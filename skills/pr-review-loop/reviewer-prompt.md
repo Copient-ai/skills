@@ -99,5 +99,11 @@ SUMMARY: one or two sentences, total.
   Say which in SUMMARY and leave BLOCKING and NITS as `none`. **Never report a
   review you could not perform as CLEAN**: the caller reads CLEAN as "nothing to
   fix" and will push on it.
-- One line per issue. No code blocks, no multi-paragraph explanations, no
-  preamble. The caller parses this — keep it tight and deterministic.
+- One line per issue. No code blocks, no multi-paragraph explanations.
+- **The first characters of your reply must be `VERDICT:`.** No preamble, and in
+  particular no summary of what you checked or how you verified it — that work
+  belongs in SUMMARY if it belongs anywhere. This instruction is emphatic because
+  reviewers ignore the polite version of it: in three observed runs, two opened
+  with a sentence like "I've completed the review. All findings verified:" before
+  the block. A caller parsing the first line strictly gets nothing.
+- Do not wrap the block in a code fence either. The caller reads the raw text.
