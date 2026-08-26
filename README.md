@@ -68,11 +68,16 @@ bash <skill-dir>/scripts/codex-review.sh --version
 Compare it against [CHANGELOG.md](CHANGELOG.md). If yours is behind, update
 before you trust a clean verdict.
 
-**Updates overwrite.** `npx skills update` re-fetches from this repo and rewrites
-the installed files, so treat everything under `.claude/skills/` as disposable
-and keep your own changes somewhere an update will not reach — a fork, or the
-`.review-loop.json` described below. The `computedHash` in
-`skills-lock.json` is how the CLI tells a modified install from a clean one.
+**Updates overwrite your edits, silently.** `npx skills update` re-fetches from
+this repo and rewrites the installed files. A file you had modified is replaced
+with no warning, no prompt, and no diff — the run just reports `✓ Updated`, and
+`skills-lock.json` records a `computedHash` that would have let it notice.
+
+So treat everything under `.claude/skills/` as disposable. Anything you want to
+keep belongs somewhere an update cannot reach: `.review-loop.json` for how your
+project runs its checks, your own settings for permissions, and a fork for
+anything larger. If you have already customised an installed copy, diff it
+against this repo before updating.
 
 ## Telling the loops how to test your project
 
