@@ -3,6 +3,9 @@ name: test
 on:
   push:
   pull_request:
+  # The portability jobs are the only check on the macOS shims, and nothing in
+  # this repo changes often enough to rely on a push to exercise them.
+  workflow_dispatch:
 
 jobs:
   parser:
