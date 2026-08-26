@@ -9,8 +9,14 @@ needs a PR, a push, or a GitHub round-trip.
 
 | Skill | Reviewer | Isolation | Runs on |
 |---|---|---|---|
-| `copient:codex-review-loop` | OpenAI Codex, via the `codex` CLI | The transcript stays in a log file; only findings are printed | **Any agent that can run bash** |
-| `copient:pr-review-loop` | Claude, in a subagent | The subagent returns only a verdict block | **Claude Code only** |
+| `codex-review-loop` | OpenAI Codex, via the `codex` CLI | The transcript stays in a log file; only findings are printed | **Any agent that can run bash** |
+| `pr-review-loop` | Claude, in a subagent | The subagent returns only a verdict block | **Claude Code only** |
+
+**What they are called depends on how you install them.** The Claude Code plugin
+prefixes both with the plugin name — `copient:codex-review-loop`,
+`copient:pr-review-loop`. `npx skills` installs them under their bare frontmatter
+names, `codex-review-loop` and `pr-review-loop`, where the prefix does not
+resolve. The skills themselves refer to each other by the bare names.
 
 Run both for two independent perspectives — they catch different things.
 
@@ -27,8 +33,10 @@ npx skills@latest add Copient-ai/skills            # this project only
 npx skills@latest add Copient-ai/skills --global   # every project
 ```
 
-You get real, editable copies — project installs land in `.claude/skills/`,
-alongside a `skills-lock.json` recording what you installed. Works across Claude
+You get real, editable copies, invoked as `codex-review-loop` and
+`pr-review-loop`. Project installs land in `.claude/skills/` for Claude Code and
+`.agents/skills/` for every other agent, alongside a `skills-lock.json` recording
+what you installed. Works across Claude
 Code, Codex, Cursor, and the other agents the CLI knows about, which is why it is
 the recommended path for `codex-review-loop`.
 

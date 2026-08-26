@@ -21,9 +21,14 @@ First release as a standalone repo. Extracted from `lancegoyke/dotfiles` and
 - Both skills declare a host requirement. `codex-review-loop` runs under any
   agent with bash; `pr-review-loop` is Claude Code only, because its isolation
   is the `Task` subagent and it loses that silently anywhere else.
-- Cross-references between the skills use the namespaced `copient:` form, and
-  no install path is hardcoded — the helper is located relative to the skill
-  directory, which differs per install path.
+- Cross-references between the skills use the bare skill names, which resolve
+  under every install path. The `copient:` prefix exists only under the Claude
+  Code plugin — `npx skills` registers the bare frontmatter names — so each
+  skill states the difference once instead of naming a form half its users
+  cannot invoke.
+- No install path is hardcoded. The helper is located relative to the skill
+  directory, and `allowed-tools` covers the plugin root, `.claude/skills/`, and
+  the `.agents/skills/` that `npx` uses for non-Claude agents.
 - `pr-review-loop`'s final verification round now applies the same convergence
   test as every other round: a `CLEAN` verdict carrying new nits does not
   bypass the declined-nits ledger.

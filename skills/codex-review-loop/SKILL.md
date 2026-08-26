@@ -1,12 +1,17 @@
 ---
 name: codex-review-loop
-description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to `copient:pr-review-loop` — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
+description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to `pr-review-loop` — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
 version: 1.0.0
 disable-model-invocation: false
-allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(bash .claude/skills/codex-review-loop/scripts/*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(bash .claude/skills/codex-review-loop/scripts/*), Bash(bash .agents/skills/codex-review-loop/scripts/*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
 ---
 
 # Codex Review Loop
+
+> **On names.** Under the Claude Code plugin these skills are prefixed with the
+> plugin name — `copient:codex-review-loop`, `copient:pr-review-loop`. Installed
+> with `npx skills` they keep their bare frontmatter names and that prefix does
+> not resolve. This file uses the bare names, which are correct either way.
 
 ## Host requirement
 
@@ -14,7 +19,7 @@ allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts
 separate process, so nothing here depends on a particular host agent's features.
 Claude Code, Codex, Cursor, Warp and OpenCode can all drive it.
 
-Contrast `copient:pr-review-loop`, which is Claude Code only because its
+Contrast `pr-review-loop`, which is Claude Code only because its
 isolation *is* the `Task` subagent.
 
 ## Overview
@@ -22,10 +27,10 @@ isolation *is* the `Task` subagent.
 Run a **review → fix → re-review** loop on the current branch using OpenAI
 Codex's local CLI, keeping the heavy review output out of this thread's context.
 
-This is the **Codex peer to `copient:pr-review-loop`**. Both run locally and
+This is the **Codex peer to `pr-review-loop`**. Both run locally and
 converge the same way; they differ only in *who reviews*:
 
-| | `copient:pr-review-loop` | `copient:codex-review-loop` (this) |
+| | `pr-review-loop` | `codex-review-loop` (this) |
 |---|---|---|
 | Reviewer | Claude, in an isolated subagent | OpenAI Codex, via `codex review` CLI |
 | Isolation | subagent returns only a verdict | `codex-review.sh` keeps the ~100KB transcript in a log file, prints only findings |
@@ -34,15 +39,16 @@ Run them back to back for two independent perspectives (Claude's is typically
 the more thorough; Codex catches a different slice). Neither uses the GitHub
 review cycle — this is fully local, no push required to review.
 
-**Convergence policy (same as `copient:pr-review-loop`):**
+**Convergence policy (same as `pr-review-loop`):**
 - **Blocking issues (Codex P0/P1) always get fixed** — they gate convergence.
 - **Nits (P2/P3): be ambitious.** Fix worthwhile, low-risk ones. But nits never
   block, and a nit you deliberately decline must not be re-fixed because a fresh
   review flags it again (oscillation guard).
 - **Converged** when a review returns no blocking issues and no new actionable
-  nits remain. A literal `CLEAN` verdict is *sufficient* for convergence but not
-  *necessary* — `BLOCKING=0` with only ledger-repeats left converges just as
-  well. See the large-branch guideline under Guidelines.
+  nits remain. `CODEX_REVIEW: CLEAN` is emitted only when no findings parsed at
+  all, so it always converges — but it is not *required*: `BLOCKING=0` with
+  every listed nit already in your ledger converges just as well. See the
+  large-branch guideline under Guidelines.
 - **Cap: 3 iterations.** Push once on convergence; never push if escalating.
 
 ## Prerequisites
@@ -64,8 +70,13 @@ every call, so it keeps matching this skill's `allowed-tools` entries:
 | Install path | Skill directory |
 |---|---|
 | Claude Code plugin | `${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop` |
-| `npx skills add` (project) | `.claude/skills/codex-review-loop` |
-| `npx skills add -g` (user) | wherever your agent keeps user-level skills |
+| `npx skills add`, Claude Code | `.claude/skills/codex-review-loop` |
+| `npx skills add`, other agents | `.agents/skills/codex-review-loop` |
+| `npx skills add -g` (user-level) | your agent's user-level skills directory |
+
+The `npx` installer writes per-agent: Claude Code gets `.claude/skills/`, every
+other agent gets `.agents/skills/`. Both are in `allowed-tools`; a user-level
+install is not, because its location varies by agent.
 
 Do **not** resolve the path into a shell variable and invoke `bash "$VAR"` —
 permission matching reads the literal command text, so a variable silently drops
@@ -269,7 +280,8 @@ and lint commands **once per loop** and reuse them every iteration:
    | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
    | `package.json` with a `test` script | `npm test` | `npm run lint` if scripted |
    | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
-   | `pyproject.toml` / `pytest.ini` / `tox.ini` | `pytest <path>` | `ruff check` if configured |
+   | `pytest.ini`, or `pyproject.toml` declaring pytest | `pytest <path>` | `ruff check` if configured |
+   | `tox.ini` | `tox` (read it — it may not be pytest) | as configured there |
    | `Cargo.toml` | `cargo test` | `cargo clippy` |
    | `go.mod` | `go test ./...` | `go vet ./...` |
    | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |

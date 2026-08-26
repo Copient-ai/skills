@@ -8,6 +8,11 @@ allowed-tools: Task, Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
 
 # PR Review Loop
 
+> **On names.** Under the Claude Code plugin these skills are prefixed with the
+> plugin name — `copient:codex-review-loop`, `copient:pr-review-loop`. Installed
+> with `npx skills` they keep their bare frontmatter names and that prefix does
+> not resolve. This file uses the bare names, which are correct either way.
+
 ## Host requirement
 
 **Claude Code only.** This skill's isolation *is* the `Task` subagent: the whole
@@ -19,7 +24,7 @@ isolation guarantee disappears **silently** — the loop still looks like it wor
 while the thing it exists to prevent has already happened. Do not port it by
 swapping `Task` for an inline review.
 
-For a host-agnostic loop, use `copient:codex-review-loop`, which shells out to the
+For a host-agnostic loop, use `codex-review-loop`, which shells out to the
 `codex` CLI and needs nothing but bash.
 
 ## Overview
@@ -46,8 +51,11 @@ context lives.
   block convergence, and a nit you deliberately decline must not be re-fixed
   just because a fresh reviewer flags it again (oscillation guard).
 - **Converged** when a review returns no blocking issues and no new actionable
-  nits remain. A `VERDICT: CLEAN` is *sufficient* for convergence but not
-  *necessary* — `BLOCKING: none` with only ledger-repeats left converges too.
+  nits remain. **`VERDICT: CLEAN` is not by itself convergence.** The reviewer's
+  output contract explicitly allows a CLEAN verdict to list NITS, and a listed
+  nit you have neither fixed nor declined is still actionable. The nits check
+  decides, not the verdict line — in both directions: `BLOCKING: none` with only
+  ledger-repeats left converges without a CLEAN verdict.
 - **Cap: 3 iterations.** Push once on convergence; never push if escalating.
 
 ## Steps
@@ -183,7 +191,8 @@ and lint commands **once per loop** and reuse them every iteration:
    | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
    | `package.json` with a `test` script | `npm test` | `npm run lint` if scripted |
    | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
-   | `pyproject.toml` / `pytest.ini` / `tox.ini` | `pytest <path>` | `ruff check` if configured |
+   | `pytest.ini`, or `pyproject.toml` declaring pytest | `pytest <path>` | `ruff check` if configured |
+   | `tox.ini` | `tox` (read it — it may not be pytest) | as configured there |
    | `Cargo.toml` | `cargo test` | `cargo clippy` |
    | `go.mod` | `go test ./...` | `go vet ./...` |
    | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |
@@ -221,9 +230,9 @@ around a prompt by skipping the step.
   one field at a time makes the tail endless. When a finding names an instance
   of a class you have already accepted, audit the siblings and fix them all in
   that round. On a big branch, converge on *0 blockers + rounds of only
-  ledger-repeats and shrinking same-class instances*: a `CLEAN` verdict ends the
-  loop when you get one, but waiting for it is not the bar — a large branch may
-  never produce one, and holding out for it loops forever.
+  ledger-repeats and shrinking same-class instances*. Do not hold out for a
+  `CLEAN` verdict: a large branch may never produce one, and a CLEAN that
+  arrives still has to pass the nits check like any other verdict.
 - **Local until clean.** Commits stay local across iterations; a single push
   happens only on convergence so you can rely on inspecting the result.
 - **Verify before committing** — run the relevant tests/lint for what you touched.
@@ -236,7 +245,7 @@ around a prompt by skipping the step.
   and falls back to its own judgment for whichever are absent — nothing is
   required to exist. No custom agent type is registered either, so it works
   without a Claude Code restart.
-- `copient:codex-review-loop` is the peer to this skill: the same loop, reviewed
+- `codex-review-loop` is the peer to this skill: the same loop, reviewed
   by OpenAI Codex's local CLI instead of Claude. Run both for two independent
   perspectives.
 - Per-iteration cost ≈ one reviewer subagent + your fixing. The cap bounds it.
