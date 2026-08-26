@@ -169,7 +169,7 @@ to the user.
 This skill installs on any repo, so it cannot assume a runner. Resolve the test
 and lint commands **once per loop** and reuse them every iteration:
 
-1. **Explicit config wins.** If `.claude/review-loop.json` exists, take `test`
+1. **Explicit config wins.** If `.review-loop.json` exists, take `test`
    and `lint` from it verbatim:
 
    ```json

@@ -16,7 +16,7 @@ First release as a standalone repo. Extracted from `lancegoyke/dotfiles` and
   against this file. The parser itself is unchanged from the dotfiles copy.
 - Neither skill hardcodes a task runner any more. `just` recipes are gone from
   `allowed-tools`; each loop now resolves the project's test and lint commands
-  from `.claude/review-loop.json` or by detection, and **stops and asks** when
+  from `.review-loop.json` or by detection, and **stops and asks** when
   it cannot, instead of quietly skipping the check.
 - Both skills declare a host requirement. `codex-review-loop` runs under any
   agent with bash; `pr-review-loop` is Claude Code only, because its isolation

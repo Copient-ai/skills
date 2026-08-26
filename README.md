@@ -71,7 +71,7 @@ before you trust a clean verdict.
 **Updates overwrite.** `npx skills update` re-fetches from this repo and rewrites
 the installed files, so treat everything under `.claude/skills/` as disposable
 and keep your own changes somewhere an update will not reach — a fork, or the
-`.claude/review-loop.json` described below. The `computedHash` in
+`.review-loop.json` described below. The `computedHash` in
 `skills-lock.json` is how the CLI tells a modified install from a clean one.
 
 ## Telling the loops how to test your project
@@ -80,7 +80,7 @@ Both skills stop and run your project's checks before committing each iteration.
 They do not assume a task runner. Each loop resolves the commands once, in this
 order:
 
-1. `.claude/review-loop.json`, if you have one — it wins over everything:
+1. `.review-loop.json`, if you have one — it wins over everything:
 
    ```json
    {
