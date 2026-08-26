@@ -10,6 +10,11 @@ and report only.**
 
 ## What to review
 
+0. If the caller named a repository, confirm you are in it before anything else:
+   `git rev-parse --show-toplevel` must match the path you were given. If it does
+   not, `cd` there. If you cannot, stop and report `VERDICT: BLOCKED` saying which
+   repo you were in and which you were asked for. Reviewing the wrong checkout is
+   the one failure that can look like a completed review.
 1. Determine the base branch. The caller gives you one; otherwise:
    `BASE=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)`
 2. Resolve `$BASE` to a ref that actually exists. Do **not** assume a remote

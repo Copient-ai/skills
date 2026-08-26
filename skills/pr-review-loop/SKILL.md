@@ -64,6 +64,10 @@ context lives.
 
 - Confirm a branch, not the default branch: `git branch --show-current`. If on
   `main`/`master`, stop and tell the user.
+- Record the repo root: `git rev-parse --show-toplevel`. Confirm it names the
+  checkout you mean to review — the Bash tool silently resets cwd after some
+  commands, so this is not a formality. You will pass this path to the reviewer
+  in step 1.
 - If the working tree has uncommitted changes (`git status --porcelain`), commit
   them first — the reviewer only sees committed state. Use a message that
   matches the repo's convention (check recent `git log --oneline -5`).
@@ -78,9 +82,17 @@ Spawn a **`general-purpose`** subagent with the Task tool. Keep the Task prompt
 tiny so nothing heavy enters this thread — point the subagent at the reviewer
 prompt file and let it read that itself:
 
-> Read `<skill-dir>/reviewer-prompt.md` and follow it exactly to review the
-> current branch against base `<BASE>`. You are read-only. Return only the verdict
-> block it specifies.
+> Work in the repository at `<repo-root>` — run every git command with that as
+> the working directory. Read `<skill-dir>/reviewer-prompt.md` and follow it
+> exactly to review the current branch against base `<BASE>`. You are read-only.
+> Return only the verdict block it specifies.
+
+**Name the repository explicitly; do not rely on the subagent inheriting your
+working directory.** It may not, and a reviewer that starts somewhere else
+reviews *that* repo instead — reporting on a diff you never made, or on no diff
+at all. `reviewer-prompt.md` catches the common shape of this (an empty diff
+returns `BLOCKED`, never `CLEAN`), but only after the round is wasted, and it
+cannot catch the case where the wrong directory happens to contain a real diff.
 
 `<skill-dir>` is **this skill's own directory** — the one this file was loaded
 from. That is the rule; the familiar paths (`${CLAUDE_PLUGIN_ROOT}/skills/pr-review-loop`
