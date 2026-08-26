@@ -19,16 +19,16 @@ allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts
 separate process, so nothing here depends on a particular host agent's features.
 Claude Code, Codex, Cursor, Warp and OpenCode can all drive it.
 
-Contrast `pr-review-loop`, which is Claude Code only because its
-isolation *is* the `Task` subagent.
+Contrast `pr-review-loop`, which is Claude Code only because its isolation
+*is* the `Task` subagent.
 
 ## Overview
 
 Run a **review → fix → re-review** loop on the current branch using OpenAI
 Codex's local CLI, keeping the heavy review output out of this thread's context.
 
-This is the **Codex peer to `pr-review-loop`**. Both run locally and
-converge the same way; they differ only in *who reviews*:
+This is the **Codex peer to `pr-review-loop`**. Both run locally and converge
+the same way; they differ only in *who reviews*:
 
 | | `pr-review-loop` | `codex-review-loop` (this) |
 |---|---|---|
@@ -280,12 +280,15 @@ and lint commands **once per loop** and reuse them every iteration:
    { "test": "just test-module", "lint": "just precommit" }
    ```
 
-2. **Otherwise detect,** first match wins:
+2. **Otherwise detect from the files you actually changed.** A repo can carry
+   more than one toolchain, and first-match on root markers will run the
+   JavaScript tests for a Go-only fix and call the iteration verified. Pick by
+   what your diff touches; if it touches more than one, **run each of them**.
 
-   | Marker in the repo root | Test | Lint |
+   | Toolchain marker | Test | Lint |
    |---|---|---|
    | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
-   | `package.json` with a `test` script | `<pm> test` | `<pm> run lint` if scripted |
+   | `package.json` with a `test` script | `<pm> run test` | `<pm> run lint` if scripted |
    | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
    | `pytest.ini`, or `pyproject.toml` declaring pytest | `pytest <path>` | `ruff check` if configured |
    | `tox.ini` | `tox` (read it — it may not be pytest) | as configured there |
@@ -294,10 +297,17 @@ and lint commands **once per loop** and reuse them every iteration:
    | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |
 
    `<pm>` is the project's own package manager, not `npm`: read the
-   `packageManager` field in `package.json`, else the lockfile — `bun.lockb` →
-   `bun`, `pnpm-lock.yaml` → `pnpm`, `yarn.lock` → `yarn`, otherwise `npm`.
-   Guessing `npm` breaks Yarn PnP, which needs `yarn` to inject its loader, and
-   Bun-only repos, which may not have `npm` installed at all.
+   `packageManager` field in `package.json`, else the lockfile — `bun.lock` or
+   `bun.lockb` → `bun`, `pnpm-lock.yaml` → `pnpm`, `yarn.lock` → `yarn`,
+   otherwise `npm`. Guessing `npm` breaks Yarn PnP, which needs `yarn` to inject
+   its loader, and Bun-only repos, which may not have `npm` installed at all.
+   Bun 1.2+ writes the text `bun.lock` by default, so checking only for the
+   legacy binary `bun.lockb` misses most current Bun projects.
+
+   Always `<pm> run test`, never `<pm> test`. They are the same command for npm,
+   yarn and pnpm, but `bun test` runs Bun's own built-in runner and ignores
+   `scripts.test` entirely — so any setup, end-to-end suite or extra step that
+   script performs is skipped while the iteration still looks verified.
 
    Confirm the recipe actually exists before relying on it — `just --list`,
    `<pm> run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
