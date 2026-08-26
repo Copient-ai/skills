@@ -63,29 +63,36 @@ The helper script fails with a clear message if `codex` is missing from `PATH`.
 
 ## Locating the helper
 
-The scripts live in **this skill's own directory**, under `scripts/`. Resolve
-that directory once at the start of the loop and use the same literal path for
-every call, so it keeps matching this skill's `allowed-tools` entries:
+The scripts live in **this skill's own directory**, under `scripts/`. The rule is
+just that: use the directory *this file was loaded from*. Resolve it once at the
+start of the loop and use the same literal path for every call.
+
+Do not work from a list of known install locations — there is no such list. The
+`npx` installer writes wherever the target agent keeps skills, which for a
+Claude Code project is `.claude/skills/`, for most other agents `.agents/skills/`,
+and for an agent with its own convention somewhere else again. These are common
+cases, not an enumeration:
 
 | Install path | Skill directory |
 |---|---|
 | Claude Code plugin | `${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop` |
-| `npx skills add`, Claude Code | `.claude/skills/codex-review-loop` |
-| `npx skills add`, other agents | `.agents/skills/codex-review-loop` |
-| `npx skills add -g` (user-level) | your agent's user-level skills directory |
+| `npx skills add`, Claude Code project | `.claude/skills/codex-review-loop` |
+| `npx skills add`, most other agents | `.agents/skills/codex-review-loop` |
+| anything else | wherever you were loaded from — that is the answer |
 
-The `npx` installer writes per-agent: Claude Code gets `.claude/skills/`, every
-other agent gets `.agents/skills/`. Both are in `allowed-tools`; a user-level
-install is not, because its location varies by agent.
+If `scripts/codex-review.sh` is not under the directory you were loaded from,
+stop and say so. Do not go hunting for a copy elsewhere on the machine: a second
+copy is very likely a *different version*, and running an old parser is how you
+get a clean verdict for a branch nobody reviewed.
 
 Do **not** resolve the path into a shell variable and invoke `bash "$VAR"` —
 permission matching reads the literal command text, so a variable silently drops
 out of the allowlist and every call falls back to an approval prompt. Write the
 path out.
 
-A user-level install lands outside both `allowed-tools` patterns and will prompt
-on first use. That is deliberate: prompting is a visible, honest outcome. To stop
-seeing it, allowlist the path your install actually uses:
+`allowed-tools` covers the first three rows as a convenience. Any other location
+prompts on first use, which is deliberate: a prompt is a visible, honest outcome.
+To stop seeing it, allowlist the path your install actually uses:
 
 ```json
 { "permissions": { "allow": ["Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)"] } }
@@ -278,7 +285,7 @@ and lint commands **once per loop** and reuse them every iteration:
    | Marker in the repo root | Test | Lint |
    |---|---|---|
    | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
-   | `package.json` with a `test` script | `npm test` | `npm run lint` if scripted |
+   | `package.json` with a `test` script | `<pm> test` | `<pm> run lint` if scripted |
    | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
    | `pytest.ini`, or `pyproject.toml` declaring pytest | `pytest <path>` | `ruff check` if configured |
    | `tox.ini` | `tox` (read it — it may not be pytest) | as configured there |
@@ -286,8 +293,14 @@ and lint commands **once per loop** and reuse them every iteration:
    | `go.mod` | `go test ./...` | `go vet ./...` |
    | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |
 
+   `<pm>` is the project's own package manager, not `npm`: read the
+   `packageManager` field in `package.json`, else the lockfile — `bun.lockb` →
+   `bun`, `pnpm-lock.yaml` → `pnpm`, `yarn.lock` → `yarn`, otherwise `npm`.
+   Guessing `npm` breaks Yarn PnP, which needs `yarn` to inject its loader, and
+   Bun-only repos, which may not have `npm` installed at all.
+
    Confirm the recipe actually exists before relying on it — `just --list`,
-   `npm run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
+   `<pm> run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
    test command.
 
 3. **Nothing resolved → stop and ask the user** for the command, and record the

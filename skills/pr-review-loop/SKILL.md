@@ -83,8 +83,9 @@ prompt file and let it read that itself:
 > block it specifies.
 
 `<skill-dir>` is **this skill's own directory** — the one this file was loaded
-from (`${CLAUDE_PLUGIN_ROOT}/skills/pr-review-loop` under a plugin install,
-`.claude/skills/pr-review-loop` under a project install). Pass the subagent an
+from. That is the rule; the familiar paths (`${CLAUDE_PLUGIN_ROOT}/skills/pr-review-loop`
+under a plugin install, `.claude/skills/pr-review-loop` under a Claude Code
+project install) are examples of it, not a list to search. Pass the subagent an
 absolute path; its working directory is not guaranteed to be yours.
 
 (`general-purpose` is used because it always exists — a custom agent type would
@@ -189,7 +190,7 @@ and lint commands **once per loop** and reuse them every iteration:
    | Marker in the repo root | Test | Lint |
    |---|---|---|
    | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
-   | `package.json` with a `test` script | `npm test` | `npm run lint` if scripted |
+   | `package.json` with a `test` script | `<pm> test` | `<pm> run lint` if scripted |
    | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
    | `pytest.ini`, or `pyproject.toml` declaring pytest | `pytest <path>` | `ruff check` if configured |
    | `tox.ini` | `tox` (read it — it may not be pytest) | as configured there |
@@ -197,8 +198,14 @@ and lint commands **once per loop** and reuse them every iteration:
    | `go.mod` | `go test ./...` | `go vet ./...` |
    | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |
 
+   `<pm>` is the project's own package manager, not `npm`: read the
+   `packageManager` field in `package.json`, else the lockfile — `bun.lockb` →
+   `bun`, `pnpm-lock.yaml` → `pnpm`, `yarn.lock` → `yarn`, otherwise `npm`.
+   Guessing `npm` breaks Yarn PnP, which needs `yarn` to inject its loader, and
+   Bun-only repos, which may not have `npm` installed at all.
+
    Confirm the recipe actually exists before relying on it — `just --list`,
-   `npm run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
+   `<pm> run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
    test command.
 
 3. **Nothing resolved → stop and ask the user** for the command, and record the
