@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  parser:
+    # The portability shims in codex-review.sh (an ESC byte for BSD sed, a
+    # gtimeout fallback, a tac-free trim) exist for macOS and are the reason
+    # this runs on both. macos-latest also gives BSD awk/sed/tr and grep's
+    # binary-file behaviour, which the NUL-byte fixture depends on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report the shell in use
+        run: bash --version | head -1
+      - name: Parser regression suite (no Codex call needed)
+        run: bash skills/codex-review-loop/scripts/test-codex-review.sh
+
+  bash32:
+    # macos-latest ships bash 5 via the runner image, so the matrix above does
+    # NOT exercise the stock /bin/bash 3.2 a real Mac has. Pin to it explicitly.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm this really is bash 3.2
+        run: /bin/bash --version | head -1
+      - name: Parser regression suite under stock macOS bash
+        run: /bin/bash skills/codex-review-loop/scripts/test-codex-review.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning skills/codex-review-loop/scripts/*.sh

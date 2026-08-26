@@ -1,0 +1,13 @@
+{
+  "name": "copient",
+  "description": "Local review→fix loops that converge a branch before you push it: an OpenAI Codex reviewer and an isolated-subagent Claude reviewer.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Copient AI",
+    "url": "https://github.com/Copient-ai"
+  },
+  "homepage": "https://github.com/Copient-ai/skills",
+  "repository": "https://github.com/Copient-ai/skills",
+  "license": "MIT",
+  "keywords": ["code-review", "codex", "pre-push", "convergence-loop"]
+}

@@ -1,0 +1,4 @@
+{
+  "test": "bash skills/codex-review-loop/scripts/test-codex-review.sh",
+  "lint": "shellcheck --severity=warning skills/codex-review-loop/scripts/*.sh"
+}

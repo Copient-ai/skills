@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "copient-skills",
+  "description": "Copient's public, project-agnostic developer skills.",
+  "owner": {
+    "name": "Copient AI",
+    "url": "https://github.com/Copient-ai"
+  },
+  "plugins": [
+    {
+      "name": "copient",
+      "description": "Local review→fix loops that converge a branch before you push it: an OpenAI Codex reviewer and an isolated-subagent Claude reviewer.",
+      "author": {
+        "name": "Copient AI",
+        "url": "https://github.com/Copient-ai"
+      },
+      "category": "development",
+      "source": "./",
+      "homepage": "https://github.com/Copient-ai/skills"
+    }
+  ]
+}
