@@ -1,21 +1,31 @@
 ---
 name: codex-review-loop
-description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to /pr-review-loop — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
+description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to `copient:pr-review-loop` — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
+version: 1.0.0
 disable-model-invocation: false
-allowed-tools: Bash(bash ~/.claude/skills/codex-review-loop/scripts/*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Bash(just precommit:*), Bash(just test:*), Bash(just test-module:*), Bash(just check:*), Read, Edit, Write, Grep, Glob
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(bash .claude/skills/codex-review-loop/scripts/*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
 ---
 
 # Codex Review Loop
+
+## Host requirement
+
+**Any agent that can run bash.** The review itself happens in the `codex` CLI, a
+separate process, so nothing here depends on a particular host agent's features.
+Claude Code, Codex, Cursor, Warp and OpenCode can all drive it.
+
+Contrast `copient:pr-review-loop`, which is Claude Code only because its
+isolation *is* the `Task` subagent.
 
 ## Overview
 
 Run a **review → fix → re-review** loop on the current branch using OpenAI
 Codex's local CLI, keeping the heavy review output out of this thread's context.
 
-This is the **Codex peer to `/pr-review-loop`**. Both run locally and converge
-the same way; they differ only in *who reviews*:
+This is the **Codex peer to `copient:pr-review-loop`**. Both run locally and
+converge the same way; they differ only in *who reviews*:
 
-| | `/pr-review-loop` | `/codex-review-loop` (this) |
+| | `copient:pr-review-loop` | `copient:codex-review-loop` (this) |
 |---|---|---|
 | Reviewer | Claude, in an isolated subagent | OpenAI Codex, via `codex review` CLI |
 | Isolation | subagent returns only a verdict | `codex-review.sh` keeps the ~100KB transcript in a log file, prints only findings |
@@ -24,13 +34,15 @@ Run them back to back for two independent perspectives (Claude's is typically
 the more thorough; Codex catches a different slice). Neither uses the GitHub
 review cycle — this is fully local, no push required to review.
 
-**Convergence policy (same as `/pr-review-loop`):**
+**Convergence policy (same as `copient:pr-review-loop`):**
 - **Blocking issues (Codex P0/P1) always get fixed** — they gate convergence.
 - **Nits (P2/P3): be ambitious.** Fix worthwhile, low-risk ones. But nits never
   block, and a nit you deliberately decline must not be re-fixed because a fresh
   review flags it again (oscillation guard).
 - **Converged** when a review returns no blocking issues and no new actionable
-  nits remain.
+  nits remain. A literal `CLEAN` verdict is *sufficient* for convergence but not
+  *necessary* — `BLOCKING=0` with only ledger-repeats left converges just as
+  well. See the large-branch guideline under Guidelines.
 - **Cap: 3 iterations.** Push once on convergence; never push if escalating.
 
 ## Prerequisites
@@ -42,6 +54,43 @@ One-time setup per machine:
    can run without an approval prompt on every file it reads.
 
 The helper script fails with a clear message if `codex` is missing from `PATH`.
+
+## Locating the helper
+
+The scripts live in **this skill's own directory**, under `scripts/`. Resolve
+that directory once at the start of the loop and use the same literal path for
+every call, so it keeps matching this skill's `allowed-tools` entries:
+
+| Install path | Skill directory |
+|---|---|
+| Claude Code plugin | `${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop` |
+| `npx skills add` (project) | `.claude/skills/codex-review-loop` |
+| `npx skills add -g` (user) | wherever your agent keeps user-level skills |
+
+Do **not** resolve the path into a shell variable and invoke `bash "$VAR"` —
+permission matching reads the literal command text, so a variable silently drops
+out of the allowlist and every call falls back to an approval prompt. Write the
+path out.
+
+A user-level install lands outside both `allowed-tools` patterns and will prompt
+on first use. That is deliberate: prompting is a visible, honest outcome. To stop
+seeing it, allowlist the path your install actually uses:
+
+```json
+{ "permissions": { "allow": ["Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)"] } }
+```
+
+## Checking you are current
+
+```bash
+bash <skill-dir>/scripts/codex-review.sh --version
+```
+
+Prints the parser version. A copy older than the current release may carry
+false-`CLEAN` bugs that have since been fixed — a review tool that silently
+approves branches it did not read. Compare it against
+<https://github.com/Copient-ai/skills/blob/main/CHANGELOG.md> before trusting a
+clean verdict from an install you have not updated in a while.
 
 ## The helper
 
@@ -97,7 +146,7 @@ from the reset directory reviews *that* repo and comes back a confident, useless
 
 ```bash
 git rev-parse --show-toplevel   # must name the checkout under review
-bash ~/.claude/skills/codex-review-loop/scripts/codex-review.sh --base <BASE>
+bash <skill-dir>/scripts/codex-review.sh --base <BASE>
 ```
 
 Use a generous timeout (codex review can take a few minutes on a large branch;
@@ -176,8 +225,8 @@ your declined ledger. For any nit you decline, add it to the ledger with a one-
 line reason so it isn't re-attempted.
 
 Then:
-1. Run the narrowest sensible check — `just test-module <path>`, `just check` for
-   migrations/config, `just precommit` if non-trivial.
+1. Run the narrowest sensible check for what you touched, using **this project's**
+   test/lint command — see *Finding this project's checks* below.
 2. **Commit locally** (no push), message matching repo style. One commit per
    iteration (or per fix) for auditability.
 3. Increment the counter. If it has **reached 3**, run one final
@@ -201,6 +250,47 @@ End with Codex's final SUMMARY and confirm the push.
 Report the open blocking finding(s), your reasoning if you dispute one, and the
 local commits made so far. Hand the decision to the user.
 
+## Finding this project's checks
+
+This skill installs on any repo, so it cannot assume a runner. Resolve the test
+and lint commands **once per loop** and reuse them every iteration:
+
+1. **Explicit config wins.** If `.claude/review-loop.json` exists, take `test`
+   and `lint` from it verbatim:
+
+   ```json
+   { "test": "just test-module", "lint": "just precommit" }
+   ```
+
+2. **Otherwise detect,** first match wins:
+
+   | Marker in the repo root | Test | Lint |
+   |---|---|---|
+   | `justfile` / `Justfile` | `just test-module <path>` (else `just test`) | `just precommit` (else `just check`) |
+   | `package.json` with a `test` script | `npm test` | `npm run lint` if scripted |
+   | `Makefile` with a `test` target | `make test` | `make lint` if targeted |
+   | `pyproject.toml` / `pytest.ini` / `tox.ini` | `pytest <path>` | `ruff check` if configured |
+   | `Cargo.toml` | `cargo test` | `cargo clippy` |
+   | `go.mod` | `go test ./...` | `go vet ./...` |
+   | `.pre-commit-config.yaml` (lint only) | — | `pre-commit run --files <paths>` |
+
+   Confirm the recipe actually exists before relying on it — `just --list`,
+   `npm run`, `make -qp`. A `justfile` without a `test-module` recipe is not a
+   test command.
+
+3. **Nothing resolved → stop and ask the user** for the command, and record the
+   answer for the rest of the loop.
+
+**An iteration whose check did not run is not a completed iteration.** Do not
+increment the counter, do not commit it as verified, and never report the loop as
+converged on the strength of a check that no-op'd or that you skipped because you
+could not find a command. This is the same rule the parser follows for
+`UNPARSED`: never report approval for something you did not actually do.
+
+The check command runs under your host agent's normal permission rules and may
+prompt the first time. Approve it, or allowlist it in your own settings — do not
+work around a prompt by skipping the step.
+
 ## Guidelines
 
 - **Never dump the transcript into this thread.** The script already keeps it in
@@ -216,8 +306,9 @@ local commits made so far. Hand the decision to the user.
   one field at a time makes the tail endless. When a finding names an instance
   of a class you have already accepted, audit the siblings and fix them all in
   that round. On a big branch, converge on *0 blockers + rounds of only
-  ledger-repeats and shrinking same-class instances* — a literal `CLEAN` is not
-  a terminating condition.
+  ledger-repeats and shrinking same-class instances*: a literal `CLEAN` ends the
+  loop when you get one, but waiting for it is not the bar — a large branch may
+  never produce one, and holding out for it loops forever.
 - **Local until clean** — commit across iterations; single push on convergence.
 - **Verify before committing** — run the relevant tests/lint for what you touched.
 
@@ -228,10 +319,11 @@ local commits made so far. Hand the decision to the user.
 - The script pins `codex review` to `gpt-5.6-sol` at `xhigh` reasoning effort;
   override with `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` if needed.
 - The script's regression test needs no live Codex call:
-  `bash ~/.claude/skills/codex-review-loop/scripts/test-codex-review.sh`.
-- Distinct from `pr-comments`, which addresses review threads already posted on
-  the GitHub PR (e.g. Codex's auto-review on push or a human reviewer). This loop
-  is local and pre-push.
-- A natural follow-up, if you want both perspectives in one command, is an
-  alternating loop that runs a Claude round then a Codex round until both are
-  clean — ask and I'll build it on top of these two skills.
+  `bash <skill-dir>/scripts/test-codex-review.sh`. It must report `ALL PASS`
+  before you trust a verdict from a modified parser.
+- Distinct from any skill that addresses review threads already posted on the
+  GitHub PR (Codex's auto-review on push, or a human reviewer). This loop is
+  local and pre-push — no PR required.
+- If you touch the parser, every change needs a fixture proven red against the
+  previous version before it goes green. The guards are not decoration; each one
+  traces to a reproduced false-`CLEAN`.

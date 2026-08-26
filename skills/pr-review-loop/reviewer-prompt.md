@@ -45,8 +45,9 @@ and report only.**
 ## Calibrate to the project's standards
 
 Before reviewing, read whichever of these reviewer definitions exist and apply
-their checklists as your rubric (this keeps the loop consistent with the user's
-`/pr-review`). Check the repo first, then the home directory —
+their checklists as your rubric, so the loop reviews to this project's standards
+rather than to generic ones. These are Claude Code **agent** definitions, not
+skills: check the repo first, then the user's own agents directory —
 `.claude/agents/<name>.md`, else `~/.claude/agents/<name>.md` — for:
 
 - `security-reviewer`
