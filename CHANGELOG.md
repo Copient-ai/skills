@@ -9,6 +9,15 @@ bash <skill-dir>/scripts/codex-review.sh --version
 
 ## 1.0.0
 
+**Security:** `allowed-tools` originally pre-approved `bash` for the helper
+script at `.claude/skills/…/scripts/*` and `.agents/skills/…/scripts/*`. Under a
+project-level `npx` install those paths are inside the repo being reviewed, so
+the branch under review could rewrite `codex-review.sh` and have it run without
+a permission prompt — unreviewed branch code executing as part of the review of
+that branch. Only the plugin root, which lives outside any checkout, is
+pre-approved now; every other install prompts. Corrected before any release tag
+existed, so no version carried it.
+
 First release as a standalone repo. Extracted from `lancegoyke/dotfiles` and
 `copient-trainer/.claude/skills/`, which both carried their own copies.
 

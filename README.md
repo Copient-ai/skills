@@ -102,10 +102,14 @@ order:
    }
    ```
 
-2. Otherwise detection, first match wins: `justfile`, `package.json` scripts,
-   `Makefile`, `pyproject.toml`/`pytest.ini`/`tox.ini`, `Cargo.toml`, `go.mod`,
-   `.pre-commit-config.yaml`. The full table is in each skill's *Finding this
-   project's checks* section.
+2. Otherwise the loop detects the toolchain **from the files your fix actually
+   touched** — `justfile`, `package.json` scripts, `Makefile`,
+   `pyproject.toml`/`pytest.ini`/`tox.ini`, `Cargo.toml`, `go.mod`,
+   `.pre-commit-config.yaml`. In a polyglot repo a fix spanning two of them runs
+   *both*, and the set is re-derived after each round rather than fixed at the
+   start. Picking one root marker and sticking with it would run the JavaScript
+   tests for a Go-only change and call it verified. The full table is in each
+   skill's *Finding this project's checks* section.
 
 3. If nothing resolves, the loop **stops and asks you** rather than skipping the
    check.
@@ -126,9 +130,12 @@ approval prompt the first time, and allowlist it yourself in
 { "permissions": { "allow": ["Bash(npm test:*)", "Bash(npm run lint:*)"] } }
 ```
 
-A user-level (`--global`) install of `codex-review-loop` puts the helper script
-outside the declared patterns too, so its first call will prompt as well. Add the
-path your install actually uses:
+`codex-review-loop`'s helper script prompts too, on every install except the
+plugin. That one is deliberate and worth keeping: a project-level install puts
+the script **inside the repo under review**, where the branch being reviewed can
+rewrite it, so pre-approving that path would run unreviewed branch code before
+the review. Silence the prompt only for a copy outside any checkout — a
+`--global` install qualifies, a project-level one does not:
 
 ```json
 { "permissions": { "allow": ["Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)"] } }

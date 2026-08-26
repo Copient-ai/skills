@@ -175,8 +175,8 @@ to the user.
 
 ## Finding this project's checks
 
-This skill installs on any repo, so it cannot assume a runner. Resolve the test
-and lint commands **once per loop** and reuse them every iteration:
+This skill installs on any repo, so it cannot assume a runner. Work out the test
+and lint commands like this:
 
 1. **Explicit config wins.** If `.review-loop.json` exists, take `test`
    and `lint` from it verbatim:
@@ -220,6 +220,15 @@ and lint commands **once per loop** and reuse them every iteration:
 
 3. **Nothing resolved → stop and ask the user** for the command, and record the
    answer for the rest of the loop.
+
+**Recompute the set after every fix round — do not resolve once and reuse.** How
+the project runs a given toolchain is stable, so resolve `<pm>`, the runner
+names and any `.review-loop.json` once. *Which* checks apply is not stable: round
+one may touch only Python, and round two, chasing an orphaned reference the
+reviewer found, may touch Go as well. Reusing round one's command then verifies
+round two against files it never ran. After each round, re-derive the check set
+from the files *that round* touched, and run any toolchain that has newly come
+into scope.
 
 **An iteration whose check did not run is not a completed iteration.** Do not
 increment the counter, do not commit it as verified, and never report the loop as

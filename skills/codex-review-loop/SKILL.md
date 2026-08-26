@@ -3,7 +3,7 @@ name: codex-review-loop
 description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to `pr-review-loop` — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
 version: 1.0.0
 disable-model-invocation: false
-allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(bash .claude/skills/codex-review-loop/scripts/*), Bash(bash .agents/skills/codex-review-loop/scripts/*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
 ---
 
 # Codex Review Loop
@@ -90,9 +90,23 @@ permission matching reads the literal command text, so a variable silently drops
 out of the allowlist and every call falls back to an approval prompt. Write the
 path out.
 
-`allowed-tools` covers the first three rows as a convenience. Any other location
-prompts on first use, which is deliberate: a prompt is a visible, honest outcome.
-To stop seeing it, allowlist the path your install actually uses:
+### Why only the plugin path is pre-approved
+
+`allowed-tools` pre-approves exactly one location: the plugin root. Every other
+install prompts on first use, and that is not an oversight to be tidied away.
+
+A project-level `npx` install puts `scripts/codex-review.sh` **inside the
+checkout** — `.claude/skills/…` or `.agents/skills/…` are ordinary tracked
+paths. Pre-approving `bash` for a path inside the repo means the branch under
+review can rewrite the helper, and step 1 then executes it without a prompt,
+*before anything has reviewed that branch*. A review tool that runs unreviewed
+code from the thing it is about to review is not a safe default, however
+convenient.
+
+So: approve the prompt when it appears, having satisfied yourself the script is
+the one you installed. If you want to silence it, allowlist only a copy that
+lives **outside** any checkout — a global install qualifies, a project-level one
+does not:
 
 ```json
 { "permissions": { "allow": ["Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)"] } }
@@ -270,8 +284,8 @@ local commits made so far. Hand the decision to the user.
 
 ## Finding this project's checks
 
-This skill installs on any repo, so it cannot assume a runner. Resolve the test
-and lint commands **once per loop** and reuse them every iteration:
+This skill installs on any repo, so it cannot assume a runner. Work out the test
+and lint commands like this:
 
 1. **Explicit config wins.** If `.review-loop.json` exists, take `test`
    and `lint` from it verbatim:
@@ -315,6 +329,15 @@ and lint commands **once per loop** and reuse them every iteration:
 
 3. **Nothing resolved → stop and ask the user** for the command, and record the
    answer for the rest of the loop.
+
+**Recompute the set after every fix round — do not resolve once and reuse.** How
+the project runs a given toolchain is stable, so resolve `<pm>`, the runner
+names and any `.review-loop.json` once. *Which* checks apply is not stable: round
+one may touch only Python, and round two, chasing an orphaned reference the
+reviewer found, may touch Go as well. Reusing round one's command then verifies
+round two against files it never ran. After each round, re-derive the check set
+from the files *that round* touched, and run any toolchain that has newly come
+into scope.
 
 **An iteration whose check did not run is not a completed iteration.** Do not
 increment the counter, do not commit it as verified, and never report the loop as
