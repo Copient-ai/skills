@@ -405,6 +405,22 @@ check "findings under an unknown header name their cause" \
 check "a clean review with no bullets is unaffected" \
   grep -qx "CODEX_REVIEW: CLEAN" <<<"$out_clean"
 
+# --- Fixture 17: --version reports a version without needing codex or a log ---
+# The staleness check is a safety feature: an installed copy older than the repo
+# may still carry a false-CLEAN bug. It has to answer on a machine with no codex
+# CLI installed and no transcript to parse, so it must exit before both.
+# PATH is emptied rather than just scrubbed of codex, so the check also proves
+# --version returns before the script reaches any external command. "$BASH" is
+# an absolute path to the running shell, so it still starts with no PATH.
+ver_out=$(PATH='' "$BASH" "$REVIEW" --version 2>&1)
+ver_rc=$?
+echo "--- version output ---"
+printf '%s\n' "$ver_out"
+
+check "--version exits 0" test "$ver_rc" -eq 0
+check "--version prints a semver, with no codex CLI on PATH" \
+  grep -qE '^codex-review\.sh [0-9]+\.[0-9]+\.[0-9]+$' <<<"$ver_out"
+
 echo
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"

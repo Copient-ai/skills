@@ -13,6 +13,7 @@
 #   codex-review.sh [--base BRANCH | --commit SHA | --uncommitted] [--prompt TEXT]
 #                   [--log FILE] [--raw] [--timeout SEC]
 #   codex-review.sh --from-log FILE        # just re-extract from an existing transcript
+#   codex-review.sh --version              # print the parser version and exit
 #
 #   Scope (default: --base <PR base, else main>):
 #     --base BRANCH    review all changes vs BRANCH
@@ -26,6 +27,11 @@
 #   --raw              print the full transcript instead of the distilled findings
 #   --timeout SEC      max seconds for the review (default 600)
 #   --from-log FILE    skip running codex; extract from FILE (testing / re-parse)
+#   --version          print the parser version and exit. Compare it against the
+#                      version in Copient-ai/skills: an older copy may still carry
+#                      a false-CLEAN bug that has since been fixed, and a review
+#                      tool that silently approves unread branches is the one
+#                      failure this script exists to prevent.
 #
 #   Env overrides:
 #     CODEX_REVIEW_MODEL    model passed to `codex review` (default: gpt-5.6-sol)
@@ -43,6 +49,10 @@
 #   <- [Pn] ... items>
 # Severity: P0/P1 = blocking, P2/P3 = nit.
 set -euo pipefail
+
+# Bump on every change to the parsing behaviour, so an installed copy can be
+# compared against the repo. See --version.
+CODEX_REVIEW_VERSION="1.0.0"
 
 # --- Portability shims (work on both GNU/Linux and BSD/macOS) ----------------
 # ESC byte for stripping ANSI color: GNU sed's `\x1b` escape isn't portable to
@@ -117,6 +127,7 @@ while [ $# -gt 0 ]; do
     --raw) RAW=true; shift ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --from-log) FROM_LOG="$2"; shift 2 ;;
+    --version) echo "codex-review.sh $CODEX_REVIEW_VERSION"; exit 0 ;;
     -h|--help) grep '^#' "$0" | grep -v '^#!' | sed 's/^# //;s/^#//'; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
