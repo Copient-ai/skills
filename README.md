@@ -2,219 +2,147 @@
 
 Public, project-agnostic developer skills from [Copient AI](https://github.com/Copient-ai).
 
-Two so far, and they are one idea reviewed by two different models: run a
-**review → fix → re-review** loop on your branch locally until it stops finding
-things, keeping the review's bulk out of your working context. Neither needs a
-PR, a push, or a GitHub round-trip.
+Two so far, and they are one idea reviewed by two different models: a
+**review → fix → re-review** loop on your branch, run locally, that keeps the
+review's bulk out of your working context. No PR, no push, no GitHub round-trip.
 
-| Skill | Reviewer | Isolation | Runs on |
-|---|---|---|---|
-| `codex-review-loop` | OpenAI Codex, via the `codex` CLI | Transcript stays in a log file; only findings print | **Any agent that can run bash** |
-| `pr-review-loop` | Claude, in a subagent | The subagent returns only a verdict block | **Claude Code only** |
+| Skill | Reviewer | Runs on |
+|---|---|---|
+| `codex-review-loop` | OpenAI Codex, via the `codex` CLI | **Any agent that can run bash** |
+| `pr-review-loop` | Claude, in an isolated subagent | **Claude Code only** |
 
-Run both for two independent perspectives — they catch different things.
+Run both before a PR — they surface different classes of problem.
 
-`pr-review-loop`'s host requirement is not a packaging detail. Its isolation *is*
-the `Task` subagent. On an agent without subagents the review runs in your main
-context and the guarantee is gone, with nothing to tell you so.
-
-**What they are called depends on how you install them.** The Claude Code plugin
-prefixes both with the plugin name — `copient:codex-review-loop`,
-`copient:pr-review-loop`. `npx skills` installs them under their bare frontmatter
-names, `codex-review-loop` and `pr-review-loop`, where the prefix does not
-resolve. The skills refer to each other by the bare names.
+`pr-review-loop`'s host requirement is not packaging trivia. Its isolation *is*
+the `Task` subagent; on an agent without subagents the review runs in your main
+context and the guarantee is gone, silently.
 
 ## Install — pick one
 
-### `npx skills` (recommended)
-
 ```bash
-npx skills@latest add Copient-ai/skills --global   # every project
-npx skills@latest add Copient-ai/skills            # this project only
+npx skills@latest add Copient-ai/skills --global   # recommended
 ```
 
-It asks which agents to install for. Non-interactively, add
-`-a claude-code -s '*' -y`.
-
-You get real, editable copies. Claude Code installs land under `.claude/skills/`;
-every other agent gets `.agents/skills/`. A `skills-lock.json` records what you
-installed.
-
-### Claude Code plugin
+Editable copies, any agent, invoked as `codex-review-loop` / `pr-review-loop`.
+It asks which agents to install for; add `-a claude-code -s '*' -y` to skip that.
 
 ```
-/plugin marketplace add Copient-ai/skills
+/plugin marketplace add Copient-ai/skills          # Claude Code only
 /plugin install copient@copient-skills
 ```
 
-A managed, read-only bundle that updates with the marketplace.
+Managed and read-only, invoked as `copient:codex-review-loop` — the plugin name
+becomes a prefix.
 
-### Do not install both
-
-They do not layer, they duplicate — you end up with two copies of every skill
-registered at once. A project-level copy also **shadows** a user-level one of the
-same name, so the copy you edit may not be the copy that runs. Pick one path and
-remove the other before switching.
+**Do not install both.** They duplicate rather than layer, and a project-level
+copy shadows a user-level one, so the copy you edit may not be the copy that runs.
 
 ## Prerequisites
 
-`codex-review-loop` needs the OpenAI [Codex CLI](https://github.com/openai/codex)
-on your `PATH` and signed in:
-
-```bash
-codex login
-```
-
-Trust the repo you review in `~/.codex/config.toml`, or the review stops for an
-approval on every file it reads — which makes it unusable rather than broken. The
-helper fails with a clear message if `codex` is missing.
+`codex-review-loop` needs the [Codex CLI](https://github.com/openai/codex) on your
+`PATH`, `codex login` done, and the repo trusted in `~/.codex/config.toml`.
+Untrusted, the review stops for approval on every file it reads.
 
 `pr-review-loop` needs Claude Code and nothing else.
 
-## Verify before you rely on it
+## Verify
 
-These skills gate a push, so "it looks installed" is not enough.
+These gate a push, so "it looks installed" is not enough.
 
 ```bash
-# 1. the parser is the version you think it is
 bash ~/.claude/skills/codex-review-loop/scripts/codex-review.sh --version
-# codex-review.sh 1.0.0
+# codex-review.sh 1.0.0   — compare against CHANGELOG.md
 
-# 2. the offline parser suite passes here — no Codex call needed
 bash ~/.claude/skills/codex-review-loop/scripts/test-codex-review.sh
-# ALL PASS
-
-# 3. both skills are registered
-npx skills@latest list
+# ALL PASS                — offline, no Codex call needed
 ```
 
-Adjust the path for your install — `.agents/skills/…` for agents other than
-Claude Code, `${CLAUDE_PLUGIN_ROOT}/skills/…` under the plugin.
-
-- [ ] `--version` matches [CHANGELOG.md](CHANGELOG.md)
-- [ ] The suite reports `ALL PASS`
-- [ ] Both skills appear in your agent's skill list
-- [ ] You have run one real loop on a small branch
+Adjust the path for your install: `.agents/skills/…` for agents other than Claude
+Code, `${CLAUDE_PLUGIN_ROOT}/skills/…` under the plugin.
 
 ## Using them
 
-Both take the same shape. You are on a feature branch with committed work; the
-loop reviews, you fix, it re-reviews, and it stops when the code stops changing.
+From a feature branch with your work committed:
 
 ```
-/codex-review-loop      # Codex reviews, via its CLI
-/pr-review-loop         # Claude reviews, in an isolated subagent
+/codex-review-loop
+/pr-review-loop
 ```
 
-Reach for `codex-review-loop` when you want a second model's eyes, or when you
-are not in Claude Code. Reach for `pr-review-loop` when you want a review
-calibrated to your own reviewer-agent definitions. Running both before a PR is
-the point — in practice they surface different classes of problem.
+Each reviews, you fix, it re-reviews, and it stops when the code stops changing.
+Blocking findings always get fixed. Nits are optional but ambitious, and one you
+decline is remembered so a later round cannot re-raise it. Three iterations, then
+a verification round that reviews without fixing. It pushes once, on convergence,
+never while escalating.
 
-What to expect:
-
-- **Blocking findings always get fixed.** They gate convergence.
-- **Nits are optional but ambitious.** Worthwhile ones get fixed; one you decline
-  goes in a ledger so a later round does not re-raise it and start an
-  oscillation.
-- **Three iterations, then a verification round.** At the cap the loop reviews
-  what you committed without fixing again, so anything it escalates is verified
-  still-open rather than already-fixed.
-- **A clean verdict is not automatically convergence.** A review can come back
-  clean while listing nits you have neither fixed nor declined.
-- **It pushes once, on convergence.** Never while escalating.
-
-The single rule underneath all of it: **an iteration whose check did not run is
-not a completed iteration.** A loop that gates a push has to know its gate
-actually ran.
+A clean verdict is not automatically convergence — a review can come back clean
+while listing nits you have neither fixed nor declined. And the rule underneath
+all of it: **an iteration whose check did not run is not a completed iteration.**
 
 ## Telling the loops how to test your project
 
-They do not assume a task runner. Each loop works out the commands like this:
+They assume no task runner. Commands resolve in this order:
 
-1. **`.review-loop.json` at the repo root wins,** if you have one:
+1. **`.review-loop.json` at the repo root wins:**
 
    ```json
-   {
-     "test": "just test-module",
-     "lint": "just precommit"
-   }
+   { "test": "just test-module", "lint": "just precommit" }
    ```
 
-2. **Otherwise it detects the toolchain from the files your fix touched** —
-   `justfile`, `package.json` scripts, `Makefile`,
-   `pyproject.toml`/`pytest.ini`/`tox.ini`, `Cargo.toml`, `go.mod`,
-   `.pre-commit-config.yaml`. A fix spanning two of them runs **both**, and the
-   set is re-derived after each round rather than fixed at the start. Picking one
-   root marker and sticking with it would run the JavaScript tests for a Go-only
-   change and call it verified.
+2. **Otherwise, detection from the files your fix touched** — `justfile`,
+   `package.json`, `Makefile`, `pyproject.toml`/`pytest.ini`/`tox.ini`,
+   `Cargo.toml`, `go.mod`, `.pre-commit-config.yaml`. A fix spanning two runs
+   **both**, re-derived after each round. Picking one root marker and keeping it
+   would run the JavaScript tests for a Go-only change and call it verified.
 
-3. **If nothing resolves it stops and asks you** rather than skipping the check.
+3. **Nothing resolves → it stops and asks you,** rather than skipping the check.
 
-Pin a `.review-loop.json` when detection would guess wrong — a `justfile` whose
-recipes are named something other than `test`/`test-module`/`precommit`/`check`
-is the common case, and without a config the loop stops to ask on every run.
+Pin a config when detection would guess wrong — a `justfile` whose recipes aren't
+named `test`/`test-module`/`precommit`/`check` is the common case.
 
 ## Permissions
 
-Two approval prompts are deliberate. If you assume they are bugs you will route
-around them, which defeats the point.
+Two prompts are deliberate.
 
-**The helper script prompts on first use.** Only the plugin copy is pre-approved.
-A project-level install puts the script *inside the repo being reviewed*, where
-the branch under review could rewrite it and have it run before anything reviewed
-it. To silence the prompt, allowlist a copy that lives outside any checkout:
+**The helper script prompts on first use.** Only the plugin copy is pre-approved,
+because a project-level install puts the script *inside the repo being reviewed*,
+where the branch under review could rewrite it and have it run before anything
+reviewed it. Silence it only for a copy outside any checkout:
 
 ```json
 { "permissions": { "allow": [
-  "Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)"
+  "Bash(bash ~/.claude/skills/codex-review-loop/scripts/:*)",
+  "Bash(just test-module:*)"
 ] } }
 ```
 
-**Your project's test command prompts too.** There is no way to know it in
-advance, so it is not in `allowed-tools`:
+**Your test command prompts too** — there's no way to know it in advance. Add it
+alongside, as above.
 
-```json
-{ "permissions": { "allow": ["Bash(just test-module:*)"] } }
-```
-
-Approving a prompt is fine. Skipping the check step to avoid one is not.
+Approving a prompt is fine. Skipping the check to avoid one is not.
 
 ## Staying current
 
-For these skills, running an old copy is a safety problem rather than a
-missing-features problem. `codex-review.sh` is a parser, and every guard in it
-exists because some transcript once distilled to a confident `CLEAN` it had not
-earned — one of them a `- [P0]` for plaintext credential logging that came out as
-`BLOCKING=0`. A stale copy goes on reporting approval for branches nobody read.
+An old copy is a safety problem, not a missing-features one: the bugs fixed in
+`codex-review.sh` are false-`CLEAN` bugs, where the tool reports approval for a
+branch it never parsed.
 
 ```bash
-npx skills@latest update --global
+npx skills@latest update --global      # or: /plugin marketplace update copient-skills
 ```
 
-or, on the plugin path:
+**Updates overwrite your edits silently** — no warning, no prompt, no diff, just
+`✓ Updated`. Keep anything worth keeping in `.review-loop.json`, your own
+settings, or a PR here.
 
-```
-/plugin marketplace update copient-skills
-```
-
-**Updates overwrite your edits, silently.** A file you modified is replaced with
-no warning, no prompt and no diff — the run just reports `✓ Updated`. Treat
-everything under `.claude/skills/` as disposable; anything worth keeping belongs
-in `.review-loop.json`, your own settings, or a PR here.
-
-**If `~/.claude/skills` is a symlink,** check your links after an update that
-actually changes something. The installer keeps real files in `~/.agents/skills/`
-and links them in using a path relative to where it thinks `~/.claude/skills` is;
-if that is itself a symlink, the links resolve somewhere that does not exist and
-the skills stop loading with no error.
+**If `~/.claude/skills` is a symlink,** check your links after any real update.
+The installer keeps files in `~/.agents/skills/` and links them in *relatively*;
+against a symlinked directory those resolve nowhere and the skills stop loading
+with no error.
 
 ```bash
 test -e ~/.claude/skills/codex-review-loop/SKILL.md && echo ok || echo BROKEN
-
-# repair with absolute links
-cd ~/.claude/skills
-for s in codex-review-loop pr-review-loop; do
+cd ~/.claude/skills && for s in codex-review-loop pr-review-loop; do
   rm -f "$s" && ln -s "$HOME/.agents/skills/$s" "$s"
 done
 ```
@@ -223,66 +151,37 @@ done
 
 ```bash
 npx skills@latest remove codex-review-loop pr-review-loop
+# or: /plugin uninstall copient@copient-skills
 ```
 
-or:
+Nothing else to undo — no config is written outside the skill directories.
 
-```
-/plugin uninstall copient@copient-skills
-```
+## Rolling out to a team
 
-Nothing else to undo. No configuration is written outside the skill directories,
-and a `.review-loop.json` you added is inert without them.
-
-## Rolling this out to a team
-
-- **Delete any vendored copies first.** If these skills are checked into a repo
-  your team works in, the project-level copies shadow whatever each person
-  installs — so people get the new version everywhere except the repo they spend
-  the most time in, with nothing indicating which one ran. Remove them before
-  telling anyone to install.
-- **Pick one install path for everyone.** The invocation name differs between
-  them, so mixed installs mean docs and muscle memory that only work for half the
-  team.
-- **Pin `.review-loop.json` in the repos you review most.** One small PR per repo,
-  and nobody gets asked for the lint command again.
-- **Say the prompts are expected.** Both are described above; the failure mode
-  worth naming out loud is someone skipping the check step to avoid one.
+Delete any copies vendored into your repos first, or they shadow whatever people
+install and nothing says which one ran. Pick one install path for everyone, since
+the invocation name differs between them. Pin `.review-loop.json` in the repos you
+review most.
 
 ## Contributing
 
-**Everything here is public and goes under the `copient:` namespace.** A skill
-that needs Copient context — repo knowledge, production data, credentials — does
-not belong in this repo.
+**Everything here is public.** A skill needing Copient context — repo knowledge,
+production data, credentials — does not belong in this repo.
 
-If you touch `codex-review.sh`, two rules:
+**Do not simplify `codex-review.sh`.** It looks over-engineered. Each guard traces
+to a reproduced false-`CLEAN`, and together they mean: never report approval for
+something you did not parse. `UNPARSED` exists so an unrecognized transcript fails
+loudly. Every parser change needs a fixture proven red against the previous
+version before it goes green.
 
-- **Do not simplify it.** It looks over-engineered. Each guard traces to a
-  reproduced false-`CLEAN`, and together they add up to one rule: this script must
-  never report approval for something it did not parse. `UNPARSED` exists so an
-  unrecognized transcript fails loudly instead of quietly passing.
-- **Every parser change needs a fixture proven red against the previous version
-  before it goes green.** The offline suite needs no Codex call:
-
-  ```bash
-  bash skills/codex-review-loop/scripts/test-codex-review.sh   # expects ALL PASS
-  ```
-
-CI runs that suite on Linux, macOS, and stock macOS bash 3.2 on every push, plus
-`shellcheck`.
+CI runs the parser suite on Linux, macOS, and stock macOS bash 3.2, plus
+`shellcheck`, on every push.
 
 ## Layout
 
 ```
-skills/                  agent-neutral source of truth
-  codex-review-loop/
-  pr-review-loop/
-.claude-plugin/          Claude Code adapter (marketplace + plugin manifests)
+skills/            agent-neutral source of truth
+.claude-plugin/    Claude Code adapter
 ```
-
-`skills/` carries nothing agent-specific. The adapter sits on top, so the plugin
-path works without the skills knowing about it.
-
-## License
 
 MIT — see [LICENSE](LICENSE).
