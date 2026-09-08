@@ -163,7 +163,9 @@ def validate_plan(data, source):
         if not isinstance(a, dict):
             usage_error(f"plan {source}: each angle must be an object")
         aid = a.get("id")
-        if not isinstance(aid, str) or not ANGLE_ID_RE.match(aid):
+        # fullmatch, not match/$ -- re's `$` matches before a trailing
+        # newline too, so `.match()` would let an id like "alpha\n" through.
+        if not isinstance(aid, str) or not ANGLE_ID_RE.fullmatch(aid):
             usage_error(
                 f"plan {source}: invalid angle id {aid!r} "
                 f"(must match ^[a-z0-9][a-z0-9-]*$)"
@@ -632,16 +634,18 @@ def dir_in_git_repo(path):
     """Whether `path` sits inside a git working tree (any repo — not just
     the one adversarial-review would review, and no relation to whether
     `path` itself is version-controlled). Used only to decide where
-    merged.json is safe to land; a git rev-parse failure (no git on PATH, or
-    genuinely not in a repo) is read as "not in a repo" so the normal
-    same-directory behavior is the fail-safe default."""
+    merged.json is safe to land. Fails closed: git actually running and
+    answering "not a repo" (nonzero exit) is trusted as such, but git not
+    being runnable at all (missing from PATH, bad cwd, ...) means the
+    question was never answered — treated as "possibly inside a checkout" so
+    merged.json diverts to a temp file instead of risking a write into one."""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=path, capture_output=True, text=True,
         )
     except OSError:
-        return False
+        return True
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
@@ -804,29 +808,42 @@ def kill_process_group(proc, grace_sec=2):
 # signal directly. Codex is started with start_new_session=True precisely so
 # each one's whole process group, not just its own pid, can be reaped this
 # way (see kill_process_group).
+#
+# The signal handler below must never block on a lock: it runs on the main
+# thread, synchronously, wherever that thread's bytecode happened to be —
+# possibly itself inside `with _LIVE_PROCS_LOCK` via _track_proc/_untrack_proc
+# a worker thread called into, or inside a ThreadPoolExecutor internal lock —
+# so taking a lock or calling executor.shutdown() (which takes one of its
+# own) from here risks a self-deadlock. _LIVE_PROCS is therefore a plain
+# list: worker paths (_track_proc/_untrack_proc) still serialize their own
+# add/remove through _LIVE_PROCS_LOCK to avoid corrupting the list under
+# concurrent workers, but the handler reads it directly, lock-free — a plain
+# list's append/remove/read are each atomic enough under the GIL that a
+# lock-free read is safe (worst case it misses an id added a moment after
+# the signal, or races a same-moment removal; either way `kill_process_group`
+# treats an already-gone process as a no-op).
 _LIVE_PROCS_LOCK = threading.Lock()
-_LIVE_PROCS = set()
+_LIVE_PROCS = []
 
-# The parallel-phase ThreadPoolExecutor, while one is running — None the rest
-# of the time (including throughout the serial phase, which uses no
-# executor). Lets the interrupt handler cancel not-yet-started futures
-# without main() having to thread the executor through to it.
-_CURRENT_EXECUTOR = None
+# Set only by the signal handler, read (never written) everywhere else — a
+# bare global bool rather than a threading.Event, whose set() takes an
+# internal lock the handler must not touch. Lets a main-thread path (e.g.
+# main()'s future-submission loop) notice cancellation and stop scheduling
+# more work without itself taking any lock.
+_CANCELLED = False
 
 
 def _track_proc(proc):
     with _LIVE_PROCS_LOCK:
-        _LIVE_PROCS.add(proc)
+        _LIVE_PROCS.append(proc)
 
 
 def _untrack_proc(proc):
     with _LIVE_PROCS_LOCK:
-        _LIVE_PROCS.discard(proc)
-
-
-def _set_current_executor(ex):
-    global _CURRENT_EXECUTOR
-    _CURRENT_EXECUTOR = ex
+        try:
+            _LIVE_PROCS.remove(proc)
+        except ValueError:
+            pass
 
 
 def _interrupt_and_exit(signum=None, frame=None):
@@ -845,20 +862,26 @@ def _interrupt_and_exit(signum=None, frame=None):
     angle's own subprocess.communicate() being interrupted directly (see
     run_angle's matching except BaseException, which kills that one angle's
     group immediately, before this function's sweep, so a SIGKILL escalation
-    on the same group here is a harmless no-op rather than a race). Cancels
-    every not-yet-started future in the parallel-phase pool, kills every
-    tracked reviewer's process group, prints one line, and exits — 130, the
-    conventional 128+SIGINT code, used for SIGTERM here too since either
-    means "the run is being cancelled", never "codex could not be spawned"
-    (exit 3) or any other structured exit this tool defines. Uses os._exit,
-    not sys.exit, so it terminates immediately and correctly even when
-    called from inside a signal handler on the main thread, without waiting
-    on any worker thread still blocked in a subprocess call."""
-    ex = _CURRENT_EXECUTOR
-    if ex is not None:
-        ex.shutdown(wait=False, cancel_futures=True)
-    with _LIVE_PROCS_LOCK:
-        procs = list(_LIVE_PROCS)
+    on the same group here is a harmless no-op rather than a race).
+
+    Never takes a lock and never calls executor.shutdown() — see the
+    _LIVE_PROCS comment above for why. Sets _CANCELLED first (so any
+    main-thread path checking it, and any worker mid-Popen in run_angle,
+    sees cancellation as early as possible), then kills every process group
+    in a lock-free snapshot of _LIVE_PROCS, prints one line, and exits —
+    130, the conventional 128+SIGINT code, used for SIGTERM here too since
+    either means "the run is being cancelled", never "codex could not be
+    spawned" (exit 3) or any other structured exit this tool defines. Uses
+    os._exit, not sys.exit, so it terminates immediately and correctly even
+    when called from inside a signal handler on the main thread, without
+    waiting on any worker thread still blocked in a subprocess call — which
+    also means a not-yet-started future in the parallel-phase pool is never
+    explicitly cancelled here: the whole process (every thread, every queued
+    future with it) is gone by the time os._exit returns, so there is
+    nothing left to cancel."""
+    global _CANCELLED
+    _CANCELLED = True
+    procs = list(_LIVE_PROCS)
     for proc in procs:
         kill_process_group(proc)
     print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
@@ -885,8 +908,20 @@ def clear_stale_artifacts(aid, run_dir):
             pass
 
 
+def _mark_interrupted(aid, run_dir):
+    """Marks angle `aid` UNPARSED(interrupted) — written by run_angle itself
+    when it notices _CANCELLED around its own Popen call, so this run's own
+    collect_angle_result (or a later --from-dir re-merge of the same --dir)
+    reports the same outcome, the same way _mark_skipped's dirty-tree/
+    compromised markers do for angles that never ran at all."""
+    (run_dir / f"{aid}.skipped.txt").write_text("interrupted\n")
+
+
 def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
-    clear_stale_artifacts(aid, run_dir)
+    # Stale artifacts for `aid` are cleared by main(), synchronously, before
+    # either phase (parallel or serial) schedules any angle — not here, so a
+    # queued angle whose run_angle body never gets to run before an
+    # interrupt still has its old outputs gone.
     prompt_text = render_prompt(template, plan, angle, base_resolved)
     (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
     out_path = run_dir / f"{aid}.out.json"
@@ -903,6 +938,21 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     ]
     try:
         with open(log_path, "wb") as logfh:
+            # Closes the spawn/track race with the interrupt handler: a
+            # signal landing between Popen() returning and _track_proc()
+            # registering it would let the handler's lock-free sweep of
+            # _LIVE_PROCS miss this process entirely, leaking it (and
+            # anything it backgrounds) past this run's exit. Checking
+            # _CANCELLED immediately before Popen, registering immediately
+            # after (before anything else runs), and checking once more
+            # right after covers both sides of that window — if cancellation
+            # is seen at either point, this angle kills its own new group
+            # itself rather than trust a sweep that may already have run
+            # without it, and reports the same outcome the handler's own
+            # exit would have implied.
+            if _CANCELLED:
+                _mark_interrupted(aid, run_dir)
+                return None
             # start_new_session makes this process its own process-group
             # leader, so a timeout can reap everything it spawned via
             # killpg — not just its own pid, which is all subprocess.run's
@@ -912,6 +962,11 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                 cwd=root, start_new_session=True,
             )
             _track_proc(proc)
+            if _CANCELLED:
+                kill_process_group(proc)
+                _untrack_proc(proc)
+                _mark_interrupted(aid, run_dir)
+                return None
             try:
                 try:
                     proc.communicate(timeout=timeout_sec)
@@ -1155,6 +1210,17 @@ def main(argv=None):
         # run_write_capable_angles.
         parallel_ids, serial_ids = partition_angles(angle_ids, angles_by_id)
 
+        # Every selected angle's stale artifacts (this same --dir's leftovers
+        # from an earlier invocation) are cleared here, synchronously, before
+        # either phase schedules any work — not lazily inside run_angle. A
+        # reused --dir with --jobs 1 makes this observable: if a SIGINT lands
+        # while angle 1 is still running, angles 2 and 3 sit queued and their
+        # run_angle body never executes in this run at all, so only an
+        # upfront clear (not run_angle's own) can guarantee their old
+        # .out.json doesn't survive as this run's (mis)result.
+        for aid in angle_ids:
+            clear_stale_artifacts(aid, run_dir)
+
         spawn_failures = []
         # SIGINT/SIGTERM anywhere in here — blocked on a parallel angle in
         # cf.as_completed, or on a serial one inside run_write_capable_angles
@@ -1174,20 +1240,28 @@ def main(argv=None):
             if parallel_ids:
                 jobs = args.jobs or min(len(parallel_ids), 4)
                 ex = cf.ThreadPoolExecutor(max_workers=jobs)
-                _set_current_executor(ex)
-                future_to_id = {
-                    ex.submit(
+                # An explicit loop, not a dict comprehension: checking
+                # _CANCELLED after each submit() lets this stop handing out
+                # more work once cancellation is seen, rather than
+                # unconditionally queuing every remaining angle. In practice
+                # the signal handler's os._exit ends the whole process (this
+                # loop included) before a real interrupt could ever be
+                # observed here — this is a cheap, correct belt-and-suspenders
+                # check, not the primary defense (that's run_angle's own
+                # checks around its Popen call).
+                future_to_id = {}
+                for aid in parallel_ids:
+                    future_to_id[ex.submit(
                         run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
                         run_dir, root, schema_path, args.timeout,
-                    ): aid
-                    for aid in parallel_ids
-                }
+                    )] = aid
+                    if _CANCELLED:
+                        break
                 for fut in cf.as_completed(future_to_id):
                     err = fut.result()
                     if err is not None:
                         spawn_failures.append((future_to_id[fut], err))
                 ex.shutdown(wait=True)
-                _set_current_executor(None)
 
             synthetic_results, serial_spawn_failures = run_write_capable_angles(
                 serial_ids, angles_by_id, plan, base_resolved, template,

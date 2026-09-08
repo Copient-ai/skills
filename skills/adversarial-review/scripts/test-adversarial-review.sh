@@ -204,6 +204,16 @@ printf '%s\n' "$err7f"
 check "int base exits 2" test "$rc7f" -eq 2
 check "int base names the problem" grep -qi "'base' must be a non-empty string" <<<"$err7f"
 
+# Regression: ANGLE_ID_RE was checked with .match(), and re's `$` matches
+# just before a trailing newline as well as at the true end of string, so an
+# id of "alpha\n" slipped through validation. Must be rejected by .fullmatch().
+dir7g=$(stage bad-plan-id-newline)
+err7g=$(bash "$SH" --from-dir "$dir7g" 2>&1); rc7g=$?
+echo "--- case 7g: angle id with an embedded trailing newline ---"
+printf '%s\n' "$err7g"
+check "id with trailing newline exits 2" test "$rc7g" -eq 2
+check "id with trailing newline names the problem" grep -qi "invalid angle id" <<<"$err7g"
+
 # --- Case 8: the block format is exact -----------------------------------------
 dir8=$(stage exact-format)
 out8=$(bash "$SH" --from-dir "$dir8")
@@ -763,6 +773,95 @@ EOF
   rm -rf "$rundir22" "$linkdir22"
 fi
 
+# --- Case 23: dir_in_git_repo fails closed when git cannot be run --------------
+# Regression: dir_in_git_repo returned False -- "not in a repo, safe to write
+# merged.json in place" -- whenever `git rev-parse` itself could not even be
+# run (e.g. no git on PATH), indistinguishable from a real, confident "not a
+# repo" answer. It must fail closed instead: a check that never ran means the
+# question was never answered, so merged.json is diverted to a temp file
+# exactly as it would be for a directory git confirms is inside a checkout
+# (see case 20). Invokes adversarial_review.py directly rather than through
+# adversarial-review.sh, whose own preflight needs `dirname` on PATH too; a
+# staged fixture (not itself a git repo) proves the diversion comes from git
+# being unusable, not from the directory actually being inside one.
+dir23=$(stage all-clean)
+nogitbin23="$tmpdir/nogit-bin.$$.${RANDOM:-0}"
+mkdir -p "$nogitbin23"
+ln -s "$(command -v python3)" "$nogitbin23/python3"
+out23=$(PATH="$nogitbin23" python3 "$PY" --from-dir "$dir23" 2>&1); rc23=$?
+echo "--- case 23: dir_in_git_repo fails closed when git is unavailable ---"
+printf '%s\n' "$out23"
+
+check "exits 0" test "$rc23" -eq 0
+merged23=$(grep '^MERGED=' <<<"$out23" | sed 's/^MERGED=//')
+check "a MERGED= line was printed" test -n "$merged23"
+check "the MERGED= path exists" test -f "$merged23"
+check "merged.json was diverted outside the staged fixture dir" \
+  bash -c '[[ "$1" != "$2"/* ]]' _ "$merged23" "$dir23"
+check "merged.json was not written into the staged fixture dir" \
+  test ! -f "$dir23/merged.json"
+
+rm -f "$merged23"
+
+# --- Case 24: stale artifacts are cleared for every selected angle up front ----
+# Regression: clear_stale_artifacts(aid, run_dir) ran at the top of run_angle
+# itself, so under --jobs 1 a queued (not-yet-started) angle kept whatever
+# .out.json an earlier invocation of this same --dir had left, right up until
+# an interrupt ended the run before that angle's own worker turn ever came.
+# Reuses fake-codex-hang.sh (see case 22): with a single worker, angle 1
+# hangs well past the SIGINT this test sends while angles 2 and 3 never start
+# at all -- proving their stale artifacts can only have been cleared eagerly,
+# not lazily inside a run_angle call that, for them, never happened.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 24: stale artifacts cleared eagerly, not lazily per worker ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo24=$(make_throwaway_repo stale-artifacts-eager-clear)
+  cat > "$repo24/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "gamma", "title": "Gamma", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+  rundir24="$tmpdir/stale-clear-run.$$.${RANDOM:-0}"
+  linkdir24="$tmpdir/stale-clear-links.$$.${RANDOM:-0}"
+  mkdir -p "$rundir24" "$linkdir24"
+  for aid24 in alpha beta gamma; do
+    printf '{"angle": "%s", "verdict": "CLEAN", "summary": "stale", "findings": []}' "$aid24" \
+      > "$rundir24/$aid24.out.json"
+    printf '0\n' > "$rundir24/$aid24.status"
+  done
+  marker24="staleclear$$_${RANDOM:-0}"
+  stdout24="$tmpdir/stale-clear.stdout"
+  stderr24="$tmpdir/stale-clear.stderr"
+
+  CODEX_BIN="$FIXTURES/fake-codex-hang.sh" \
+  ADV_TEST_SLEEP_MARKER="$marker24" \
+  ADV_TEST_SLEEP_LINKDIR="$linkdir24" \
+  bash -c 'cd "$1" && exec bash "$2" --plan plan.json --base main --dir "$3" --jobs 1 --timeout 2' \
+    _ "$repo24" "$SH" "$rundir24" >"$stdout24" 2>"$stderr24" &
+  runner_pid=$!
+
+  sleep 1
+  kill -INT "$runner_pid" 2>/dev/null || true
+  wait "$runner_pid"
+  rc24=$?
+
+  echo "--- case 24: stale artifacts cleared eagerly, not lazily per worker ---"
+  cat "$stderr24"
+
+  check "exits 130" test "$rc24" -eq 130
+  for aid24 in alpha beta gamma; do
+    check "no stale $aid24.out.json remains" test ! -f "$rundir24/$aid24.out.json"
+  done
+
+  sleep 1
+  pkill -f "sleep-$marker24" 2>/dev/null || true
+  rm -rf "$rundir24" "$linkdir24"
+fi
+
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
 py_ver=$(python3 "$PY" --version | awk '{print $2}')
@@ -928,6 +1027,46 @@ echo "--- partition_angles scheduling ---"
 printf '%s\n' "$partition_check"
 check "read-only/workspace-write split preserves plan order in each group" \
   test "$partition_check" = "OK"
+
+# --- run_angle honors _CANCELLED before ever spawning a reviewer ---------------
+# Regression: a SIGINT/SIGTERM landing between Popen() returning and the new
+# process being registered in _LIVE_PROCS could let the interrupt handler's
+# sweep miss it entirely. run_angle now checks _CANCELLED immediately before
+# Popen (and again right after registering); this exercises the simpler,
+# hermetic half of that fix directly -- presetting the flag before the call,
+# which the real signal-race can't easily be forced into on demand -- and
+# proves Popen is never reached at all, with the angle reported the same way
+# an interrupt handler's own exit would have left it: UNPARSED(interrupted).
+cancel_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+ar._CANCELLED = True
+
+def fail_popen(*a, **kw):
+    raise AssertionError("Popen must not be called once _CANCELLED is set")
+ar.subprocess.Popen = fail_popen
+
+angle = {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}
+plan = {"promise": "Ships a thing.", "contracts": [], "invariants": []}
+
+with tempfile.TemporaryDirectory() as d:
+    run_dir = Path(d)
+    err = ar.run_angle(
+        "alpha", angle, plan, "main", "template {{ANGLE_ID}}",
+        run_dir, "/tmp", "schema.json", 5,
+    )
+    result = ar.collect_angle_result(angle, run_dir)
+    ok = err is None and result.kind == "UNPARSED" and result.cause == "interrupted"
+    print("OK" if ok else f"MISMATCH: err={err!r} kind={result.kind!r} cause={result.cause!r}")
+PYEOF
+)
+echo "--- run_angle: cancellation is checked before Popen ---"
+printf '%s\n' "$cancel_check"
+check "a preset _CANCELLED flag skips Popen and reports UNPARSED(interrupted)" \
+  test "$cancel_check" = "OK"
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh
