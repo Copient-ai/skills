@@ -38,6 +38,28 @@ stage() { # stage <fixture-name>
   printf '%s\n' "$dest"
 }
 
+# Creates a tiny throwaway git repo (its own dir under $tmpdir) with a
+# 'main' branch and a 'feature' branch one commit ahead, so `git diff
+# main...feature` is non-empty and resolve_base can find local branch
+# 'main' (no 'origin' remote is configured, so the origin/main candidate
+# never verifies). Used by the live-ish cases below that need main() to run
+# past its git/base/diff preflight checks. Echoes the repo path.
+make_throwaway_repo() { # make_throwaway_repo <name>
+  local repo="$tmpdir/$1.$$.${RANDOM:-0}"
+  mkdir -p "$repo"
+  git init -q -b main "$repo"
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test"
+  echo "base" > "$repo/f.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m base
+  git -C "$repo" checkout -q -b feature
+  echo "changed" >> "$repo/f.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m feature
+  printf '%s\n' "$repo"
+}
+
 # --- Case 1: all angles CLEAN --------------------------------------------------
 dir1=$(stage all-clean)
 out1=$(bash "$SH" --from-dir "$dir1"); rc1=$?
@@ -143,6 +165,20 @@ printf '%s\n' "$err7c"
 check "version 2 exits 2" test "$rc7c" -eq 2
 check "version 2 names the problem" grep -qi "unsupported plan version" <<<"$err7c"
 
+dir7d=$(stage bad-plan-null-promise)
+err7d=$(bash "$SH" --from-dir "$dir7d" 2>&1); rc7d=$?
+echo "--- case 7d: null promise ---"
+printf '%s\n' "$err7d"
+check "null promise exits 2" test "$rc7d" -eq 2
+check "null promise names the problem" grep -qi "'promise' must be a non-empty string" <<<"$err7d"
+
+dir7e=$(stage bad-plan-string-contracts)
+err7e=$(bash "$SH" --from-dir "$dir7e" 2>&1); rc7e=$?
+echo "--- case 7e: contracts is a string, not a list ---"
+printf '%s\n' "$err7e"
+check "string contracts exits 2" test "$rc7e" -eq 2
+check "string contracts names the problem" grep -qi "'contracts' must be a list of strings" <<<"$err7e"
+
 # --- Case 8: the block format is exact -----------------------------------------
 dir8=$(stage exact-format)
 out8=$(bash "$SH" --from-dir "$dir8")
@@ -238,6 +274,123 @@ check "stderr names the refused angle" grep -qi "reassign" <<<"$err12"
 check "stderr says the provider refused" grep -qi "refused" <<<"$err12"
 check "the log excerpt itself is not echoed to stdout" \
   bash -c '! grep -qi "flagged for possible cybersecurity risk" <<<"$1"' _ "$out12"
+
+# --- Case 13: out.json present but no .status file at all ----------------------
+# A present, well-formed out.json must never be accepted on its own — only a
+# .status file that parses as exactly 0 marks the run as having completed.
+dir13=$(stage missing-status)
+out13=$(bash "$SH" --from-dir "$dir13" 2>/dev/null); rc13=$?
+echo "--- case 13: missing-status ---"
+printf '%s\n' "$out13"
+
+check "verdict is UNPARSED (no .status means the run is never accepted)" \
+  grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out13"
+check "exits 4" test "$rc13" -eq 4
+check "the angle names its cause" \
+  grep -qx "alpha: UNPARSED(nostatus)" <<<"$out13"
+check "counts show one UNPARSED angle, none RAN" \
+  grep -qx "ANGLES=1  RAN=0  BLOCKED=0  UNPARSED=1" <<<"$out13"
+
+# --- Case 14: out.json is tagged with a different angle's id -------------------
+dir14=$(stage mistagged)
+out14=$(bash "$SH" --from-dir "$dir14" 2>/dev/null); rc14=$?
+echo "--- case 14: mistagged ---"
+printf '%s\n' "$out14"
+
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out14"
+check "exits 4" test "$rc14" -eq 4
+check "the mistagged angle names its cause" \
+  grep -qx "mismatch: UNPARSED(mistagged)" <<<"$out14"
+check "the control angle still ran clean" \
+  grep -qx "control: CLEAN" <<<"$out14"
+check "the mistagged angle's finding is never attributed" \
+  bash -c '! grep -q "must never be attributed" <<<"$1"' _ "$out14"
+check "no findings block at all — its only finding came from the mistagged angle" \
+  bash -c '! grep -q -- "--- FINDINGS ---" <<<"$1"' _ "$out14"
+
+# --- Case 15: two findings share a claim prefix over 60 chars but diverge later
+# Regression for dedup keying on a 60-char claim prefix instead of the full
+# normalized claim — these two must NOT collapse into one finding.
+dir15=$(stage long-claim-prefix)
+out15=$(bash "$SH" --from-dir "$dir15"); rc15=$?
+echo "--- case 15: long-claim-prefix ---"
+printf '%s\n' "$out15"
+
+check "exits 0" test "$rc15" -eq 0
+check "verdict is FINDINGS" grep -qx "ADVERSARIAL_REVIEW: FINDINGS" <<<"$out15"
+check "both findings survive — dedup is on the full claim, not a 60-char prefix" \
+  test "$(grep -c '^- \[P' <<<"$out15")" -eq 2
+check "reader-a's claim is present" \
+  grep -qF "logs nothing, so the failure is invisible to on-call" <<<"$out15"
+check "reader-b's claim is present" \
+  grep -qF "returns a fabricated success response to the caller" <<<"$out15"
+
+# --- Case 16: --dir pointing inside the repository is refused ------------------
+repo16=$(make_throwaway_repo dir-inside-repo)
+cat > "$repo16/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+err16=$(cd "$repo16" && CODEX_BIN=true bash "$SH" --plan plan.json --base main --dir "$repo16/rundir" 2>&1); rc16=$?
+echo "--- case 16: --dir inside the repository ---"
+printf '%s\n' "$err16"
+check "dir inside repo exits 2" test "$rc16" -eq 2
+check "dir inside repo names the problem" \
+  grep -qi "run directory must live outside the repository so it cannot dirty the tree" <<<"$err16"
+
+# --- Case 17: a codex timeout kills the whole process group, not just codex ----
+# The one live-ish case here: CODEX_BIN points at fixtures/fake-codex-hang.sh,
+# a fake codex that backgrounds a marker-named `sleep 30` and then hangs
+# itself, so a real --timeout has to fire. Proves run_angle's
+# start_new_session + killpg reaps the whole group (subprocess.run's own
+# timeout kill would leave the backgrounded sleep orphaned and running).
+# Hermetic: no network, no real codex — skipped with a clear message if this
+# platform lacks pgrep/process-group semantics.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 17: timeout kills the process group ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo17=$(make_throwaway_repo timeout-killpg)
+  cat > "$repo17/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+  rundir17="$tmpdir/timeout-killpg-run.$$.${RANDOM:-0}"
+  linkdir17="$tmpdir/timeout-killpg-links.$$.${RANDOM:-0}"
+  mkdir -p "$linkdir17"
+  marker17="killpgtest$$_${RANDOM:-0}"
+
+  start17=$(date +%s)
+  out17=$(cd "$repo17" && \
+    CODEX_BIN="$FIXTURES/fake-codex-hang.sh" \
+    ADV_TEST_SLEEP_MARKER="$marker17" \
+    ADV_TEST_SLEEP_LINKDIR="$linkdir17" \
+    bash "$SH" --plan plan.json --base main --dir "$rundir17" --timeout 2 2>&1)
+  rc17=$?
+  end17=$(date +%s)
+  elapsed17=$((end17 - start17))
+  echo "--- case 17: timeout kills the process group ---"
+  printf '%s\n' "$out17"
+  echo "  elapsed: ${elapsed17}s"
+
+  check "finishes quickly despite the fake codex hanging" test "$elapsed17" -le 15
+  check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out17"
+  check "exits 4" test "$rc17" -eq 4
+  check "the angle is marked UNPARSED(timeout)" \
+    grep -qx "alpha: UNPARSED(timeout)" <<<"$out17"
+
+  # Give the kill a brief moment to land, then confirm no leftover sleep.
+  sleep 1
+  if pgrep -f "sleep-$marker17" >/dev/null 2>&1; then
+    echo "  FAIL: leftover 'sleep 30' process from this run is still running"
+    fails=$((fails + 1))
+    pkill -f "sleep-$marker17" 2>/dev/null || true
+  else
+    echo "  ok: no leftover 'sleep 30' process from this run"
+  fi
+
+  rm -rf "$rundir17" "$linkdir17"
+fi
 
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')

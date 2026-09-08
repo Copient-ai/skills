@@ -1,0 +1,15 @@
+{
+  "angle": "control",
+  "verdict": "FINDINGS",
+  "summary": "Found one issue (but this output is tagged with the wrong angle id).",
+  "findings": [
+    {
+      "severity": "P1",
+      "path": "x.py",
+      "line": 3,
+      "claim": "This finding must never be attributed since its angle tag is wrong",
+      "evidence": "e",
+      "reproduction": "r"
+    }
+  ]
+}

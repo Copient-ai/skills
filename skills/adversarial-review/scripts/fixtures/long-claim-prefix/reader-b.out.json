@@ -1,0 +1,15 @@
+{
+  "angle": "reader-b",
+  "verdict": "FINDINGS",
+  "summary": "Reader B found one issue.",
+  "findings": [
+    {
+      "severity": "P2",
+      "path": "retry.py",
+      "line": 40,
+      "claim": "The retry wrapper swallows the underlying exception when the connection drops mid-request and returns a fabricated success response to the caller",
+      "evidence": "except Exception: return {'ok': True} on the error path",
+      "reproduction": "force a connection error and observe a fabricated 200"
+    }
+  ]
+}

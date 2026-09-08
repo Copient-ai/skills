@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,15 @@ def validate_plan(data, source):
         usage_error(
             f"unsupported plan version {data.get('version')!r} in {source} (expected 1)"
         )
+    promise = data.get("promise")
+    if not isinstance(promise, str) or not promise.strip():
+        usage_error(f"plan {source}: 'promise' must be a non-empty string")
+    for list_field in ("contracts", "invariants"):
+        val = data.get(list_field)
+        if val is not None and not (
+            isinstance(val, list) and all(isinstance(x, str) for x in val)
+        ):
+            usage_error(f"plan {source}: '{list_field}' must be a list of strings")
     angles = data.get("angles")
     if not isinstance(angles, list) or not angles:
         usage_error(f"plan {source} must have a non-empty 'angles' array")
@@ -370,17 +380,22 @@ def collect_angle_result(angle, run_dir):
     residue_path = run_dir / f"{aid}.residue.txt"
     log_path = run_dir / f"{aid}.log"
 
-    exit_code = None
-    if status_path.is_file():
-        text = status_path.read_text().strip()
-        try:
-            exit_code = int(text)
-        except ValueError:
-            exit_code = None  # malformed status file — fall through to the JSON check
+    # A present out.json is trusted only once its own run reports exit 0 —
+    # a missing or unparsable .status file, or one that isn't 0, means the
+    # run never properly completed, so out.json (if present at all) is never
+    # accepted, however clean it looks: it could be left over from an
+    # earlier run, or partially written mid-crash.
+    if not status_path.is_file():
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="nostatus")
+    status_text = status_path.read_text().strip()
+    try:
+        exit_code = int(status_text)
+    except ValueError:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="nostatus")
 
     if exit_code == 124:
         return AngleResult(aid, angle["title"], "UNPARSED", cause="timeout")
-    if exit_code not in (None, 0):
+    if exit_code != 0:
         # A nonzero exit with no out.json can mean the provider refused the
         # prompt outright rather than the angle failing to run — distinguish
         # that before falling back to the generic exit<n> cause.
@@ -403,6 +418,12 @@ def collect_angle_result(angle, run_dir):
     ok, _err = validate_findings_json(data)
     if not ok:
         return AngleResult(aid, angle["title"], "UNPARSED", cause="schema")
+
+    # Output tagged with a different angle's id is never trusted — a stale
+    # file, a copy-paste, or the model answering the wrong mandate — so its
+    # findings are not attributed to anything.
+    if data["angle"] != aid:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="mistagged")
 
     findings = data["findings"]
 
@@ -435,7 +456,10 @@ def collect_angle_result(angle, run_dir):
 # --- Merge + dedup -------------------------------------------------------------
 
 def dedup_key(f):
-    claim_norm = re.sub(r"\s+", " ", f["claim"].strip().lower())[:60]
+    # The full normalized claim, not a prefix — two findings at the same
+    # path:line whose claims share a long common prefix but diverge later
+    # are different findings and must both survive the merge.
+    claim_norm = re.sub(r"\s+", " ", f["claim"].strip().lower())
     return (f["path"], f["line"], claim_norm)
 
 
@@ -580,6 +604,30 @@ def build_arg_parser():
     return p
 
 
+def kill_process_group(proc, grace_sec=2):
+    """SIGTERM the whole process group `proc` leads (started with
+    start_new_session=True), then SIGKILL after a short grace if it hasn't
+    exited. A timed-out reviewer may have spawned children of its own — a
+    test runner, a backgrounded reproduction — and killing only `proc`
+    itself (subprocess.run's own timeout behavior) would leave those
+    running. Best-effort: a process/group that's already gone is not an
+    error here."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=grace_sec)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
     prompt_text = render_prompt(template, plan, angle, base_resolved)
     (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
@@ -597,14 +645,20 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     ]
     try:
         with open(log_path, "wb") as logfh:
-            proc = subprocess.run(
+            # start_new_session makes this process its own process-group
+            # leader, so a timeout can reap everything it spawned via
+            # killpg — not just its own pid, which is all subprocess.run's
+            # built-in timeout kill would reach.
+            proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                cwd=root, timeout=timeout_sec,
+                cwd=root, start_new_session=True,
             )
-        (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
-        return None
-    except subprocess.TimeoutExpired:
-        (run_dir / f"{aid}.status").write_text("124\n")
+            try:
+                proc.communicate(timeout=timeout_sec)
+                (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
+            except subprocess.TimeoutExpired:
+                kill_process_group(proc)
+                (run_dir / f"{aid}.status").write_text("124\n")
         return None
     except OSError as e:
         return str(e)
@@ -725,9 +779,24 @@ def main(argv=None):
             # otherwise land codex's output under root instead of where the
             # caller meant.
             run_dir = Path(args.dir).resolve()
-            run_dir.mkdir(parents=True, exist_ok=True)
         else:
             run_dir = Path(tempfile.mkdtemp(prefix="adversarial-review.", dir=os.environ.get("TMPDIR", "/tmp")))
+
+        # A run directory inside the repository would let codex's own
+        # output (or a workspace-write angle's reproduction) land inside the
+        # tree under review, dirtying it under the very git-status gate meant
+        # to catch that. --from-dir is exempt (handled in its own branch
+        # above) — it only ever reads a prior run's output, never writes.
+        if run_dir.is_relative_to(Path(root).resolve()):
+            if not args.dir:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            usage_error(
+                f"run directory {run_dir} is inside the repository root {root} — "
+                "the run directory must live outside the repository so it cannot dirty the tree"
+            )
+
+        if args.dir:
+            run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
 
         template = load_angle_prompt_template(args.angle_prompt, script_dir)
