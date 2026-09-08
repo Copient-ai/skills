@@ -1134,6 +1134,37 @@ check "merged.json landed under /tmp or /var/tmp, not some other surprise path" 
 
 rm -f "$merged23f"
 
+# --- Case 23g: dir_in_git_repo's git probe is locale-stable ---------------------
+# Regression: the "not a git repository (or any of the parent directories)"
+# match in _git_probe_inside_work_tree is the literal English string git
+# prints -- a localized ambient LANG/LC_ALL (a caller's shell, a CI runner
+# set to e.g. de_DE.UTF-8) would make git emit a translated fatal: message
+# instead, so the match would silently miss and a genuine "outside any
+# repo" directory would fail open to "possibly inside a checkout" (True)
+# instead of the correct False. The probe now pins LC_ALL=C/LANG=C in the
+# subprocess env it runs with, on a copy, regardless of the caller's own
+# environment. /tmp is not inside any git repo, so with git available this
+# must report False either way -- the point of this test is that a
+# de_DE.UTF-8 LANG exported in the *caller's* environment cannot flip that
+# answer.
+if ! command -v git >/dev/null 2>&1; then
+  echo "--- case 23g: dir_in_git_repo is locale-stable ---"
+  echo "  SKIP: git not available"
+else
+  probe23g=$(LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+print(ar.dir_in_git_repo("/tmp"))
+PYEOF
+)
+  echo "--- case 23g: dir_in_git_repo is locale-stable under a localized caller LANG ---"
+  echo "  dir_in_git_repo(/tmp) result: $probe23g"
+  check "/tmp reports outside any repo (False) even with LANG=de_DE.UTF-8 exported" \
+    test "$probe23g" = "False"
+fi
+
 # --- Case 24: stale artifacts are cleared for every selected angle up front ----
 # Regression: clear_stale_artifacts(aid, run_dir) ran at the top of run_angle
 # itself, so under --jobs 1 a queued (not-yet-started) angle kept whatever
@@ -1249,6 +1280,36 @@ printf '%s\n' "$err25b"
 check "missing --base exits 2" test "$rc25b" -eq 2
 check "missing --base names the problem" grep -qi -- "--print-base requires --base" <<<"$err25b"
 
+# --- Case 25c: resolve_base checks the remote-ref namespace, not a same- ------
+# --- named local branch --------------------------------------------------------
+# Regression: resolve_base used to hardcode "origin/<base>" as a candidate
+# and verify it with a bare `git rev-parse --verify --quiet origin/<base>`.
+# git's own ref disambiguation (gitrevisions(7)) checks refs/heads/<name>
+# before refs/remotes/<name>, so a *local* branch literally named
+# "origin/main" would satisfy that check even with no "origin" remote
+# configured at all -- resolving to the wrong ref entirely. Builds a repo
+# with a local branch named "origin/main" (no remote, so no real
+# refs/remotes/origin/main exists) and a real local "main", and confirms
+# --print-base --base main correctly falls through to "main" rather than
+# being fooled by the decoy branch name.
+repo25c="$tmpdir/remote-ref-namespace.$$.${RANDOM:-0}"
+mkdir -p "$repo25c"
+git init -q -b main "$repo25c"
+git -C "$repo25c" config user.email "test@example.com"
+git -C "$repo25c" config user.name "Test"
+echo base > "$repo25c/f.txt"
+git -C "$repo25c" add -A
+git -C "$repo25c" commit -q -m base
+git -C "$repo25c" branch "origin/main"
+
+out25c=$(cd "$repo25c" && CODEX_BIN=true bash "$SH" --print-base --base main 2>&1); rc25c=$?
+echo "--- case 25c: resolve_base is not fooled by a local branch named like a remote ---"
+printf '%s\n' "$out25c"
+
+check "exits 0" test "$rc25c" -eq 0
+check "--print-base prints main, not the decoy 'origin/main' branch" \
+  test "$out25c" = "main"
+
 # --- Case 26: the codex exec argv gets an option terminator before the prompt --
 # Regression: a rendered prompt is arbitrary text a plan or a custom
 # --angle-prompt template controls, not this runner -- one that happens to
@@ -1277,7 +1338,15 @@ printf '%s\n' "$out26"
 
 check "exits 0" test "$rc26" -eq 0
 check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out26"
-argv_n26=$(find "$argvdir26" -maxdepth 1 -name '[0-9]*' | wc -l | tr -d ' ')
+# A glob, not `find -maxdepth`, so this runs the same on every `find`
+# variant this suite might see -- the argv-index files are named plain
+# integers (0, 1, 2, ...; see fake-codex-argv-log.sh), never "argv0"
+# (logged separately), so "[0-9]*" alone (no recursion possible from a
+# glob) is the same match as the old -name '[0-9]*'.
+argv_n26=0
+for f in "$argvdir26"/[0-9]*; do
+  [ -e "$f" ] && argv_n26=$((argv_n26 + 1))
+done
 last26=$((argv_n26 - 1))
 second_last26=$((argv_n26 - 2))
 check "argv has at least two elements logged" test "$argv_n26" -ge 2
@@ -1426,6 +1495,55 @@ echo "--- prompt rendering: base is shell-quoted in DIFF_COMMAND ---"
 printf '%s\n' "$quote_check"
 check "a base with shell metacharacters is quoted in the generated diff command" \
   test "$quote_check" = "OK"
+
+# --- claude-angle-prompt.md's base-resolution block quotes {{BASE_SHELL}} once -
+# Regression: the base-resolution shell block in claude-angle-prompt.md used
+# to splice the raw {{BASE}} placeholder directly into "origin/{{BASE}}",
+# $(git remote | sed "s@.*@&/{{BASE}}@"), and "{{BASE}}" -- each a
+# double-quoted (or double-quoted-sed-script) position where a base
+# containing shell metacharacters is live shell, not data: a base of
+# "feature;$(id)" would splice in a real, executable $(id) command
+# substitution. The block now assigns BASE={{BASE_SHELL}} once, from a
+# render_prompt-quoted single-quoted literal, and every other use in the
+# block is "$BASE" (a plain variable reference to already-safe data, never
+# re-spliced text) -- so rendering with a hostile base must produce the
+# quoted assignment exactly once and never a second, unquoted copy of the
+# dangerous substring anywhere else in the rendered output.
+base_shell_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from adversarial_review import render_prompt
+
+template = (Path(sys.argv[1]).parent / "claude-angle-prompt.md").read_text()
+plan = {"promise": "Ship it.", "contracts": [], "invariants": []}
+angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.", "evidence": "A concrete case.",
+         "execution": "read-only"}
+rendered = render_prompt(template, plan, angle, "feature;$(id)")
+
+# Scoped to the fenced shell block itself, not the whole rendered doc -- the
+# prose line above it deliberately still shows the raw base in backticks
+# (a harmless documentation mention, never shell), so counting "$(id)"
+# across the entire file would over-count. Locate the block by its BASE=
+# assignment (now emitted exactly once) through the next closing fence.
+start = rendered.index("BASE=")
+end = rendered.index("```", start)
+block = rendered[start:end]
+
+has_quoted = "BASE='feature;$(id)'" in block
+# Inside the block, the dangerous substring must appear exactly once --
+# inside that single-quoted assignment -- and nowhere else unquoted, which
+# is what the old {{BASE}}-splicing bug would have left behind at each of
+# the other three (now "$BASE") use sites.
+count = block.count("$(id)")
+ok = has_quoted and count == 1
+print("OK" if ok else f"MISMATCH: has_quoted={has_quoted} count={count}\n{block}")
+PYEOF
+)
+echo "--- claude-angle-prompt.md: base-resolution block quotes BASE_SHELL once ---"
+printf '%s\n' "$base_shell_check"
+check "a hostile base is single-quoted once and never spliced bare elsewhere" \
+  test "$base_shell_check" = "OK"
 
 # --- Prompt rendering is single-pass: inserted plan text is never re-scanned ---
 # Regression: render_prompt used to substitute placeholders one at a time via

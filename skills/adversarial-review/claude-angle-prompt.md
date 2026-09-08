@@ -36,8 +36,9 @@ the two stay aligned — consult it directly if anything here is unclear.
    candidate that resolves:
 
    ```bash
+   BASE={{BASE_SHELL}}
    BASE_REF=""
-   for candidate in "origin/{{BASE}}" $(git remote | sed "s@.*@&/{{BASE}}@") "{{BASE}}"; do
+   for candidate in "origin/$BASE" $(git remote | sed "s@.*@&/$BASE@") "$BASE"; do
      if git rev-parse --verify --quiet "$candidate" >/dev/null; then
        BASE_REF="$candidate"; break
      fi

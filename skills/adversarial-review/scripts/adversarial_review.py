@@ -285,17 +285,33 @@ def git_status_porcelain(cwd):
 def resolve_base(base, cwd):
     """Mirrors codex-review.sh's resolve_base_ref, but stricter: fails loudly
     (exit 1) if nothing verifies, rather than silently falling back to a bare
-    name that a later git command would choke on with a less clear error."""
+    name that a later git command would choke on with a less clear error.
+
+    Remote candidates are verified through the fully-qualified
+    refs/remotes/<remote>/<base> path, never the bare "<remote>/<base>" —
+    git's own ref disambiguation (gitrevisions(7)) checks refs/heads/<name>
+    before refs/remotes/<name>, so a bare "origin/<base>" would verify
+    against a *local* branch that merely happens to be named that (e.g.
+    "origin/main"), even when no "origin" remote exists at all. Only once
+    every actually-configured remote has been checked this way does this
+    fall back to the plain local <base> (refs/heads/<base>), then to the
+    bare revision (a tag, a commit-ish, ...) as a last resort."""
     remotes_r = git(["remote"], cwd=cwd)
     remotes = [l for l in remotes_r.stdout.splitlines() if l.strip()] if remotes_r.returncode == 0 else []
-    candidates = []
-    for c in [f"origin/{base}"] + [f"{r}/{base}" for r in remotes if r != "origin"] + [base]:
-        if c not in candidates:
-            candidates.append(c)
-    for c in candidates:
-        if git_verify(c, cwd):
-            return c
-    env_error(f"cannot resolve base ref '{base}': tried {', '.join(candidates)}")
+    # origin tried first when present, matching the previous candidate order.
+    ordered_remotes = [r for r in remotes if r == "origin"] + [r for r in remotes if r != "origin"]
+
+    for remote in ordered_remotes:
+        if git_verify(f"refs/remotes/{remote}/{base}", cwd):
+            return f"{remote}/{base}"
+
+    if git_verify(f"refs/heads/{base}", cwd):
+        return base
+    if git_verify(base, cwd):
+        return base
+
+    tried = [f"{r}/{base}" for r in ordered_remotes] + [base]
+    env_error(f"cannot resolve base ref '{base}': tried {', '.join(tried)}")
 
 
 # --- Prompt rendering ---------------------------------------------------------
@@ -345,6 +361,14 @@ _EXECUTION_INSTRUCTIONS = {
 def render_prompt(template, plan, angle, base_resolved):
     values = {
         "BASE": base_resolved,
+        # A shell-quoted literal of the same value, for templates (like
+        # claude-angle-prompt.md's base-resolution block) that assign it
+        # into a shell variable once and reference "$VAR" from then on,
+        # rather than splicing {{BASE}} as raw text into an unquoted or
+        # double-quoted position — a base containing shell metacharacters
+        # (e.g. "feature;$(id)") would otherwise be live shell, not data, at
+        # every point it's spliced in.
+        "BASE_SHELL": shlex.quote(base_resolved),
         "PROMISE": plan.get("promise", ""),
         "CONTRACTS": bulleted(plan.get("contracts"), "(none)"),
         "INVARIANTS": bulleted(plan.get("invariants"), "(none)"),
@@ -740,9 +764,19 @@ def _git_probe_inside_work_tree(path, scrub_env):
     that phrase) never actually answered the question, same as git not
     being runnable at all (missing from PATH, bad cwd, ...) — both are
     treated as "possibly inside a checkout"."""
-    env = os.environ
     if scrub_env:
         env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
+    else:
+        env = dict(os.environ)
+    # The "not a git repository" match below is the literal English string
+    # git prints — a localized ambient LANG/LC_ALL (a caller's shell, a CI
+    # runner set to e.g. de_DE.UTF-8) would make git emit a translated
+    # message instead, so the match would silently fail and a genuine
+    # "outside any repo" answer would fail open to "possibly inside a
+    # checkout". Pinned here, on a copy, so the caller's own environment is
+    # never mutated.
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
