@@ -154,8 +154,16 @@ provider's content filter refused the prompt rather than the angle failing
 to run cleanly — the runner prints one stderr line naming the angle when
 this happens. The run directory keeps `plan.json`, `<angle>.prompt.txt`,
 `<angle>.out.json`, `<angle>.log`, `<angle>.status`, `<angle>.residue.txt`
-(write-capable angles only, when the tree came back dirty), and
-`merged.json`.
+(write-capable angles only, when the tree came back dirty), and normally
+`merged.json` — except under `--from-dir` when that directory sits inside a
+real git checkout (a fixtures tree, an example under version control): then
+`merged.json` is written to a temp file instead, so the run never dirties
+that checkout, and the block's `DIR=` line is followed by a `MERGED=` line
+naming where it actually landed. Re-running an angle into a reused `--dir`
+(a fresh invocation, or `--only` narrowing a re-run) first deletes that
+angle's own prior `.prompt.txt`/`.out.json`/`.log`/`.status`/`.residue.txt`,
+so a stale file from an earlier run in the same directory is never mistaken
+for this run's result.
 
 Output:
 

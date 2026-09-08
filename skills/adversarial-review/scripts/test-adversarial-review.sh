@@ -392,6 +392,124 @@ EOF
   rm -rf "$rundir17" "$linkdir17"
 fi
 
+# --- Case 18: verdict FINDINGS with an empty findings array is never CLEAN -----
+# Regression: a reviewer that mislabels verdict="FINDINGS" while reporting no
+# findings at all is self-contradictory and must never be trusted as a clean
+# (or even parseable) run.
+dir18=$(stage findings-empty)
+out18=$(bash "$SH" --from-dir "$dir18" 2>/dev/null); rc18=$?
+echo "--- case 18: findings-empty ---"
+printf '%s\n' "$out18"
+
+check "verdict is UNPARSED (FINDINGS with no findings is never trusted)" \
+  grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out18"
+check "exits 4" test "$rc18" -eq 4
+check "the empty-findings angle names its cause" \
+  grep -qx "alpha: UNPARSED(schema)" <<<"$out18"
+check "the control angle still ran clean" \
+  grep -qx "beta: CLEAN" <<<"$out18"
+
+# --- Case 19: a reused --dir clears an angle's stale artifacts before rerun ----
+# Regression: stage a stale .residue.txt and a stale .out.json for 'alpha' in
+# the run dir (as if left behind by an earlier, interrupted invocation), then
+# rerun with the hanging fake codex under a short --timeout. The result must
+# come from *this* run (a timeout), never from the leftover files.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 19: stale artifacts are cleared before a reused --dir reruns ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo19=$(make_throwaway_repo stale-artifacts)
+  cat > "$repo19/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+  rundir19="$tmpdir/stale-artifacts-run.$$.${RANDOM:-0}"
+  mkdir -p "$rundir19"
+  printf 'M some/file.py\n' > "$rundir19/alpha.residue.txt"
+  cat > "$rundir19/alpha.out.json" <<'EOF'
+{"angle": "alpha", "verdict": "CLEAN", "summary": "stale run from an earlier invocation", "findings": []}
+EOF
+  linkdir19="$tmpdir/stale-artifacts-links.$$.${RANDOM:-0}"
+  mkdir -p "$linkdir19"
+  marker19="staletest$$_${RANDOM:-0}"
+
+  out19=$(cd "$repo19" && \
+    CODEX_BIN="$FIXTURES/fake-codex-hang.sh" \
+    ADV_TEST_SLEEP_MARKER="$marker19" \
+    ADV_TEST_SLEEP_LINKDIR="$linkdir19" \
+    bash "$SH" --plan plan.json --base main --dir "$rundir19" --only alpha --timeout 2 2>&1)
+  rc19=$?
+  echo "--- case 19: stale artifacts are cleared before a reused --dir reruns ---"
+  printf '%s\n' "$out19"
+
+  check "exits 4" test "$rc19" -eq 4
+  check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out19"
+  check "the angle is marked UNPARSED(timeout), not residue or the stale JSON" \
+    grep -qx "alpha: UNPARSED(timeout)" <<<"$out19"
+  check "the stale summary never appears in the report" \
+    bash -c '! grep -q "stale run from an earlier invocation" <<<"$1"' _ "$out19"
+  check "the stale residue.txt was deleted before this run, not left behind" \
+    test ! -f "$rundir19/alpha.residue.txt"
+  check "the stale out.json was deleted before this run, not left behind" \
+    test ! -f "$rundir19/alpha.out.json"
+
+  sleep 1
+  pkill -f "sleep-$marker19" 2>/dev/null || true
+  rm -rf "$rundir19" "$linkdir19"
+fi
+
+# --- Case 20: --from-dir must never write merged.json into a real checkout -----
+# Regression: pointed directly at fixtures/all-clean (part of this repo, not
+# staged into the scratch tmpdir), the run must not dirty the tree — merged.json
+# goes to a temp file instead, named by a MERGED= line in the report.
+if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "--- case 20: --from-dir against a directory inside a real checkout ---"
+  echo "  SKIP: this checkout of the skill is not itself a git repository"
+else
+  before20=$(git -C "$SCRIPT_DIR" status --porcelain)
+  out20=$(bash "$SH" --from-dir "$FIXTURES/all-clean"); rc20=$?
+  after20=$(git -C "$SCRIPT_DIR" status --porcelain)
+  echo "--- case 20: --from-dir against a directory inside a real checkout ---"
+  printf '%s\n' "$out20"
+
+  check "exits 0" test "$rc20" -eq 0
+  check "git status is unchanged by the run (merged.json was not written into the checkout)" \
+    test "$before20" = "$after20"
+  merged20=$(grep '^MERGED=' <<<"$out20" | sed 's/^MERGED=//')
+  check "a MERGED= line was printed" test -n "$merged20"
+  check "the MERGED= path exists" test -f "$merged20"
+  check "merged.json was not created next to the fixture" \
+    test ! -f "$FIXTURES/all-clean/merged.json"
+
+  rm -f "$merged20" "$FIXTURES/all-clean/merged.json"
+fi
+
+# --- Case 21: multiline claim/evidence/reproduction render as one line each ----
+# Regression: an embedded \r\n or \n in path/claim/evidence/reproduction must
+# never introduce a bare continuation line into the compact block — each
+# finding is exactly one '- [Pn] ...' line plus its evidence/reproduction lines.
+dir21=$(stage multiline-fields)
+out21=$(bash "$SH" --from-dir "$dir21"); rc21=$?
+echo "--- case 21: multiline-fields ---"
+printf '%s\n' "$out21"
+
+check "exits 0" test "$rc21" -eq 0
+check "verdict is FINDINGS" grep -qx "ADVERSARIAL_REVIEW: FINDINGS" <<<"$out21"
+check "exactly one '- [P' line per finding" \
+  test "$(grep -c '^- \[P' <<<"$out21")" -eq 2
+check "exactly one 'evidence:' line per finding" \
+  test "$(grep -c '^  evidence: ' <<<"$out21")" -eq 2
+check "exactly one 'reproduction:' line per finding" \
+  test "$(grep -c '^  reproduction: ' <<<"$out21")" -eq 2
+check "the findings block has no lines beyond those 6 (no bare continuation lines)" \
+  test "$(awk '/^--- FINDINGS ---$/{f=1;next} f && NF' <<<"$out21" | wc -l | tr -d ' ')" -eq 6
+check "the multiline claim's embedded newline is escaped, not a bare line break" \
+  grep -qF -- "Line one of the claim\\nLine two of the claim" <<<"$out21"
+check "the CRLF evidence's embedded newline is escaped" \
+  grep -qF -- "Evidence line one\\nEvidence line two" <<<"$out21"
+check "the multiline reproduction's embedded newlines are escaped" \
+  grep -qF -- "Repro step one\\nRepro step two\\nRepro step three" <<<"$out21"
+
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
 py_ver=$(python3 "$PY" --version | awk '{print $2}')

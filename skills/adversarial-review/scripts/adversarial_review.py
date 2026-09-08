@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -337,6 +338,11 @@ def validate_findings_json(data):
         for key in ("claim", "evidence", "reproduction"):
             if not isinstance(f[key], str):
                 return False, f"findings[{i}].{key} must be a string"
+    # verdict="FINDINGS" with an empty findings array is self-contradictory —
+    # never trust it as CLEAN (or as FINDINGS with nothing to show); treat it
+    # the same as any other schema violation.
+    if data["verdict"] == "FINDINGS" and not findings:
+        return False, "'verdict' is FINDINGS but 'findings' is empty"
     return True, ""
 
 
@@ -504,7 +510,19 @@ def merge_findings(results):
 
 # --- Report rendering ----------------------------------------------------------
 
-def build_report(angle_ids, results_by_id, merged_findings, run_dir):
+def escape_block_text(s):
+    """Collapse any literal CR/LF in `s` into a visible two-character `\\n`
+    so a multiline path/claim/evidence/reproduction can never inject a bare
+    continuation line into the compact block — each finding must render as
+    exactly its `- [Pn] ...` line plus the `  evidence:`/`  reproduction:`
+    lines that follow it, nothing else. Uses str.replace, not re.sub, so the
+    literal backslash-n is never re-interpreted as an escape sequence.
+    merged.json is unaffected — JSON handles embedded newlines natively, so
+    this only applies to the plain-text block."""
+    return s.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+
+
+def build_report(angle_ids, results_by_id, merged_findings, run_dir, merged_path=None):
     unparsed_n = sum(1 for aid in angle_ids if results_by_id[aid].kind == "UNPARSED")
     blocked_n = sum(1 for aid in angle_ids if results_by_id[aid].kind == "BLOCKED")
     ran = len(angle_ids) - unparsed_n
@@ -526,8 +544,14 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir):
         f"ANGLES={len(angle_ids)}  RAN={ran}  BLOCKED={blocked_n}  UNPARSED={unparsed_n}",
         f"BLOCKING={blocking}  NITS={nits}",
         f"DIR={run_dir}",
-        "--- ANGLES ---",
     ]
+    # merged_path is only ever different from the default <run_dir>/merged.json
+    # when --from-dir pointed at a directory inside a real git checkout (see
+    # resolve_merged_json_path) — call that out explicitly rather than
+    # leaving it to be discovered by listing the run dir.
+    if merged_path is not None and merged_path != run_dir / "merged.json":
+        lines.append(f"MERGED={merged_path}")
+    lines.append("--- ANGLES ---")
     for aid in angle_ids:
         r = results_by_id[aid]
         if r.kind == "UNPARSED":
@@ -550,12 +574,16 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir):
     if merged_findings:
         lines.append("--- FINDINGS ---")
         for f in merged_findings:
+            path = escape_block_text(f["path"])
+            claim = escape_block_text(f["claim"])
+            evidence = escape_block_text(f["evidence"])
+            reproduction = escape_block_text(f["reproduction"])
             lines.append(
-                f"- [{f['severity']}] {f['path']}:{f['line']} — {f['claim']}  "
+                f"- [{f['severity']}] {path}:{f['line']} — {claim}  "
                 f"[angles: {','.join(f['angles'])}]"
             )
-            lines.append(f"  evidence: {f['evidence']}")
-            lines.append(f"  reproduction: {f['reproduction']}")
+            lines.append(f"  evidence: {evidence}")
+            lines.append(f"  reproduction: {reproduction}")
 
     counts = {
         "angles": len(angle_ids),
@@ -568,7 +596,40 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir):
     return "\n".join(lines), rc, banner, counts
 
 
-def write_merged_json(run_dir, angle_ids, results_by_id, merged_findings, banner, counts):
+def dir_in_git_repo(path):
+    """Whether `path` sits inside a git working tree (any repo — not just
+    the one adversarial-review would review, and no relation to whether
+    `path` itself is version-controlled). Used only to decide where
+    merged.json is safe to land; a git rev-parse failure (no git on PATH, or
+    genuinely not in a repo) is read as "not in a repo" so the normal
+    same-directory behavior is the fail-safe default."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=path, capture_output=True, text=True,
+        )
+    except OSError:
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def resolve_merged_json_path(run_dir, from_dir_mode):
+    """Where merged.json for this run should be written. In `--from-dir`
+    mode `run_dir` may be a directory the caller doesn't own writing into —
+    a fixtures tree, an example checked into some other repo — so if it
+    sits inside a git working tree, merged.json is diverted to a temp file
+    instead of dirtying that checkout; the report's MERGED= line (see
+    build_report) says where it actually landed. Live runs never divert:
+    `main` already refuses a run dir inside the repository under review, so
+    the default <run_dir>/merged.json is always safe there."""
+    if from_dir_mode and dir_in_git_repo(run_dir):
+        fd, path = tempfile.mkstemp(prefix="adversarial-review-merged.", suffix=".json")
+        os.close(fd)
+        return Path(path)
+    return run_dir / "merged.json"
+
+
+def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts):
     doc = {
         "version": 1,
         "verdict": banner,
@@ -585,7 +646,7 @@ def write_merged_json(run_dir, angle_ids, results_by_id, merged_findings, banner
         ],
         "findings": merged_findings,
     }
-    (run_dir / "merged.json").write_text(json.dumps(doc, indent=2) + "\n")
+    merged_path.write_text(json.dumps(doc, indent=2) + "\n")
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -604,31 +665,80 @@ def build_arg_parser():
     return p
 
 
+def _group_running(pgid):
+    """Whether any process still belongs to process group `pgid`. Signal 0
+    sends nothing — it only probes whether the target exists — so this is
+    safe to call repeatedly while polling."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # Can't tell (e.g. a permissions surprise) — assume it's still
+        # there rather than declaring victory early.
+        return True
+
+
 def kill_process_group(proc, grace_sec=2):
     """SIGTERM the whole process group `proc` leads (started with
-    start_new_session=True), then SIGKILL after a short grace if it hasn't
-    exited. A timed-out reviewer may have spawned children of its own — a
-    test runner, a backgrounded reproduction — and killing only `proc`
-    itself (subprocess.run's own timeout behavior) would leave those
-    running. Best-effort: a process/group that's already gone is not an
-    error here."""
+    start_new_session=True), then verify the group actually died rather than
+    just `proc` itself. A timed-out reviewer may have spawned children of its
+    own — a test runner, a backgrounded reproduction — that ignore or trap
+    SIGTERM even when the reviewer process (`proc`) exits on it normally;
+    proc.wait() succeeding only proves the leader is gone, not the group, so
+    membership is re-checked with `os.killpg(pgid, 0)` before declaring the
+    kill done. If any member survives, SIGKILL the group and poll (bounded by
+    `grace_sec`) until no member remains. Best-effort: a process/group that's
+    already gone is not an error here."""
     try:
         pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, OSError):
         return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=grace_sec)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if not _group_running(pgid):
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        return
+
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline and _group_running(pgid):
+        time.sleep(0.05)
+
+
+# Every file collect_angle_result (or a human re-running --from-dir) would
+# read for one angle. A reused --dir (an explicit --dir re-run of the same
+# plan, or --only re-running just a few ids) must never let one of these
+# survive from an earlier run — a stale .out.json or .residue.txt sitting
+# next to a failed re-run would be misread as this run's own result.
+ANGLE_ARTIFACT_SUFFIXES = (".prompt.txt", ".out.json", ".log", ".status", ".residue.txt")
+
+
+def clear_stale_artifacts(aid, run_dir):
+    """Delete any leftover files for angle `aid` in `run_dir` before it's
+    launched again. Best-effort: a file that's already gone is not an
+    error."""
+    for suffix in ANGLE_ARTIFACT_SUFFIXES:
         try:
-            os.killpg(pgid, sig)
-        except (ProcessLookupError, OSError):
-            return
-        try:
-            proc.wait(timeout=grace_sec)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            (run_dir / f"{aid}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
 
 
 def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
+    clear_stale_artifacts(aid, run_dir)
     prompt_text = render_prompt(template, plan, angle, base_resolved)
     (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
     out_path = run_dir / f"{aid}.out.json"
@@ -780,7 +890,13 @@ def main(argv=None):
             # caller meant.
             run_dir = Path(args.dir).resolve()
         else:
-            run_dir = Path(tempfile.mkdtemp(prefix="adversarial-review.", dir=os.environ.get("TMPDIR", "/tmp")))
+            # .resolve() here too — mkdtemp's dir= can itself be a symlink
+            # (e.g. macOS's /tmp -> /private/tmp), and the containment check
+            # below, plus every path handed to codex, must compare against
+            # the same fully-resolved form as `root`.
+            run_dir = Path(
+                tempfile.mkdtemp(prefix="adversarial-review.", dir=os.environ.get("TMPDIR", "/tmp"))
+            ).resolve()
 
         # A run directory inside the repository would let codex's own
         # output (or a workspace-write angle's reproduction) land inside the
@@ -848,8 +964,11 @@ def main(argv=None):
         }
 
     merged_findings = merge_findings([results_by_id[aid] for aid in angle_ids])
-    report, rc, banner, counts = build_report(angle_ids, results_by_id, merged_findings, run_dir)
-    write_merged_json(run_dir, angle_ids, results_by_id, merged_findings, banner, counts)
+    merged_path = resolve_merged_json_path(run_dir, from_dir_mode=bool(args.from_dir))
+    report, rc, banner, counts = build_report(
+        angle_ids, results_by_id, merged_findings, run_dir, merged_path=merged_path,
+    )
+    write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts)
     print(report)
     return rc
 

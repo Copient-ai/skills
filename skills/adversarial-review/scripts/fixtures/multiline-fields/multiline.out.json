@@ -1,0 +1,23 @@
+{
+  "angle": "multiline",
+  "verdict": "FINDINGS",
+  "summary": "Found two issues.",
+  "findings": [
+    {
+      "severity": "P1",
+      "path": "a.py",
+      "line": 10,
+      "claim": "Line one of the claim\nLine two of the claim",
+      "evidence": "single line evidence",
+      "reproduction": "single line reproduction"
+    },
+    {
+      "severity": "P2",
+      "path": "b.py",
+      "line": 20,
+      "claim": "single line claim",
+      "evidence": "Evidence line one\r\nEvidence line two",
+      "reproduction": "Repro step one\nRepro step two\nRepro step three"
+    }
+  ]
+}
