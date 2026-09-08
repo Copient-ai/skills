@@ -16,7 +16,14 @@ SH="$SCRIPT_DIR/adversarial-review.sh"
 PY="$SCRIPT_DIR/adversarial_review.py"
 FIXTURES="$SCRIPT_DIR/fixtures"
 fails=0
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/adversarial-review-test.XXXXXX")
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/adversarial-review-test.XXXXXX") || {
+  echo "test-adversarial-review: mktemp -d failed" >&2
+  exit 1
+}
+if [ -z "$tmpdir" ]; then
+  echo "test-adversarial-review: mktemp -d returned an empty path" >&2
+  exit 1
+fi
 trap 'rm -rf "$tmpdir"' EXIT
 
 check() { # check <description> <condition-cmd...>
@@ -1907,6 +1914,65 @@ echo "--- run_angle: cancellation is checked before Popen ---"
 printf '%s\n' "$cancel_check"
 check "a preset _CANCELLED flag skips Popen and reports UNPARSED(interrupted)" \
   test "$cancel_check" = "OK"
+
+# --- Case 29: -c project_doc_max_bytes=0 is passed for every angle -------------
+# Security regression: `codex exec -C <root>` auto-loads AGENTS.md (root and
+# every parent up to the git root) as project instructions ahead of the angle
+# prompt -- a branch under review controls that file, so without this knob it
+# could instruct every angle to report CLEAN regardless of what the diff does.
+# run_angle now always includes "-c project_doc_max_bytes=0" in the codex exec
+# argv it builds, for every angle regardless of execution mode -- verified
+# live against codex-cli 0.145.0 with `codex debug prompt-input`, which shows
+# the "# AGENTS.md instructions for <dir>" block disappear from the
+# model-visible prompt at this setting. Checks both execution modes, one
+# angle at a time via --only (fake-codex-argv-log.sh clears ADV_TEST_ARGV_DIR
+# on every invocation, so two angles sharing one run would race).
+repo29=$(make_throwaway_repo project-doc-knob)
+# The plan lives outside repo29, not inside it (see case 28): the beta
+# angle's dirty-tree gate requires a genuinely clean tree before it runs,
+# and an untracked plan.json sitting in the checkout would itself trip
+# that gate.
+plan29="$tmpdir/project-doc-knob-plan.$$.${RANDOM:-0}.json"
+cat > "$plan29" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+
+for aid29 in alpha beta; do
+  argvdir29="$tmpdir/argv-log-doc-knob-$aid29.$$.${RANDOM:-0}"
+  rundir29="$tmpdir/project-doc-knob-$aid29-run.$$.${RANDOM:-0}"
+  out29=$(cd "$repo29" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29" \
+    bash "$SH" --plan "$plan29" --base main --dir "$rundir29" --only "$aid29" 2>&1); rc29=$?
+  echo "--- case 29: project_doc_max_bytes=0 is present for angle '$aid29' (execution=$([ "$aid29" = alpha ] && echo read-only || echo workspace-write)) ---"
+  printf '%s\n' "$out29"
+
+  check "angle '$aid29' run exits 0" test "$rc29" -eq 0
+  check "angle '$aid29' verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out29"
+
+  n29=0
+  for f in "$argvdir29"/[0-9]*; do
+    [ -e "$f" ] || continue
+    n29=$((n29 + 1))
+  done
+  found29=false
+  if [ "$n29" -ge 2 ]; then
+    last_idx29=$((n29 - 1))
+    for idx in $(seq 0 $((last_idx29 - 1))); do
+      if [ "$(cat "$argvdir29/$idx")" = "-c" ] \
+         && [ "$(cat "$argvdir29/$((idx + 1))")" = "project_doc_max_bytes=0" ]; then
+        found29=true
+        break
+      fi
+    done
+  fi
+  check "angle '$aid29''s codex exec argv includes -c project_doc_max_bytes=0" \
+    test "$found29" = true
+
+  rm -rf "$rundir29"
+done
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh

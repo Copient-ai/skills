@@ -1199,6 +1199,16 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         "-o", str(out_path),
         "-c", f"model={CODEX_REVIEW_MODEL}",
         "-c", f"model_reasoning_effort={CODEX_REVIEW_EFFORT}",
+        # `codex exec -C <root>` auto-loads AGENTS.md (root and every parent
+        # up to the git root) as project instructions ahead of the angle
+        # prompt below. The branch under review controls that file, so
+        # without this it could instruct every angle to report CLEAN
+        # regardless of the diff. project_doc_max_bytes=0 disables that
+        # discovery — verified against codex-cli 0.145.0 with `codex debug
+        # prompt-input`, which shows the "# AGENTS.md instructions for
+        # <dir>" block disappear from the model-visible prompt at this
+        # setting.
+        "-c", "project_doc_max_bytes=0",
         # The option terminator: a rendered prompt is arbitrary text a plan
         # or a custom --angle-prompt template controls, not this runner —
         # one that happens to start with "-" (a mandate quoting a CLI flag,

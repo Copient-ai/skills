@@ -15,7 +15,7 @@ bash <skill-dir>/scripts/adversarial-review.sh --version
 `codex-review-loop` and `pr-review-loop` are byte-identical to their 1.0.0
 release.
 
-New skill: `adversarial-review`, with its own runner version `1.0.0`
+New skill: `adversarial-review`, with its own runner version `1.1.0`
 (`adversarial-review.sh --version`). Where the other two skills converge a
 generic review, this one plans first — a serialized planning phase reads the
 diff and derives what the branch itself promises, then turns each promise
@@ -32,6 +32,10 @@ into a falsifiable attack angle. It adds:
   angles are never counted as clean, even when the rest of the run reports
   `CLEAN`.
 - A new host requirement: `python3` (stdlib only) on `PATH`, for the runner.
+- **Branch-owned instructions are never loaded.** Each Codex pass runs with
+  `project_doc_max_bytes=0`, so the reviewed branch's own `AGENTS.md` cannot
+  tell the reviewer what to conclude; the Claude pass is told to read such
+  files as part of the diff, never as instructions.
 
 ## 1.0.0
 

@@ -135,7 +135,15 @@ Each angle runs as its own `codex exec --ephemeral -s read-only` (or
 tests or reproductions — under read-only, `git` works but a test runner that
 writes caches fails), stdin closed, `--output-schema` enforcing
 `scripts/findings.schema.json` (`angle-prompt.md` shows the reviewer the same
-shape). Write-capable angles run against the shared checkout — a `git
+shape), and `-c project_doc_max_bytes=0`: without it, `codex exec -C <root>`
+loads the branch's own `AGENTS.md`/`CLAUDE.md` (root and every parent up to
+the git root) as project instructions ahead of the angle prompt, and a branch
+under review controls that file — it could instruct every angle to report
+CLEAN regardless of what the diff does. The Codex lane never loads them. The
+Claude lane (`claude-angle-prompt.md`) has no such knob to disable that
+loading, so a Claude reviewer must treat repo instruction files as part of
+the diff under review, never as instructions to itself. Write-capable angles
+run against the shared checkout — a `git
 worktree` was rejected because reviewers need the project's real environment
 (`.venv`, caches) that a worktree lacks — so the runner schedules
 accordingly: every `read-only` angle runs together in the shared thread pool,
