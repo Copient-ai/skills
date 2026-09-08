@@ -297,6 +297,26 @@ def load_angle_prompt_template(path_arg, script_dir):
 
 PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
 
+# The instruction substituted for {{EXECUTION}}, keyed by angle["execution"].
+# Chosen per angle rather than left as a bare "read-only"/"workspace-write"
+# label so the two modes' obligations differ in the rendered text itself,
+# not just in a word the reviewer has to interpret: a workspace-write
+# reviewer is told to run things, a read-only one is told not to.
+_EXECUTION_INSTRUCTIONS = {
+    "read-only": (
+        "`read-only` — read and reason. Run only read-only commands such as "
+        "`git` and `grep` to investigate; do not attempt the mandated "
+        "reproduction itself. Describe it in `reproduction` as a concrete "
+        "input or command sequence instead."
+    ),
+    "workspace-write": (
+        "`workspace-write` — RUN the mandated reproduction or tests and "
+        "report what actually happened, not what you expect would happen. "
+        "You may run commands freely to do this, but never edit, create, or "
+        "delete tracked source files, and never commit."
+    ),
+}
+
 
 def render_prompt(template, plan, angle, base_resolved):
     values = {
@@ -309,6 +329,7 @@ def render_prompt(template, plan, angle, base_resolved):
         "MANDATE": angle["mandate"],
         "EVIDENCE": angle["evidence"],
         "FILES": bulleted(angle.get("files"), "(all changed files)"),
+        "EXECUTION": _EXECUTION_INSTRUCTIONS[angle["execution"]],
         # shlex.quote only the base — the quoted and unquoted pieces
         # concatenate to the same single shell token, and a base with shell
         # metacharacters (e.g. from a hand-edited plan) can never break out
@@ -634,10 +655,14 @@ def dir_in_git_repo(path):
     """Whether `path` sits inside a git working tree (any repo — not just
     the one adversarial-review would review, and no relation to whether
     `path` itself is version-controlled). Used only to decide where
-    merged.json is safe to land. Fails closed: git actually running and
-    answering "not a repo" (nonzero exit) is trusted as such, but git not
-    being runnable at all (missing from PATH, bad cwd, ...) means the
-    question was never answered — treated as "possibly inside a checkout" so
+    merged.json is safe to land. Fails closed: only a probe that positively
+    confirms "not a repo" — git runs and exits nonzero with the canonical
+    "not a git repository (or any of the parent directories)" stderr — is
+    trusted as such. Any other nonzero exit (a bad GIT_DIR, a safe.directory
+    rejection, a permissions surprise — each prints a different fatal:
+    message that doesn't match that phrase) never actually answered the
+    question, same as git not being runnable at all (missing from PATH, bad
+    cwd, ...) — both are treated as "possibly inside a checkout" so
     merged.json diverts to a temp file instead of risking a write into one."""
     try:
         r = subprocess.run(
@@ -646,7 +671,9 @@ def dir_in_git_repo(path):
         )
     except OSError:
         return True
-    return r.returncode == 0 and r.stdout.strip() == "true"
+    if r.returncode == 0:
+        return r.stdout.strip() == "true"
+    return "not a git repository (or any of the parent directories)" not in r.stderr
 
 
 def resolve_merged_json_path(run_dir, from_dir_mode):
@@ -825,6 +852,18 @@ def kill_process_group(proc, grace_sec=2):
 _LIVE_PROCS_LOCK = threading.Lock()
 _LIVE_PROCS = []
 
+# One sentinel per Popen call currently between "returned" and "registered in
+# _LIVE_PROCS" — appended immediately before Popen, removed immediately after
+# _track_proc completes (see run_angle). Closes the same spawn/track race
+# run_angle's own _CANCELLED checks narrow but cannot close alone: a signal
+# landing in that exact window would otherwise let the handler's snapshot run
+# before the new proc is registered, leaking it past os._exit. No lock, like
+# _LIVE_PROCS's handler-side reads: only run_angle's own worker thread ever
+# touches its own sentinel (append then remove, never inspected by identity
+# from elsewhere), so a plain list's append/remove are atomic enough under
+# the GIL; the handler only ever reads truthiness via _wait_for_in_flight.
+_IN_FLIGHT = []
+
 # Set only by the signal handler, read (never written) everywhere else — a
 # bare global bool rather than a threading.Event, whose set() takes an
 # internal lock the handler must not touch. Lets a main-thread path (e.g.
@@ -844,6 +883,38 @@ def _untrack_proc(proc):
             _LIVE_PROCS.remove(proc)
         except ValueError:
             pass
+
+
+def _wait_for_in_flight(timeout_sec=2.0, poll_sec=0.01):
+    """Busy-waits (no locks — see _IN_FLIGHT's own comment) until every
+    in-flight Popen/_track_proc window has closed, or `timeout_sec` has
+    passed, whichever comes first. Called by _kill_all_and_exit before it
+    snapshots _LIVE_PROCS, so a signal landing mid-spawn doesn't race ahead
+    of the new proc being registered. Bounded rather than unconditional: a
+    worker thread wedged before reaching its own sentinel removal (stuck in
+    Popen itself, e.g.) must not hang the exit forever."""
+    deadline = time.monotonic() + timeout_sec
+    while _IN_FLIGHT and time.monotonic() < deadline:
+        time.sleep(poll_sec)
+
+
+def _kill_all_and_exit(exit_fn=None):
+    """The snapshot-and-kill half of _interrupt_and_exit, factored out so a
+    test can drive it directly: waits out any open spawn/track window (see
+    _wait_for_in_flight), kills every process group in a lock-free snapshot
+    of _LIVE_PROCS, prints one line, and exits via `exit_fn` — defaulting to
+    `os._exit` looked up at call time (not bound as a default argument) so a
+    test can either pass its own `exit_fn` or monkeypatch `os._exit` and see
+    it honored either way. Never takes a lock — see the _LIVE_PROCS comment
+    above for why; the same applies here since this always runs on whatever
+    thread called it, which for the real signal path is the main thread."""
+    _wait_for_in_flight()
+    procs = list(_LIVE_PROCS)
+    for proc in procs:
+        kill_process_group(proc)
+    print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
+    sys.stderr.flush()
+    (exit_fn or os._exit)(130)
 
 
 def _interrupt_and_exit(signum=None, frame=None):
@@ -867,26 +938,20 @@ def _interrupt_and_exit(signum=None, frame=None):
     Never takes a lock and never calls executor.shutdown() — see the
     _LIVE_PROCS comment above for why. Sets _CANCELLED first (so any
     main-thread path checking it, and any worker mid-Popen in run_angle,
-    sees cancellation as early as possible), then kills every process group
-    in a lock-free snapshot of _LIVE_PROCS, prints one line, and exits —
-    130, the conventional 128+SIGINT code, used for SIGTERM here too since
-    either means "the run is being cancelled", never "codex could not be
-    spawned" (exit 3) or any other structured exit this tool defines. Uses
-    os._exit, not sys.exit, so it terminates immediately and correctly even
-    when called from inside a signal handler on the main thread, without
-    waiting on any worker thread still blocked in a subprocess call — which
-    also means a not-yet-started future in the parallel-phase pool is never
-    explicitly cancelled here: the whole process (every thread, every queued
-    future with it) is gone by the time os._exit returns, so there is
-    nothing left to cancel."""
+    sees cancellation as early as possible), then delegates the actual
+    wait/snapshot/kill/exit to _kill_all_and_exit. 130 is the conventional
+    128+SIGINT code, used for SIGTERM here too since either means "the run
+    is being cancelled", never "codex could not be spawned" (exit 3) or any
+    other structured exit this tool defines. os._exit, not sys.exit,
+    terminates immediately and correctly even from inside a signal handler
+    on the main thread, without waiting on any worker thread still blocked
+    in a subprocess call — which also means a not-yet-started future in the
+    parallel-phase pool is never explicitly cancelled here: the whole
+    process (every thread, every queued future with it) is gone by the time
+    os._exit returns, so there is nothing left to cancel."""
     global _CANCELLED
     _CANCELLED = True
-    procs = list(_LIVE_PROCS)
-    for proc in procs:
-        kill_process_group(proc)
-    print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
-    sys.stderr.flush()
-    os._exit(130)
+    _kill_all_and_exit()
 
 
 # Every file collect_angle_result (or a human re-running --from-dir) would
@@ -942,14 +1007,17 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             # signal landing between Popen() returning and _track_proc()
             # registering it would let the handler's lock-free sweep of
             # _LIVE_PROCS miss this process entirely, leaking it (and
-            # anything it backgrounds) past this run's exit. Checking
-            # _CANCELLED immediately before Popen, registering immediately
-            # after (before anything else runs), and checking once more
-            # right after covers both sides of that window — if cancellation
-            # is seen at either point, this angle kills its own new group
-            # itself rather than trust a sweep that may already have run
-            # without it, and reports the same outcome the handler's own
-            # exit would have implied.
+            # anything it backgrounds) past this run's exit. The _IN_FLIGHT
+            # sentinel (held open only across Popen+_track_proc) makes the
+            # handler itself wait out that exact window before it ever
+            # snapshots _LIVE_PROCS — see _wait_for_in_flight — so by the
+            # time a kill sweep runs, this proc is guaranteed either fully
+            # registered or never started. Checking _CANCELLED immediately
+            # before Popen, and once more right after registering, is a
+            # second, independent line of defense: if cancellation is seen
+            # at either point, this angle kills its own new group itself
+            # rather than trust a sweep, and reports the same outcome the
+            # handler's own exit would have implied.
             if _CANCELLED:
                 _mark_interrupted(aid, run_dir)
                 return None
@@ -957,11 +1025,20 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             # leader, so a timeout can reap everything it spawned via
             # killpg — not just its own pid, which is all subprocess.run's
             # built-in timeout kill would reach.
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                cwd=root, start_new_session=True,
-            )
-            _track_proc(proc)
+            sentinel = object()
+            _IN_FLIGHT.append(sentinel)
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
+                    cwd=root, start_new_session=True,
+                )
+                _track_proc(proc)
+            finally:
+                # Removed even if Popen itself raised (OSError, caught
+                # below) — a sentinel left behind on a failed spawn would
+                # otherwise wedge every future _wait_for_in_flight for the
+                # rest of the run, not just this angle's own window.
+                _IN_FLIGHT.remove(sentinel)
             if _CANCELLED:
                 kill_process_group(proc)
                 _untrack_proc(proc)

@@ -18,11 +18,12 @@ your angle names.
 - **title:** {{ANGLE_TITLE}}
 - **mandate:** {{MANDATE}}
 - **evidence required:** {{EVIDENCE}}
+- **execution mode:** {{EXECUTION}}
 - **files to start from (if given, not exhaustive):** {{FILES}}
 
 ## What to do
 
-You have read access to this repository. Read the diff first:
+Read the diff first:
 
 ```
 {{DIFF_COMMAND}}
@@ -30,9 +31,12 @@ You have read access to this repository. Read the diff first:
 
 Read any surrounding code you need beyond the diff — a counterexample against a
 contract usually needs the contract's real definition, not just the diff that
-touches it. Read only; do not restate the diff or the code back as your
-finding. A finding is a claim about a *failure*, not a summary of what the
-code does.
+touches it. Do not restate the diff or the code back as your finding. A
+finding is a claim about a *failure*, not a summary of what the code does.
+
+Follow your execution mode exactly, as stated above. In both modes, a
+finding's `reproduction` must be what was executed, when execution was
+allowed — never a description of what you expect would happen instead.
 
 Your job is exactly the mandate above: construct a counterexample, and where
 your execution mode allows it, demonstrate it. Report `"verdict": "CLEAN"` the
@@ -49,9 +53,9 @@ Every finding must carry, precisely:
 - `evidence` — the exact code facts (quote or cite what you read) that make
   the claim true, not a restatement of the mandate.
 - `reproduction` — a concrete input, program, or command sequence that
-  triggers it. If your execution mode is `workspace-write` and the mandate
-  calls for running something, run it and report what actually happened, not
-  what you expect would happen.
+  triggers it — what was executed, when your execution mode allowed it (see
+  "Follow your execution mode" above); otherwise the sequence that would
+  trigger it, described but not run.
 
 ## Severity
 

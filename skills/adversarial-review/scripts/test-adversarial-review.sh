@@ -773,6 +773,47 @@ EOF
   rm -rf "$rundir22" "$linkdir22"
 fi
 
+# --- Case 22b: the interrupt handler waits out an open spawn/track window ------
+# Regression: a signal landing between Popen() returning and _track_proc()
+# registering the new process could let the handler's snapshot of _LIVE_PROCS
+# run before that process was ever registered in it, leaking the process past
+# os._exit. _wait_for_in_flight closes this by having the handler (via
+# _kill_all_and_exit) wait until the _IN_FLIGHT sentinel list is empty, or 2s
+# pass, before it ever snapshots. Drives _kill_all_and_exit directly — with
+# an injected exit_fn so this test process doesn't actually exit — against a
+# harness that holds _IN_FLIGHT non-empty for 0.5s from a background thread,
+# and asserts the wait actually observed that clear rather than returning
+# immediately (ignoring _IN_FLIGHT entirely) or blocking for the full 2s
+# timeout regardless (also wrong, just less visibly so at 0.5s).
+inflight_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as adv
+
+adv._IN_FLIGHT.append(object())
+
+def clear_after(delay):
+    time.sleep(delay)
+    adv._IN_FLIGHT.clear()
+
+t = threading.Thread(target=clear_after, args=(0.5,))
+t.start()
+
+exits = []
+start = time.monotonic()
+adv._kill_all_and_exit(exit_fn=lambda code: exits.append(code))
+elapsed = time.monotonic() - start
+t.join()
+
+ok = exits == [130] and not adv._IN_FLIGHT and 0.5 <= elapsed < 2.5
+print("OK" if ok else f"MISMATCH: exits={exits} elapsed={elapsed} in_flight={adv._IN_FLIGHT}")
+PYEOF
+)
+echo "--- case 22b: the interrupt handler waits out an open spawn/track window ---"
+printf '%s\n' "$inflight_check"
+check "the wait observed the in-flight list clear at ~0.5s (0.5s <= elapsed < 2.5s)" \
+  test "$inflight_check" = "OK"
+
 # --- Case 23: dir_in_git_repo fails closed when git cannot be run --------------
 # Regression: dir_in_git_repo returned False -- "not in a repo, safe to write
 # merged.json in place" -- whenever `git rev-parse` itself could not even be
@@ -802,6 +843,49 @@ check "merged.json was not written into the staged fixture dir" \
   test ! -f "$dir23/merged.json"
 
 rm -f "$merged23"
+
+# --- Case 23b: an inconclusive git probe (bad GIT_DIR) still diverts -----------
+# Regression: dir_in_git_repo used to treat ANY nonzero `git rev-parse` exit
+# as a confident "not a repo" (safe to write merged.json in place) as long as
+# git itself was runnable at all -- conflating a real "not a repo" answer
+# with a probe that never actually answered the question, e.g. a bad GIT_DIR.
+# GIT_DIR pointing at a directory that doesn't exist reproduces exactly that:
+# git's own message is "fatal: not a git repository: '/nonexistent-dir'",
+# which does NOT match the canonical "...(or any of the parent directories):
+# .git" git prints when a directory is genuinely outside any repo (case
+# 23c) -- so this must fail closed and divert, the same as case 23's
+# git-unavailable probe.
+dir23b=$(stage all-clean)
+out23b=$(GIT_DIR=/nonexistent-dir python3 "$PY" --from-dir "$dir23b" 2>&1); rc23b=$?
+echo "--- case 23b: dir_in_git_repo diverts on an inconclusive git probe (bad GIT_DIR) ---"
+printf '%s\n' "$out23b"
+
+check "exits 0" test "$rc23b" -eq 0
+merged23b=$(grep '^MERGED=' <<<"$out23b" | sed 's/^MERGED=//')
+check "a MERGED= line was printed" test -n "$merged23b"
+check "the MERGED= path exists" test -f "$merged23b"
+check "merged.json was diverted outside the staged fixture dir" \
+  bash -c '[[ "$1" != "$2"/* ]]' _ "$merged23b" "$dir23b"
+check "merged.json was not written into the staged fixture dir" \
+  test ! -f "$dir23b/merged.json"
+
+rm -f "$merged23b"
+
+# --- Case 23c: a directory genuinely outside any repo writes in place ----------
+# The other half of case 23b: no GIT_DIR override, and the staged fixture
+# really is outside any git working tree (a plain scratch tmpdir), so
+# dir_in_git_repo's probe gets the canonical "not a git repository (or any of
+# the parent directories)" answer and merged.json lands at <dir>/merged.json
+# in place -- no MERGED= diversion line at all.
+dir23c=$(stage all-clean)
+out23c=$(python3 "$PY" --from-dir "$dir23c" 2>&1); rc23c=$?
+echo "--- case 23c: a directory genuinely outside any repo writes merged.json in place ---"
+printf '%s\n' "$out23c"
+
+check "exits 0" test "$rc23c" -eq 0
+check "no MERGED= diversion line was printed" \
+  bash -c '! grep -q "^MERGED=" <<<"$1"' _ "$out23c"
+check "merged.json was written in place" test -f "$dir23c/merged.json"
 
 # --- Case 24: stale artifacts are cleared for every selected angle up front ----
 # Regression: clear_stale_artifacts(aid, run_dir) ran at the top of run_angle
@@ -928,7 +1012,8 @@ from adversarial_review import render_prompt
 
 plan = {"promise": "Ship it.", "contracts": ["C1"], "invariants": ["I1"]}
 angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
-         "evidence": "A concrete case.", "files": ["a.py", "b.py"]}
+         "evidence": "A concrete case.", "files": ["a.py", "b.py"],
+         "execution": "read-only"}
 template = ("base={{BASE}} promise={{PROMISE}} contracts={{CONTRACTS}} "
             "invariants={{INVARIANTS}} id={{ANGLE_ID}} title={{ANGLE_TITLE}} "
             "mandate={{MANDATE}} evidence={{EVIDENCE}} files={{FILES}} "
@@ -955,7 +1040,8 @@ sys.path.insert(0, sys.argv[1])
 from adversarial_review import render_prompt
 
 plan = {"promise": "Ship it.", "contracts": [], "invariants": []}
-angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.", "evidence": "A concrete case."}
+angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.", "evidence": "A concrete case.",
+         "execution": "read-only"}
 rendered = render_prompt("{{DIFF_COMMAND}}", plan, angle, "feature;echo")
 expected = "git diff 'feature;echo'...HEAD"
 print("OK" if rendered == expected else "MISMATCH:\n" + rendered)
@@ -981,7 +1067,7 @@ from adversarial_review import render_prompt
 plan = {"promise": "Ship it, handling the literal token {{MANDATE}} verbatim.",
         "contracts": [], "invariants": []}
 angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
-         "evidence": "A concrete case."}
+         "evidence": "A concrete case.", "execution": "read-only"}
 rendered = render_prompt("promise={{PROMISE}} mandate={{MANDATE}}", plan, angle, "main")
 expected = ("promise=Ship it, handling the literal token {{MANDATE}} verbatim. "
             "mandate=Find bugs.")
@@ -992,6 +1078,55 @@ echo "--- prompt rendering: inserted plan text is never re-scanned (single pass)
 printf '%s\n' "$reinject_check"
 check "a literal {{MANDATE}} inside inserted plan text survives untouched" \
   test "$reinject_check" = "OK"
+
+# --- {{EXECUTION}} renders per-angle, and only a workspace-write angle's -------
+# --- rendered prompt tells the reviewer to run the mandated reproduction -------
+# Regression: angle-prompt.md used to tell every reviewer "Read only" with no
+# rendered execution mode at all, so a workspace-write reviewer had no signal
+# in its own prompt that it was ever allowed to run the reproduction it was
+# mandated to demonstrate. {{EXECUTION}} must render to text naming the
+# angle's own execution value with no unrendered "{{" left over, and the two
+# modes' rendered prompts must differ on whether they tell the reviewer to
+# run something.
+exec_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from adversarial_review import render_prompt
+
+plan = {"promise": "Ship it.", "contracts": [], "invariants": []}
+template = "mode={{EXECUTION}}"
+
+ro_angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
+            "evidence": "A concrete case.", "execution": "read-only"}
+ww_angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
+            "evidence": "A concrete case.", "execution": "workspace-write"}
+
+ro_rendered = render_prompt(template, plan, ro_angle, "main")
+ww_rendered = render_prompt(template, plan, ww_angle, "main")
+
+PHRASE = "run the mandated reproduction"
+
+checks = {
+    "read-only render names its own mode": "read-only" in ro_rendered,
+    "workspace-write render names its own mode": "workspace-write" in ww_rendered,
+    "read-only render has no unrendered {{ left": "{{" not in ro_rendered,
+    "workspace-write render has no unrendered {{ left": "{{" not in ww_rendered,
+    "workspace-write render tells the reviewer to run the reproduction":
+        PHRASE in ww_rendered.lower(),
+    "read-only render does not tell the reviewer to run the reproduction":
+        PHRASE not in ro_rendered.lower(),
+}
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    print("MISMATCH:\n" + "\n".join(failed) + f"\n\nro={ro_rendered!r}\nww={ww_rendered!r}")
+else:
+    print("OK")
+PYEOF
+)
+echo "--- prompt rendering: {{EXECUTION}} differs by angle execution mode ---"
+printf '%s\n' "$exec_check"
+check "EXECUTION renders per-mode and only workspace-write tells the reviewer to run it" \
+  test "$exec_check" = "OK"
 
 # --- Scheduling: read-only runs parallel, workspace-write runs serial ----------
 # The live serialization itself (thread pool, then one-at-a-time with the

@@ -8,7 +8,13 @@ see the other angles, and they do not see you — cover only the angle below.
 
 **You are read-only: do NOT edit, write, or create any files, and do not run
 anything that mutates the repo (no commits, no `git add`, no formatters).
-Review and report only.**
+Review and report only.** This holds regardless of the angle's assigned
+`execution` field below — even for a `workspace-write` angle, this pass never
+runs the mandated reproduction; it may only run read-only commands (`git`,
+`grep`, and the like) to investigate. When the mandate calls for running
+something to confirm it, describe the reproduction without running it, and
+say so plainly in the finding — a counterexample this pass could not execute
+is still reportable, but never presented as if it had run.
 
 The repo-confirmation, base-resolution, and empty-diff rules below are copied
 from `pr-review-loop`'s `reviewer-prompt.md` (in that skill's own directory) so
@@ -60,6 +66,8 @@ the two stay aligned — consult it directly if anything here is unclear.
 - **id:** `{{ANGLE_ID}}` — **title:** {{ANGLE_TITLE}}
 - **mandate:** {{MANDATE}}
 - **evidence required:** {{EVIDENCE}}
+- **execution field (plan-assigned; this pass stays read-only regardless — see
+  above):** {{EXECUTION}}
 - **files to start from (if given, not exhaustive):** {{FILES}}
 
 Your job is exactly the mandate: construct a counterexample against the
@@ -71,7 +79,10 @@ is for.
 Every BLOCKING item must carry, inline in its one line: where (`path:line`),
 what breaks, and the concrete input/sequence that breaks it — that triple is
 this angle's evidence and reproduction in one line, since the output contract
-below is line-based, not structured JSON.
+below is line-based, not structured JSON. If the mandate called for running
+something to confirm the counterexample, append ` — not executed here` to the
+line: this pass never runs a reproduction (see above), so a BLOCKING item built
+on one must say so rather than read as if it had run.
 
 ## Severity
 
