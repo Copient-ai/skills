@@ -342,11 +342,33 @@ class AngleResult:
     findings: list = field(default_factory=list)
 
 
+# Case-insensitive substrings the provider's content filter is known to emit
+# when it refuses an angle's prompt outright (observed: gpt-5.6-sol refusing
+# a mandate phrased as an attack recipe). A match distinguishes a refusal
+# from an ordinary crash so the SKILL can reword and retry instead of
+# treating the angle as broken.
+REFUSAL_MARKERS = (
+    "flagged for possible cybersecurity risk",
+    "content was flagged",
+    "trusted access for cyber",
+)
+
+
+def log_refused(log_path):
+    """Whether an angle's .log shows the provider's content filter refused
+    the prompt, rather than the angle crashing or misbehaving on its own."""
+    if not log_path.is_file():
+        return False
+    text = log_path.read_text(errors="replace").lower()
+    return any(marker in text for marker in REFUSAL_MARKERS)
+
+
 def collect_angle_result(angle, run_dir):
     aid = angle["id"]
     status_path = run_dir / f"{aid}.status"
     out_path = run_dir / f"{aid}.out.json"
     residue_path = run_dir / f"{aid}.residue.txt"
+    log_path = run_dir / f"{aid}.log"
 
     exit_code = None
     if status_path.is_file():
@@ -359,6 +381,16 @@ def collect_angle_result(angle, run_dir):
     if exit_code == 124:
         return AngleResult(aid, angle["title"], "UNPARSED", cause="timeout")
     if exit_code not in (None, 0):
+        # A nonzero exit with no out.json can mean the provider refused the
+        # prompt outright rather than the angle failing to run — distinguish
+        # that before falling back to the generic exit<n> cause.
+        if not out_path.is_file() and log_refused(log_path):
+            print(
+                f"{PROG}: angle '{aid}' was refused by the provider's content filter "
+                "(reword the mandate and re-run)",
+                file=sys.stderr,
+            )
+            return AngleResult(aid, angle["title"], "UNPARSED", cause="refused")
         return AngleResult(aid, angle["title"], "UNPARSED", cause=f"exit{exit_code}")
 
     if not out_path.is_file():

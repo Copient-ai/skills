@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "base": "origin/main",
+  "promise": "Ships a working thing without breaking anything else.",
+  "contracts": ["The cleanup guard always runs before a reassignment completes."],
+  "invariants": ["No request can bypass authentication."],
+  "angles": [
+    {
+      "id": "reassign",
+      "title": "Reassignment guard",
+      "mandate": "Produce a concrete sequence for which the cleanup guard does not hold, and show the observed state.",
+      "evidence": "A concrete sequence and the resulting state showing cleanup did not run.",
+      "execution": "read-only"
+    },
+    {
+      "id": "control",
+      "title": "Control angle",
+      "mandate": "Look for logic bugs.",
+      "evidence": "A concrete failing input.",
+      "execution": "read-only"
+    }
+  ]
+}

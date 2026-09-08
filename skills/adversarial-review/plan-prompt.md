@@ -48,6 +48,14 @@ concrete input/program/sequence for which `<the guarantee named above>` fails,
 and show it." A reviewer who tries and cannot construct one returns CLEAN —
 the mandate does not presume a bug exists, only that one must be looked for.
 
+**Wording matters as much as content.** A mandate must read as verification
+of a stated guarantee, not as an attack recipe: prefer "produce a concrete
+sequence for which `<guarantee>` does not hold, and show the observed state"
+over "bypass", "defeat", "exploit", "evade", "leak", or "attack the guard" —
+name the guarantee, the input, and the observation instead of the maneuver.
+The reviewer runs behind a provider content filter that refuses prompts
+phrased as circumventing protections, and a refusal costs a round.
+
 For each angle also decide:
 
 - **evidence** — what a finding on this angle must include to count. Tie it to

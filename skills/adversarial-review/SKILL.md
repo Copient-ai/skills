@@ -147,10 +147,15 @@ running. After each write-capable angle the tree is checked again; a
 non-empty result is recorded to `<angle>.residue.txt`, that angle is marked
 `UNPARSED(residue)` (its findings still surface in `merged.json` and the
 block, just not counted as `RAN`), and the run continues from that dirty
-state — nothing is auto-reverted, so inspect and restore by hand. The run
-directory keeps `plan.json`, `<angle>.prompt.txt`, `<angle>.out.json`,
-`<angle>.log`, `<angle>.status`, `<angle>.residue.txt` (write-capable angles
-only, when the tree came back dirty), and `merged.json`.
+state — nothing is auto-reverted, so inspect and restore by hand. Any angle,
+read-only or workspace-write, can also come back `UNPARSED(refused)`: it
+exited nonzero with no `<angle>.out.json`, and its `.log` shows the
+provider's content filter refused the prompt rather than the angle failing
+to run cleanly — the runner prints one stderr line naming the angle when
+this happens. The run directory keeps `plan.json`, `<angle>.prompt.txt`,
+`<angle>.out.json`, `<angle>.log`, `<angle>.status`, `<angle>.residue.txt`
+(write-capable angles only, when the tree came back dirty), and
+`merged.json`.
 
 Output:
 
@@ -230,6 +235,11 @@ Read the runner's compact block, not the run directory's contents.
   clean**, even if `ADVERSARIAL_REVIEW: CLEAN` covers the rest. Re-run just
   that angle once with `--only <id>`. If it recurs, escalate it in the final
   report as unreviewed rather than looping on it.
+- `UNPARSED(refused)` — the provider's content filter refused the angle's
+  prompt; it is not a crash. Re-run that angle once as is (`--only <id>`). If
+  it recurs, reword the angle's mandate in the plan per `plan-prompt.md`'s
+  wording guidance and re-run once more before escalating. Never treat it as
+  clean.
 - `ADVERSARIAL_REVIEW: UNPARSED` at the top level — same rule as the parsers
   in the sibling skills: it means the script refused to guess, not that
   nothing was found. Read the angle's `.log`/`.out.json` in the run directory

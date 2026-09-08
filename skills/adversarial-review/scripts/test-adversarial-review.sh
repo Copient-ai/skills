@@ -218,6 +218,27 @@ check "all 3 angles still merge from the resolved directory" \
 check "DIR= in the report is absolute" \
   grep -qE '^DIR=/' <<<"$out11"
 
+# --- Case 12: provider refusal (nonzero exit, no out.json, log shows a -------
+# content-filter refusal) must report UNPARSED(refused), not UNPARSED(exit1).
+dir12=$(stage refused)
+out12=$(bash "$SH" --from-dir "$dir12" 2>"$tmpdir/refused.stderr"); rc12=$?
+err12=$(cat "$tmpdir/refused.stderr")
+echo "--- case 12: refused ---"
+printf '%s\n' "$out12"
+
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out12"
+check "exits 4" test "$rc12" -eq 4
+check "the refused angle names its cause" \
+  grep -qx "reassign: UNPARSED(refused)" <<<"$out12"
+check "the control angle still ran clean" \
+  grep -qx "control: CLEAN" <<<"$out12"
+check "counts show one UNPARSED angle" \
+  grep -qx "ANGLES=2  RAN=1  BLOCKED=0  UNPARSED=1" <<<"$out12"
+check "stderr names the refused angle" grep -qi "reassign" <<<"$err12"
+check "stderr says the provider refused" grep -qi "refused" <<<"$err12"
+check "the log excerpt itself is not echoed to stdout" \
+  bash -c '! grep -qi "flagged for possible cybersecurity risk" <<<"$1"' _ "$out12"
+
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
 py_ver=$(python3 "$PY" --version | awk '{print $2}')
