@@ -8,14 +8,25 @@ given.
 
 ## 1. Read the diff and its stated intent
 
-- Resolve the base the same way the SKILL step did, and run the full diff, not
-  just names: `git diff <BASE>...HEAD`.
+- Resolve the base to the exact ref the runner will diff against — do not
+  hand-resolve `<BASE>` yourself (e.g. guessing `origin/<BASE>`); a second,
+  independent implementation of that rule can silently drift from the
+  runner's own. Ask the runner directly, the same way the SKILL's pre-flight
+  step did:
+  `bash <skill-dir>/scripts/adversarial-review.sh --print-base --base <BASE>`
+  (the same `<skill-dir>` and raw `<BASE>` branch name resolved there). Use
+  its stdout, verbatim, as `<BASE_REF>` for everything below and for the
+  plan file's own `"base"` field (step 5) — this is exactly what the runner
+  itself resolves `--base <BASE>` to at run time, so planning and running
+  can never diff against two different refs.
+- Run the full diff, not just names, against that resolved ref:
+  `git diff <BASE_REF>...HEAD`.
 - Gather anything that states intent: a PR body/title if one is already open
   (`gh pr view --json body,title`), a linked issue if the branch name or a
   commit message names one, and the commit messages themselves
-  (`git log <BASE>..HEAD`). Use these to learn what the author *claims* the
-  change does — the angles you write next exist to test that claim, not to
-  restate it.
+  (`git log <BASE_REF>..HEAD`). Use these to learn what the author *claims*
+  the change does — the angles you write next exist to test that claim, not
+  to restate it.
 
 ## 2. Derive what the change promises
 

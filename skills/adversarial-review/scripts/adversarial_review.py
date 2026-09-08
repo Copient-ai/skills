@@ -58,6 +58,10 @@ FINDING_REQUIRED = {"severity", "path", "line", "claim", "evidence", "reproducti
 
 # Used only when no angle-prompt.md is found next to this skill (the file the
 # sibling agent owns) — keeps this runner testable and usable standalone.
+# Must carry every placeholder render_prompt substitutes, {{EXECUTION}}
+# included — a fallback that silently drops the read-only/workspace-write
+# distinction would leave a reviewer with no signal it's allowed (or not) to
+# run its own mandated reproduction.
 DEFAULT_ANGLE_PROMPT = """\
 You are an adversarial reviewer. Your job is to find real, falsifiable
 problems with the change on this branch — not to summarize it, praise it, or
@@ -79,6 +83,8 @@ Mandate: {{MANDATE}}
 
 What a valid finding must include: {{EVIDENCE}}
 
+Execution mode: {{EXECUTION}}
+
 Files most relevant to this angle:
 {{FILES}}
 
@@ -93,7 +99,8 @@ elsewhere — read the real files and the real diff. For each candidate
 problem, try to construct a concrete counterexample or reproduction before
 reporting it: an input, a sequence of calls, or a scenario that actually
 breaks the claimed contract or invariant. Discard anything you cannot make
-concrete.
+concrete. Follow the execution mode above exactly — it says whether you may
+run that reproduction yourself or must only describe it.
 
 Report only what your angle is mandated to find. P0/P1 (blocking) means it
 breaks a contract or invariant, or is a critical bug; P2/P3 (nit) is
@@ -582,16 +589,33 @@ def merge_findings(results):
 
 # --- Report rendering ----------------------------------------------------------
 
+# Every control character below 0x20 except tab (0x09), plus DEL (0x7f).
+# Tab is left alone — it renders as harmless, unambiguous whitespace. LF and
+# CR are technically in range too, but escape_block_text always collapses
+# them (to a visible two-character "\n") before this ever runs, so in
+# practice this only ever matches the rest: NUL, ESC, BEL, and the like —
+# invisible or terminal-active bytes that must never reach a rendered block
+# raw (a NUL can truncate a naive reader, an ESC can drive a terminal).
+_CONTROL_CHAR_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _escape_control_char(m):
+    return f"\\x{ord(m.group(0)):02x}"
+
+
 def escape_block_text(s):
     """Collapse any literal CR/LF in `s` into a visible two-character `\\n`
     so a multiline path/claim/evidence/reproduction can never inject a bare
     continuation line into the compact block — each finding must render as
     exactly its `- [Pn] ...` line plus the `  evidence:`/`  reproduction:`
     lines that follow it, nothing else. Uses str.replace, not re.sub, so the
-    literal backslash-n is never re-interpreted as an escape sequence.
-    merged.json is unaffected — JSON handles embedded newlines natively, so
-    this only applies to the plain-text block."""
-    return s.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+    literal backslash-n is never re-interpreted as an escape sequence. Every
+    remaining control character (see _CONTROL_CHAR_RE) is then escaped too,
+    as \\xNN, so no other raw control byte can reach the block either.
+    merged.json is unaffected — JSON handles embedded control characters
+    natively, so this only applies to the plain-text block."""
+    collapsed = s.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+    return _CONTROL_CHAR_RE.sub(_escape_control_char, collapsed)
 
 
 def build_report(angle_ids, results_by_id, merged_findings, run_dir, merged_path=None):
@@ -703,45 +727,66 @@ def _ancestor_has_dotgit(path):
         cur = parent
 
 
-def dir_in_git_repo(path):
-    """Whether `path` sits inside a git working tree (any repo — not just
-    the one adversarial-review would review, and no relation to whether
-    `path` itself is version-controlled). Used only to decide where
-    merged.json is safe to land. Fails closed and combines two independent
-    signals with OR — either one saying "inside" wins:
-
-    1. `git rev-parse --is-inside-work-tree`, run with every discovery-
-       altering GIT_* variable (see _GIT_DISCOVERY_ENV_VARS) stripped from
-       its environment, so ambient env left over from some outer caller
-       can't steer git's search away from the real answer. Only a probe
-       that positively confirms "not a repo" — git runs and exits nonzero
-       with the canonical "not a git repository (or any of the parent
-       directories)" stderr — is trusted as such. Any other nonzero exit (a
-       bad GIT_DIR that survived because it wasn't in the scrub list, a
-       safe.directory rejection, a permissions surprise — each prints a
-       different fatal: message that doesn't match that phrase) never
-       actually answered the question, same as git not being runnable at
-       all (missing from PATH, bad cwd, ...) — both are treated as
-       "possibly inside a checkout".
-    2. _ancestor_has_dotgit(path) — a plain filesystem walk for a `.git`
-       entry, immune to environment entirely.
-
-    merged.json diverts to a temp file instead of risking a write into a
-    checkout whenever either signal says (or fails closed toward) "inside"."""
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
+def _git_probe_inside_work_tree(path, scrub_env):
+    """Runs `git rev-parse --is-inside-work-tree` in `path` once, either
+    with every discovery-altering GIT_* variable (see
+    _GIT_DISCOVERY_ENV_VARS) stripped from its environment (scrub_env=True)
+    or with the ambient environment passed through untouched
+    (scrub_env=False). Fails closed: only a probe that positively confirms
+    "not a repo" — git runs and exits nonzero with the canonical "not a git
+    repository (or any of the parent directories)" stderr — is trusted as
+    such. Any other nonzero exit (a safe.directory rejection, a permissions
+    surprise — each prints a different fatal: message that doesn't match
+    that phrase) never actually answered the question, same as git not
+    being runnable at all (missing from PATH, bad cwd, ...) — both are
+    treated as "possibly inside a checkout"."""
+    env = os.environ
+    if scrub_env:
+        env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=path, capture_output=True, text=True, env=env,
         )
     except OSError:
-        probe_inside = True
-    else:
-        if r.returncode == 0:
-            probe_inside = r.stdout.strip() == "true"
-        else:
-            probe_inside = "not a git repository (or any of the parent directories)" not in r.stderr
-    return probe_inside or _ancestor_has_dotgit(path)
+        return True
+    if r.returncode == 0:
+        return r.stdout.strip() == "true"
+    return "not a git repository (or any of the parent directories)" not in r.stderr
+
+
+def dir_in_git_repo(path):
+    """Whether `path` sits inside a git working tree (any repo — not just
+    the one adversarial-review would review, and no relation to whether
+    `path` itself is version-controlled). Used only to decide where
+    merged.json is safe to land. Fails closed and combines three
+    independent signals with OR — any one saying "inside" wins:
+
+    1. `_git_probe_inside_work_tree(path, scrub_env=True)` — every
+       discovery-altering GIT_* variable stripped, so ambient env left over
+       from some outer caller (a stray GIT_CEILING_DIRECTORIES, a leftover
+       GIT_DIR from a prior `git -C` elsewhere in the same shell, ...) can't
+       steer git's search away from the real answer for `path`'s own
+       ordinary ancestry.
+    2. `_git_probe_inside_work_tree(path, scrub_env=False)` — the same probe
+       with the ambient environment left exactly as given. This is the only
+       signal that can see a work tree defined *only* by GIT_DIR/
+       GIT_WORK_TREE (a bare repo elsewhere, pointed at `path` by those two
+       variables) — the scrub in (1) deliberately blinds itself to that
+       case, and no `.git` entry exists anywhere in `path`'s own ancestry
+       for (3) to find either, so without this second, unscrubbed probe a
+       directory that genuinely is a live work tree right now would read
+       back as "not a repository".
+    3. _ancestor_has_dotgit(path) — a plain filesystem walk for a `.git`
+       entry, immune to environment entirely.
+
+    merged.json diverts to a temp file instead of risking a write into a
+    checkout whenever any signal says (or fails closed toward) "inside"."""
+    return (
+        _git_probe_inside_work_tree(path, scrub_env=True)
+        or _git_probe_inside_work_tree(path, scrub_env=False)
+        or _ancestor_has_dotgit(path)
+    )
 
 
 def resolve_merged_json_path(run_dir, from_dir_mode):
@@ -750,14 +795,43 @@ def resolve_merged_json_path(run_dir, from_dir_mode):
     a fixtures tree, an example checked into some other repo — so if it
     sits inside a git working tree, merged.json is diverted to a temp file
     instead of dirtying that checkout; the report's MERGED= line (see
-    build_report) says where it actually landed. Live runs never divert:
-    `main` already refuses a run dir inside the repository under review, so
-    the default <run_dir>/merged.json is always safe there."""
-    if from_dir_mode and dir_in_git_repo(run_dir):
-        fd, path = tempfile.mkstemp(prefix="adversarial-review-merged.", suffix=".json")
+    build_report) says where it actually landed. The candidate temp
+    directory itself is verified the same way, not just assumed safe:
+    `tempfile.gettempdir()` (which honors TMPDIR) can itself point inside a
+    checkout — including the very one being diverted away from — so each
+    candidate is checked with `dir_in_git_repo` before use, falling back
+    from `tempfile.gettempdir()` to `/tmp` to `/var/tmp`. If every candidate
+    is unusable (missing, or itself inside a checkout), this is an
+    environment failure, not a silent write into a checkout — it exits 1.
+    Live runs never divert: `main` already refuses a run dir inside the
+    repository under review, so the default <run_dir>/merged.json is always
+    safe there."""
+    if not (from_dir_mode and dir_in_git_repo(run_dir)):
+        return run_dir / "merged.json"
+
+    tried = []
+    seen = set()
+    for candidate_dir in (tempfile.gettempdir(), "/tmp", "/var/tmp"):
+        if candidate_dir in seen:
+            continue
+        seen.add(candidate_dir)
+        if not os.path.isdir(candidate_dir):
+            tried.append(f"{candidate_dir} (missing)")
+            continue
+        if dir_in_git_repo(candidate_dir):
+            tried.append(f"{candidate_dir} (inside a git checkout)")
+            continue
+        fd, path = tempfile.mkstemp(
+            prefix="adversarial-review-merged.", suffix=".json", dir=candidate_dir,
+        )
         os.close(fd)
         return Path(path)
-    return run_dir / "merged.json"
+
+    env_error(
+        "cannot find a temp directory outside every git checkout to divert "
+        f"merged.json into — tried {', '.join(tried)} (TMPDIR may be "
+        "pointing inside a repository)"
+    )
 
 
 def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts):
@@ -806,6 +880,10 @@ def build_arg_parser():
     p.add_argument("--angle-prompt", help="prompt template file")
     p.add_argument("--from-dir", help="skip codex; merge from an existing run dir")
     p.add_argument("--version", action="store_true", help="print the version and exit")
+    p.add_argument(
+        "--print-base", action="store_true",
+        help="resolve --base to the exact ref this run would diff against, print it, and exit 0 (no --plan needed)",
+    )
     return p
 
 
@@ -1067,6 +1145,12 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         "-o", str(out_path),
         "-c", f"model={CODEX_REVIEW_MODEL}",
         "-c", f"model_reasoning_effort={CODEX_REVIEW_EFFORT}",
+        # The option terminator: a rendered prompt is arbitrary text a plan
+        # or a custom --angle-prompt template controls, not this runner —
+        # one that happens to start with "-" (a mandate quoting a CLI flag,
+        # a markdown "---" rule) must never be parsed as another codex exec
+        # option instead of the positional prompt argument.
+        "--",
         prompt_text,
     ]
     try:
@@ -1243,6 +1327,16 @@ def main(argv=None):
         print(f"adversarial_review.py {VERSION}")
         return 0
 
+    if args.print_base:
+        # No plan, no codex, no signal handlers — this is a pure lookup a
+        # planner runs (plan-prompt.md, SKILL.md step 0) to get the exact
+        # ref this run would diff against, so planning and running can never
+        # resolve `--base` two different ways.
+        if not args.base:
+            usage_error("--print-base requires --base")
+        print(resolve_base(args.base, repo_root()))
+        return 0
+
     # Both installed explicitly and unconditionally (harmless in --from-dir
     # mode, where no reviewer process is ever tracked). SIGTERM has no
     # Python-level default handler at all, so it needs this to get any
@@ -1288,8 +1382,20 @@ def main(argv=None):
         angles_by_id = {a["id"]: a for a in plan["angles"]}
         angle_ids = parse_only(args.only, angle_ids_all) or angle_ids_all
 
-        if shutil.which(CODEX_BIN) is None:
+        global CODEX_BIN
+        resolved_codex_bin = shutil.which(CODEX_BIN)
+        if resolved_codex_bin is None:
             env_error(f"codex CLI ('{CODEX_BIN}') not found on PATH")
+        # shutil.which returns a relative CODEX_BIN (one containing a path
+        # separator, e.g. "./relative/fake-codex") unchanged — it only
+        # verifies such a path directly, it does not resolve it. Every
+        # angle's Popen below runs with cwd=root (the repo top level), not
+        # this process's own cwd, so a relative path here would be
+        # re-resolved against the wrong directory and fail to spawn the
+        # moment root differs from wherever this command was invoked (e.g.
+        # a subdirectory). os.path.abspath, called now while the process's
+        # cwd is still the invocation directory, makes it unambiguous.
+        CODEX_BIN = os.path.abspath(resolved_codex_bin)
 
         root = repo_root()
         base = args.base or plan.get("base")

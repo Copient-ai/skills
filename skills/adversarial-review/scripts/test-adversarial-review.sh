@@ -704,7 +704,9 @@ fi
 # second plain 'control' angle sits alongside it, so the SUMMARY section's
 # one-line-per-angle contract is exercised across more than a single angle.
 dir21=$(stage multiline-fields)
-out21=$(bash "$SH" --from-dir "$dir21"); rc21=$?
+out21_file="$tmpdir/case21-raw.$$.${RANDOM:-0}.txt"
+bash "$SH" --from-dir "$dir21" >"$out21_file"; rc21=$?
+out21=$(cat "$out21_file")
 echo "--- case 21: multiline-fields ---"
 printf '%s\n' "$out21"
 
@@ -732,6 +734,29 @@ check "the multiline summary's embedded newline is escaped, not a bare continuat
   grep -qF -- "multiline: Found two issues.\\nSecond line of the summary." <<<"$out21"
 check "the control angle's plain summary line is present" \
   grep -qx "control: Control found nothing wrong." <<<"$out21"
+
+# Regression: escape_block_text only ever collapsed CR/LF — an ESC or NUL
+# embedded in a finding field reached the block as a raw byte, invisible or
+# terminal-active. The fixture's finding 1 claim now also carries a real ESC
+# (0x1b) and a real NUL (0x00), embedded via JSON's own escape sequences
+# (see multiline.out.json), so this exercises the actual control
+# characters, not their textual names. Checked at the byte level, not
+# through the $out21 shell variable — a raw NUL can't survive a bash
+# command substitution intact, which would mask rather than catch a
+# regression here.
+check "the ESC control character is escaped as \\x1b, not passed through raw" \
+  grep -qF -- '\x1b' <<<"$out21"
+check "the NUL control character is escaped as \\x00, not passed through raw" \
+  grep -qF -- '\x00' <<<"$out21"
+control_byte_check21=$(python3 - "$out21_file" <<'PYEOF'
+import sys
+data = open(sys.argv[1], "rb").read()
+bad = [hex(b) for b in data if (b < 0x20 and b not in (0x09, 0x0a)) or b == 0x7f]
+print("OK" if not bad else "BAD: " + repr(bad))
+PYEOF
+)
+check "no raw control byte (below 0x20 sans tab/newline, or 0x7f) leaks into the block" \
+  test "$control_byte_check21" = "OK"
 
 # --- Case 22: SIGINT during a live run kills every reviewer process group ------
 # fixtures/fake-codex-hang.sh backgrounds a marker-named `sleep 30` (which
@@ -926,12 +951,15 @@ fi
 # merged.json in place" -- whenever `git rev-parse` itself could not even be
 # run (e.g. no git on PATH), indistinguishable from a real, confident "not a
 # repo" answer. It must fail closed instead: a check that never ran means the
-# question was never answered, so merged.json is diverted to a temp file
-# exactly as it would be for a directory git confirms is inside a checkout
-# (see case 20). Invokes adversarial_review.py directly rather than through
-# adversarial-review.sh, whose own preflight needs `dirname` on PATH too; a
-# staged fixture (not itself a git repo) proves the diversion comes from git
-# being unusable, not from the directory actually being inside one.
+# question was never answered. That now applies uniformly to every directory
+# resolve_merged_json_path considers -- the staged fixture AND every
+# candidate temp directory it might divert into (see case 23f) -- so with
+# git entirely unavailable, none of them can be confirmed safe and the run
+# must refuse to guess (exit 1) rather than pick one anyway. Invokes
+# adversarial_review.py directly rather than through adversarial-review.sh,
+# whose own preflight needs `dirname` on PATH too; a staged fixture (not
+# itself a git repo) proves the failure comes from git being unusable, not
+# from the directory actually being inside one.
 dir23=$(stage all-clean)
 nogitbin23="$tmpdir/nogit-bin.$$.${RANDOM:-0}"
 mkdir -p "$nogitbin23"
@@ -940,16 +968,11 @@ out23=$(PATH="$nogitbin23" python3 "$PY" --from-dir "$dir23" 2>&1); rc23=$?
 echo "--- case 23: dir_in_git_repo fails closed when git is unavailable ---"
 printf '%s\n' "$out23"
 
-check "exits 0" test "$rc23" -eq 0
-merged23=$(grep '^MERGED=' <<<"$out23" | sed 's/^MERGED=//')
-check "a MERGED= line was printed" test -n "$merged23"
-check "the MERGED= path exists" test -f "$merged23"
-check "merged.json was diverted outside the staged fixture dir" \
-  bash -c '[[ "$1" != "$2"/* ]]' _ "$merged23" "$dir23"
+check "exits 1 (no candidate directory can be confirmed safe without git)" \
+  test "$rc23" -eq 1
+check "names the problem" grep -qi "cannot find a temp directory outside every git checkout" <<<"$out23"
 check "merged.json was not written into the staged fixture dir" \
   test ! -f "$dir23/merged.json"
-
-rm -f "$merged23"
 
 # --- Case 23b: an inconclusive git probe (permission denied) still diverts ----
 # Regression: dir_in_git_repo used to treat ANY nonzero `git rev-parse` exit
@@ -1045,6 +1068,72 @@ else
   rm -f "$merged23d" "$FIXTURES/all-clean/merged.json"
 fi
 
+# --- Case 23e: a worktree defined only by GIT_DIR/GIT_WORK_TREE env vars diverts
+# Regression: dir_in_git_repo's git probe deliberately scrubs GIT_DIR/
+# GIT_WORK_TREE (see case 23d) so a stray leftover value from an unrelated
+# outer caller can't make an ordinary directory look like it's inside a
+# repo. But that same scrub blinds it to a directory that IS a real work
+# tree right now, defined ONLY by those two variables -- a bare repository
+# elsewhere, pointed at an otherwise plain directory that carries no .git
+# entry of its own anywhere in its ancestry (so the filesystem-walk signal,
+# _ancestor_has_dotgit, can't see it either). A probe run with the ambient
+# environment left intact is the only signal that can see this, so
+# dir_in_git_repo now runs the probe twice -- once scrubbed, once not --
+# and reports "inside" if either does. Verified directly with git first
+# (not just assumed): `GIT_DIR=<bare>.git GIT_WORK_TREE=<plain> git -C
+# <plain> rev-parse --is-inside-work-tree` really does print "true".
+dir23e="$tmpdir/bare-worktree-plain.$$.${RANDOM:-0}"
+mkdir -p "$dir23e"
+baregit23e="$tmpdir/bare-worktree.$$.${RANDOM:-0}.git"
+git init -q --bare "$baregit23e"
+probe23e=$(GIT_DIR="$baregit23e" GIT_WORK_TREE="$dir23e" python3 - "$SCRIPT_DIR" "$dir23e" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+print(ar.dir_in_git_repo(sys.argv[2]))
+PYEOF
+)
+echo "--- case 23e: dir_in_git_repo diverts for a GIT_DIR/GIT_WORK_TREE-only worktree ---"
+echo "  dir_in_git_repo result: $probe23e"
+check "a directory that is a work tree only via env vars is reported inside" \
+  test "$probe23e" = "True"
+rm -rf "$dir23e" "$baregit23e"
+
+# --- Case 23f: TMPDIR pointing inside a checkout falls back to /tmp, /var/tmp -
+# Regression: resolve_merged_json_path assumed tempfile.gettempdir() was
+# always a safe place to divert merged.json to, but gettempdir() honors
+# TMPDIR -- which can itself point inside a checkout (including the very
+# one being diverted away from). Each candidate is now verified with
+# dir_in_git_repo before use, falling back from tempfile.gettempdir() to
+# /tmp to /var/tmp. Sets TMPDIR to a directory inside a throwaway repo and
+# points --from-dir at a fixture staged inside that SAME repo, so the naive
+# first candidate (TMPDIR) is itself inside a checkout; the resulting
+# MERGED= path must land outside the repo entirely (in practice /tmp or
+# /var/tmp, both real directories on every platform this suite targets).
+repo23f=$(make_throwaway_repo tmpdir-inside-repo)
+fixturedir23f="$repo23f/from-dir-target"
+cp -R "$FIXTURES/all-clean" "$fixturedir23f"
+faketmp23f="$repo23f/faketmp"
+mkdir -p "$faketmp23f"
+
+out23f=$(TMPDIR="$faketmp23f" python3 "$PY" --from-dir "$fixturedir23f" 2>&1); rc23f=$?
+echo "--- case 23f: TMPDIR inside a checkout falls back to /tmp or /var/tmp ---"
+printf '%s\n' "$out23f"
+
+check "exits 0" test "$rc23f" -eq 0
+merged23f=$(grep '^MERGED=' <<<"$out23f" | sed 's/^MERGED=//')
+check "a MERGED= line was printed" test -n "$merged23f"
+check "the MERGED= path exists" test -f "$merged23f"
+check "merged.json was not written under the hostile TMPDIR (inside the repo)" \
+  bash -c '[[ "$1" != "$2"/* ]]' _ "$merged23f" "$faketmp23f"
+check "merged.json was not written next to the staged fixture" \
+  test ! -f "$fixturedir23f/merged.json"
+check "merged.json landed under /tmp or /var/tmp, not some other surprise path" \
+  bash -c '[[ "$1" == /tmp/* || "$1" == /private/tmp/* || "$1" == /var/tmp/* || "$1" == /private/var/tmp/* ]]' _ "$merged23f"
+
+rm -f "$merged23f"
+
 # --- Case 24: stale artifacts are cleared for every selected angle up front ----
 # Regression: clear_stale_artifacts(aid, run_dir) ran at the top of run_angle
 # itself, so under --jobs 1 a queued (not-yet-started) angle kept whatever
@@ -1103,6 +1192,134 @@ EOF
   pkill -f "sleep-$marker24" 2>/dev/null || true
   rm -rf "$rundir24" "$linkdir24"
 fi
+
+# --- Case 25: --print-base resolves remote-first, matching resolve_base -------
+# Regression: plan-prompt.md told the planner to diff against a raw branch
+# name, while the runner resolves it remote-first (origin/<base>, then
+# <remote>/<base>, then <base>) -- the two could diff against different
+# refs whenever a local branch has fallen behind its remote-tracking
+# counterpart. --print-base exposes the runner's own resolve_base so the
+# planner can ask it directly instead of reimplementing the rule. Builds a
+# repo whose local 'main' is deliberately stale (behind origin/main, by
+# committing on a clone and pushing back) and confirms --print-base prints
+# "origin/main", not the stale local ref.
+repo25="$tmpdir/print-base.$$.${RANDOM:-0}"
+mkdir -p "$repo25"
+git init -q -b main "$repo25"
+git -C "$repo25" config user.email "test@example.com"
+git -C "$repo25" config user.name "Test"
+echo base > "$repo25/f.txt"
+git -C "$repo25" add -A
+git -C "$repo25" commit -q -m base
+
+remote25="$tmpdir/print-base-remote.$$.${RANDOM:-0}.git"
+git init -q --bare "$remote25"
+git -C "$repo25" remote add origin "$remote25"
+git -C "$repo25" push -q origin main
+
+work25="$tmpdir/print-base-work.$$.${RANDOM:-0}"
+git clone -q "$remote25" "$work25"
+git -C "$work25" config user.email "test@example.com"
+git -C "$work25" config user.name "Test"
+echo "remote moved on" >> "$work25/f.txt"
+git -C "$work25" commit -qam "remote moves ahead"
+git -C "$work25" push -q origin main
+
+# repo25's own remote-tracking origin/main now reflects the advanced
+# remote; its local 'main' branch is untouched by fetch, so it stays stale.
+git -C "$repo25" fetch -q origin
+
+local_sha25=$(git -C "$repo25" rev-parse main)
+origin_sha25=$(git -C "$repo25" rev-parse origin/main)
+
+out25=$(cd "$repo25" && CODEX_BIN=true bash "$SH" --print-base --base main 2>&1); rc25=$?
+echo "--- case 25: --print-base resolves remote-first ---"
+printf '%s\n' "$out25"
+
+check "the local branch really is stale (differs from origin/main)" \
+  test "$local_sha25" != "$origin_sha25"
+check "exits 0" test "$rc25" -eq 0
+check "--print-base prints origin/main, not the stale local branch" \
+  test "$out25" = "origin/main"
+
+# --- Case 25b: --print-base without --base is a usage error --------------------
+err25b=$(CODEX_BIN=true bash "$SH" --print-base 2>&1); rc25b=$?
+echo "--- case 25b: --print-base with no --base ---"
+printf '%s\n' "$err25b"
+check "missing --base exits 2" test "$rc25b" -eq 2
+check "missing --base names the problem" grep -qi -- "--print-base requires --base" <<<"$err25b"
+
+# --- Case 26: the codex exec argv gets an option terminator before the prompt --
+# Regression: a rendered prompt is arbitrary text a plan or a custom
+# --angle-prompt template controls, not this runner -- one that happens to
+# start with "-" (a mandate quoting a CLI flag, a markdown "---" rule) could
+# be parsed by `codex exec` as another option instead of the positional
+# prompt argument. run_angle now inserts "--" immediately before the prompt
+# in the argv it hands to Popen. fixtures/fake-codex-argv-log.sh logs every
+# argv element to its own file (one per element, not one line per file --
+# the prompt itself is multiline, so a line-oriented log couldn't tell an
+# embedded newline apart from an element boundary) so this checks the exact
+# argv the runner built, not just that the run succeeded.
+repo26=$(make_throwaway_repo option-terminator)
+cat > "$repo26/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+template26="$tmpdir/dashes-template.$$.${RANDOM:-0}.md"
+printf -- '---\nprompt intentionally starting with three dashes, to check the option terminator protects it from being parsed as a codex exec flag\nangle: {{ANGLE_ID}}\n' > "$template26"
+argvdir26="$tmpdir/argv-log.$$.${RANDOM:-0}"
+rundir26="$tmpdir/option-terminator-run.$$.${RANDOM:-0}"
+
+out26=$(cd "$repo26" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir26" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir26" --angle-prompt "$template26" 2>&1); rc26=$?
+echo "--- case 26: option terminator before the prompt ---"
+printf '%s\n' "$out26"
+
+check "exits 0" test "$rc26" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out26"
+argv_n26=$(find "$argvdir26" -maxdepth 1 -name '[0-9]*' | wc -l | tr -d ' ')
+last26=$((argv_n26 - 1))
+second_last26=$((argv_n26 - 2))
+check "argv has at least two elements logged" test "$argv_n26" -ge 2
+check "the element right before the prompt is a bare --" \
+  bash -c 'test "$(cat "$1")" = "--"' _ "$argvdir26/$second_last26"
+check "the prompt (the last argv element) is the one rendered, starting with ---" \
+  bash -c 'case "$(cat "$1")" in ---*) exit 0 ;; *) exit 1 ;; esac' _ "$argvdir26/$last26"
+
+# --- Case 27: a relative CODEX_BIN resolves to an absolute path before Popen ---
+# Regression: shutil.which() returns a relative CODEX_BIN (one containing a
+# path separator, e.g. "./relative/fake-codex") unchanged -- it only checks
+# such a path directly, it never resolves it. Every angle's Popen runs with
+# cwd=root (the repo top level), not this process's own invocation
+# directory, so a relative CODEX_BIN used as-is would be re-resolved
+# against the wrong directory and fail to spawn whenever root differs from
+# where the command was invoked -- exactly the case here: CODEX_BIN is
+# relative to a SUBdirectory of the repo, not the repo root. Proves this by
+# actually spawning: without the fix this fails to find the executable at
+# all (a spawn failure); with the fix it runs successfully, and argv0 (the
+# literal cmd[0] the fake codex was execve()'d with) is an absolute path.
+repo27=$(make_throwaway_repo relative-codex-bin)
+mkdir -p "$repo27/sub/relative"
+cp "$FIXTURES/fake-codex-argv-log.sh" "$repo27/sub/relative/fake-codex"
+chmod +x "$repo27/sub/relative/fake-codex"
+cat > "$repo27/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+argvdir27="$tmpdir/argv-log-relative.$$.${RANDOM:-0}"
+rundir27="$tmpdir/relative-codex-bin-run.$$.${RANDOM:-0}"
+
+out27=$(cd "$repo27/sub" && CODEX_BIN="./relative/fake-codex" ADV_TEST_ARGV_DIR="$argvdir27" \
+  bash "$SH" --plan ../plan.json --base main --dir "$rundir27" 2>&1); rc27=$?
+echo "--- case 27: relative CODEX_BIN from a subdirectory resolves absolute ---"
+printf '%s\n' "$out27"
+
+check "exits 0 (the relative CODEX_BIN, from a subdirectory, still spawns)" \
+  test "$rc27" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out27"
+check "argv0 was logged" test -f "$argvdir27/argv0"
+check "argv0 is an absolute path, not the raw relative CODEX_BIN string" \
+  bash -c 'case "$(cat "$1")" in /*) exit 0 ;; *) exit 1 ;; esac' _ "$argvdir27/argv0"
 
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
@@ -1285,6 +1502,51 @@ echo "--- prompt rendering: {{EXECUTION}} differs by angle execution mode ---"
 printf '%s\n' "$exec_check"
 check "EXECUTION renders per-mode and only workspace-write tells the reviewer to run it" \
   test "$exec_check" = "OK"
+
+# --- The fallback DEFAULT_ANGLE_PROMPT carries {{EXECUTION}} too ---------------
+# Regression: angle-prompt.md (the sibling agent's own file) renders
+# {{EXECUTION}}, but DEFAULT_ANGLE_PROMPT -- used only when no
+# angle-prompt.md is found next to this skill -- didn't mention it at all,
+# so a reviewer running under the fallback template had no signal whether
+# it was allowed to run its own mandated reproduction. Drives
+# load_angle_prompt_template(None, script_dir) with a script_dir that has
+# no sibling angle-prompt.md (so it must fall back to DEFAULT_ANGLE_PROMPT,
+# confirmed by identity below) and renders it for both execution modes, the
+# same way case above does for the real template.
+fallback_exec_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+template = ar.load_angle_prompt_template(None, Path("/nonexistent-dir-for-this-test"))
+plan = {"promise": "Ship it.", "contracts": [], "invariants": []}
+ro_angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
+            "evidence": "A concrete case.", "execution": "read-only"}
+ww_angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
+            "evidence": "A concrete case.", "execution": "workspace-write"}
+
+ro_rendered = ar.render_prompt(template, plan, ro_angle, "main")
+ww_rendered = ar.render_prompt(template, plan, ww_angle, "main")
+
+checks = {
+    "the fallback template really is DEFAULT_ANGLE_PROMPT": template is ar.DEFAULT_ANGLE_PROMPT,
+    "read-only render names its own mode": "read-only" in ro_rendered,
+    "workspace-write render names its own mode": "workspace-write" in ww_rendered,
+    "read-only render has no unrendered {{ left": "{{" not in ro_rendered,
+    "workspace-write render has no unrendered {{ left": "{{" not in ww_rendered,
+}
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    print("MISMATCH:\n" + "\n".join(failed))
+else:
+    print("OK")
+PYEOF
+)
+echo "--- fallback template: {{EXECUTION}} renders per-mode even without angle-prompt.md ---"
+printf '%s\n' "$fallback_exec_check"
+check "DEFAULT_ANGLE_PROMPT carries {{EXECUTION}} with the same per-mode guidance" \
+  test "$fallback_exec_check" = "OK"
 
 # --- Scheduling: read-only runs parallel, workspace-write runs serial ----------
 # The live serialization itself (thread pool, then one-at-a-time with the

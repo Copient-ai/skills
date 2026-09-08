@@ -198,13 +198,21 @@ Severity maps as **P0/P1 = blocking, P2/P3 = nit**. Exit `0` for
 - Confirm a feature branch, not the default branch (`git branch --show-current`).
 - Commit any uncommitted work first — `codex exec` reads committed state via
   the diff, same as `codex review` does for `codex-review-loop`.
-- Note the base branch: `gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main`.
+- Note the base branch: `BASE=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)`.
+- Resolve `$BASE` to the exact ref this run will diff against — the
+  runner's own remote-first rule (`origin/$BASE`, then `<remote>/$BASE`,
+  then `$BASE`), the same one `pr-review-loop`'s reviewer prompt uses — by
+  asking the runner itself rather than reimplementing the rule by hand:
+  `bash <skill-dir>/scripts/adversarial-review.sh --print-base --base "$BASE"`
+  (the literal `<skill-dir>` resolved above). Keep its stdout as `BASE_REF`
+  for every diff from here on, including the plan step — a hand-resolved
+  guess can silently drift from what the runner itself will diff against.
 - Start an empty **declined-findings ledger** (you persist across rounds; each
   angle run is fresh). Set the round counter to **0**.
 
 ### 1. Plan (the heart of this skill)
 
-Read `git diff <BASE>...HEAD`, plus any PR body, linked issue, or commit
+Read `git diff "$BASE_REF"...HEAD`, plus any PR body, linked issue, or commit
 messages available, and follow `<skill-dir>/plan-prompt.md` exactly to write
 the plan file. It covers: what to derive (the promise, the contracts/
 invariants, what enforces them), how to phrase an angle — a mandate is an

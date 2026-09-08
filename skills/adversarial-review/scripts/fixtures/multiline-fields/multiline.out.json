@@ -7,7 +7,7 @@
       "severity": "P1",
       "path": "a.py",
       "line": 10,
-      "claim": "Line one of the claim\nLine two of the claim",
+      "claim": "Line one of the claim\nLine two of the claim, with an ESC \u001b and a NUL \u0000 embedded",
       "evidence": "single line evidence",
       "reproduction": "single line reproduction"
     },
