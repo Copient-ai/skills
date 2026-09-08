@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "base": "origin/main",
+  "promise": "Ships a working thing.",
+  "contracts": ["Contract A"],
+  "invariants": ["Invariant A"],
+  "angles": [
+    {
+      "id": "correctness",
+      "title": "Correctness",
+      "mandate": "Find logic bugs.",
+      "evidence": "A concrete failing case.",
+      "execution": "read-only"
+    },
+    {
+      "id": "security",
+      "title": "Security",
+      "mandate": "Find security holes.",
+      "evidence": "A concrete exploit.",
+      "execution": "read-only"
+    }
+  ]
+}

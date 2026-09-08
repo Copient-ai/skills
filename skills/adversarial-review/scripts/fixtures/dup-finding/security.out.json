@@ -1,0 +1,15 @@
+{
+  "angle": "security",
+  "verdict": "FINDINGS",
+  "summary": "Security angle found one issue.",
+  "findings": [
+    {
+      "severity": "P0",
+      "path": "a.py",
+      "line": 10,
+      "claim": "Off-by-one drops the final row of the batch",
+      "evidence": "the dropped row carries the auth check for the last request",
+      "reproduction": "send 3 requests; the 3rd bypasses auth because its check is dropped"
+    }
+  ]
+}

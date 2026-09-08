@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "base": "origin/main",
+  "promise": "Ships a working thing without breaking anything else.",
+  "contracts": [],
+  "invariants": [],
+  "angles": [
+    {
+      "id": "alpha",
+      "title": "Alpha",
+      "mandate": "Look for logic bugs.",
+      "evidence": "A concrete failing input.",
+      "execution": "sandboxed"
+    }
+  ]
+}

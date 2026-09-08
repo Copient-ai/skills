@@ -1,11 +1,37 @@
 # Changelog
 
-Versions here track `codex-review.sh`'s parser, which is what `--version`
-reports. Compare it against your install before trusting a clean verdict:
+Versions here track the plugin. Each helper script reports its own
+parser/runner version via `--version` — compare it against your install
+before trusting a clean verdict:
 
 ```bash
 bash <skill-dir>/scripts/codex-review.sh --version
+bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
+
+## 1.1.0
+
+`codex-review.sh`'s parser is unchanged — it still reports `1.0.0`, and
+`codex-review-loop` and `pr-review-loop` are byte-identical to their 1.0.0
+release.
+
+New skill: `adversarial-review`, with its own runner version `1.0.0`
+(`adversarial-review.sh --version`). Where the other two skills converge a
+generic review, this one plans first — a serialized planning phase reads the
+diff and derives what the branch itself promises, then turns each promise
+into a falsifiable attack angle. It adds:
+
+- A **plan phase** that derives contracts, invariants, and 3–6 attack angles
+  from the diff itself — nothing pre-baked, no fixed checklist.
+- **Parallel `codex exec` angles** — one isolated, ephemeral Codex pass per
+  angle, plus an optional isolated Claude pass per angle.
+- **Schema-enforced findings** — each pass's output is validated against
+  `scripts/findings.schema.json`, so a reviewer hands back a reproduction,
+  not prose.
+- Exit-code discipline matching the sibling skills: `UNPARSED` and `BLOCKED`
+  angles are never counted as clean, even when the rest of the run reports
+  `CLEAN`.
+- A new host requirement: `python3` (stdlib only) on `PATH`, for the runner.
 
 ## 1.0.0
 

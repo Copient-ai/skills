@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["angle", "verdict", "summary", "findings"],
+  "properties": {
+    "angle": { "type": "string" },
+    "verdict": { "type": "string", "enum": ["CLEAN", "FINDINGS", "BLOCKED"] },
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "path", "line", "claim", "evidence", "reproduction"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "path": { "type": "string" },
+          "line": { "type": "integer" },
+          "claim": { "type": "string" },
+          "evidence": { "type": "string" },
+          "reproduction": { "type": "string" }
+        }
+      }
+    }
+  }
+}

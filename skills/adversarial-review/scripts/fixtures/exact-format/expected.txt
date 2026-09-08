@@ -1,0 +1,14 @@
+ADVERSARIAL_REVIEW: FINDINGS
+ANGLES=2  RAN=2  BLOCKED=0  UNPARSED=0
+BLOCKING=1  NITS=0
+DIR=RUNDIR
+--- ANGLES ---
+correctness: FINDINGS(1)
+security: CLEAN
+--- SUMMARY ---
+correctness: Found one blocking issue.
+security: No security issues found.
+--- FINDINGS ---
+- [P1] app/main.py:42 — Off-by-one drops the last row  [angles: correctness]
+  evidence: loop uses range(0, n-1)
+  reproduction: call main.process(range(3)) and see the last item missing
