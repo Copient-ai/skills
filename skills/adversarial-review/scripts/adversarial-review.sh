@@ -94,6 +94,13 @@ while [ "$i" -lt "$n" ]; do
       FROM_DIR=true
       i=$((i + 2))
       ;;
+    --from-dir=*)
+      # A single "--from-dir=PATH" token, not "--from-dir" + a separate
+      # value arg — must still flip FROM_DIR so the codex-on-PATH check
+      # below is skipped, same as the space-separated form above.
+      FROM_DIR=true
+      i=$((i + 1))
+      ;;
     --plan|--base|--jobs|--timeout|--dir|--only|--angle-prompt)
       i=$((i + 2))
       ;;

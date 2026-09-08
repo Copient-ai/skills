@@ -146,22 +146,26 @@ write-capable angle is skipped and marked `UNPARSED(dirty-tree)` without
 running. After each write-capable angle the tree is checked again; a
 non-empty result is recorded to `<angle>.residue.txt`, that angle is marked
 `UNPARSED(residue)` (its findings still surface in `merged.json` and the
-block, just not counted as `RAN`), and the run continues from that dirty
-state — nothing is auto-reverted, so inspect and restore by hand. Any angle,
+block, just not counted as `RAN`), and every write-capable angle still to
+come is skipped as `UNPARSED(compromised)` rather than run against that
+now-modified tree — nothing is auto-reverted, so inspect and restore by
+hand. Any angle,
 read-only or workspace-write, can also come back `UNPARSED(refused)`: it
 exited nonzero with no `<angle>.out.json`, and its `.log` shows the
 provider's content filter refused the prompt rather than the angle failing
 to run cleanly — the runner prints one stderr line naming the angle when
 this happens. The run directory keeps `plan.json`, `<angle>.prompt.txt`,
 `<angle>.out.json`, `<angle>.log`, `<angle>.status`, `<angle>.residue.txt`
-(write-capable angles only, when the tree came back dirty), and normally
-`merged.json` — except under `--from-dir` when that directory sits inside a
-real git checkout (a fixtures tree, an example under version control): then
-`merged.json` is written to a temp file instead, so the run never dirties
-that checkout, and the block's `DIR=` line is followed by a `MERGED=` line
-naming where it actually landed. Re-running an angle into a reused `--dir`
-(a fresh invocation, or `--only` narrowing a re-run) first deletes that
-angle's own prior `.prompt.txt`/`.out.json`/`.log`/`.status`/`.residue.txt`,
+(write-capable angles only, when the tree came back dirty), `<angle>.skipped.txt`
+(write-capable angles the dirty-tree gate or the compromised cascade skipped
+entirely, naming the cause), and normally `merged.json` — except under
+`--from-dir` when that directory sits inside a real git checkout (a fixtures
+tree, an example under version control): then `merged.json` is written to a
+temp file instead, so the run never dirties that checkout, and the block's
+`DIR=` line is followed by a `MERGED=` line naming where it actually landed.
+Re-running an angle into a reused `--dir` (a fresh invocation, or `--only`
+narrowing a re-run) first deletes that angle's own prior
+`.prompt.txt`/`.out.json`/`.log`/`.status`/`.residue.txt`/`.skipped.txt`,
 so a stale file from an earlier run in the same directory is never mistaken
 for this run's result.
 

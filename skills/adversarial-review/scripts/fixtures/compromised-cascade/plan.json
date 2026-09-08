@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "base": "origin/main",
+  "promise": "Ships a working thing without breaking anything else.",
+  "contracts": ["The public API keeps its documented behavior."],
+  "invariants": ["No request can bypass authentication."],
+  "angles": [
+    {
+      "id": "reader",
+      "title": "Reader angle",
+      "mandate": "Look for logic bugs.",
+      "evidence": "A concrete failing input.",
+      "execution": "read-only"
+    },
+    {
+      "id": "writer",
+      "title": "Writer angle",
+      "mandate": "Run reproductions and look for contract violations.",
+      "evidence": "A concrete broken contract.",
+      "execution": "workspace-write"
+    },
+    {
+      "id": "writer2",
+      "title": "Second writer angle",
+      "mandate": "Run a different reproduction.",
+      "evidence": "A concrete broken invariant.",
+      "execution": "workspace-write"
+    }
+  ]
+}

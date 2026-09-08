@@ -1,0 +1,15 @@
+{
+  "angle": "writer",
+  "verdict": "FINDINGS",
+  "summary": "Writer angle found one issue while reproducing.",
+  "findings": [
+    {
+      "severity": "P1",
+      "path": "b.py",
+      "line": 20,
+      "claim": "The retry loop never releases the lock on failure",
+      "evidence": "finally block is missing around lock.release()",
+      "reproduction": "call retry(fn_that_raises); the lock stays held after the call returns"
+    }
+  ]
+}

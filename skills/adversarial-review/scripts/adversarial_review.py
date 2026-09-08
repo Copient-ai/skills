@@ -24,6 +24,7 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -142,6 +143,9 @@ def validate_plan(data, source):
     promise = data.get("promise")
     if not isinstance(promise, str) or not promise.strip():
         usage_error(f"plan {source}: 'promise' must be a non-empty string")
+    base = data.get("base")
+    if base is not None and not (isinstance(base, str) and base.strip()):
+        usage_error(f"plan {source}: 'base' must be a non-empty string")
     for list_field in ("contracts", "invariants"):
         val = data.get(list_field)
         if val is not None and not (
@@ -294,7 +298,11 @@ def render_prompt(template, plan, angle, base_resolved):
         "{{MANDATE}}": angle["mandate"],
         "{{EVIDENCE}}": angle["evidence"],
         "{{FILES}}": bulleted(angle.get("files"), "(all changed files)"),
-        "{{DIFF_COMMAND}}": f"git diff {base_resolved}...HEAD",
+        # shlex.quote only the base — the quoted and unquoted pieces
+        # concatenate to the same single shell token, and a base with shell
+        # metacharacters (e.g. from a hand-edited plan) can never break out
+        # of the command a reviewer is told to paste and run.
+        "{{DIFF_COMMAND}}": f"git diff {shlex.quote(base_resolved)}...HEAD",
     }
     out = template
     for k, v in subs.items():
@@ -385,6 +393,17 @@ def collect_angle_result(angle, run_dir):
     out_path = run_dir / f"{aid}.out.json"
     residue_path = run_dir / f"{aid}.residue.txt"
     log_path = run_dir / f"{aid}.log"
+    skipped_path = run_dir / f"{aid}.skipped.txt"
+
+    # An angle that run_write_capable_angles decided never to run at all —
+    # the dirty-tree gate, or a later angle skipped after an earlier one's
+    # residue compromised the shared tree — leaves this marker instead of a
+    # .status/.out.json (see run_write_capable_angles). Checked first, ahead
+    # of every other file, so a later --from-dir re-merge reports the same
+    # UNPARSED(<cause>) rather than misreading stale or absent files.
+    if skipped_path.is_file():
+        cause = skipped_path.read_text().strip() or "skipped"
+        return AngleResult(aid, angle["title"], "UNPARSED", cause=cause)
 
     # A present out.json is trusted only once its own run reports exit 0 —
     # a missing or unparsable .status file, or one that isn't 0, means the
@@ -569,7 +588,7 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir, merged_path
         if r.kind == "UNPARSED":
             lines.append(f"{aid}: (unparsed — {r.cause})")
         else:
-            lines.append(f"{aid}: {r.summary}")
+            lines.append(f"{aid}: {escape_block_text(r.summary)}")
 
     if merged_findings:
         lines.append("--- FINDINGS ---")
@@ -649,6 +668,19 @@ def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, ba
     merged_path.write_text(json.dumps(doc, indent=2) + "\n")
 
 
+def clear_merged_json(run_dir):
+    """Best-effort delete of run_dir/merged.json. Called both before a live
+    run launches any angle (so a reused --dir's merged.json from a previous
+    invocation can never be mistaken for this run's own verdict) and again
+    on the spawn-failure abort path in main(), which exits before ever
+    writing a new one — an abort must never leave a previous run's verdict
+    looking like this run's result. A missing file is not an error."""
+    try:
+        (run_dir / "merged.json").unlink()
+    except FileNotFoundError:
+        pass
+
+
 # --- CLI -----------------------------------------------------------------------
 
 def build_arg_parser():
@@ -680,6 +712,33 @@ def _group_running(pgid):
         return True
 
 
+def _group_member_pids(pgid):
+    """Best-effort list of pids currently in process group `pgid`, via `ps
+    -eo pid=,pgid=` (supported by both GNU/Linux and BSD/macOS ps). Used
+    only to size the post-exit leak note in run_angle — never to decide
+    whether to act (that's `_group_running`, a plain signal-0 probe that
+    doesn't depend on `ps` existing at all). Returns an empty list, not an
+    error, if `ps` is missing or its output doesn't parse."""
+    try:
+        r = subprocess.run(["ps", "-eo", "pid=,pgid="], capture_output=True, text=True)
+    except OSError:
+        return []
+    if r.returncode != 0:
+        return []
+    pids = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, pg = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pg == pgid:
+            pids.append(pid)
+    return pids
+
+
 def kill_process_group(proc, grace_sec=2):
     """SIGTERM the whole process group `proc` leads (started with
     start_new_session=True), then verify the group actually died rather than
@@ -690,11 +749,17 @@ def kill_process_group(proc, grace_sec=2):
     membership is re-checked with `os.killpg(pgid, 0)` before declaring the
     kill done. If any member survives, SIGKILL the group and poll (bounded by
     `grace_sec`) until no member remains. Best-effort: a process/group that's
-    already gone is not an error here."""
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        return
+    already gone is not an error here.
+
+    `start_new_session=True` makes `proc`'s own pid its process-group id at
+    spawn time, and that never changes for the group's lifetime — so pgid is
+    just `proc.pid`, not something to look up via `os.getpgid`. That lookup
+    would in fact be wrong here: this is also called after `proc` has
+    already exited and been reaped (see run_angle's post-exit reap), at
+    which point `os.getpgid(proc.pid)` can only fail (ProcessLookupError) or,
+    worse, silently return an unrelated process's pgid if the pid number has
+    already been recycled by the OS."""
+    pgid = proc.pid
 
     try:
         os.killpg(pgid, signal.SIGTERM)
@@ -723,7 +788,7 @@ def kill_process_group(proc, grace_sec=2):
 # plan, or --only re-running just a few ids) must never let one of these
 # survive from an earlier run — a stale .out.json or .residue.txt sitting
 # next to a failed re-run would be misread as this run's own result.
-ANGLE_ARTIFACT_SUFFIXES = (".prompt.txt", ".out.json", ".log", ".status", ".residue.txt")
+ANGLE_ARTIFACT_SUFFIXES = (".prompt.txt", ".out.json", ".log", ".status", ".residue.txt", ".skipped.txt")
 
 
 def clear_stale_artifacts(aid, run_dir):
@@ -766,12 +831,43 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             try:
                 proc.communicate(timeout=timeout_sec)
                 (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
+                # A normal exit only proves the reviewer process itself is
+                # gone, not anything it backgrounded (a detached
+                # reproduction, a leftover server) — that survives in the
+                # same process group exactly as it would after a timeout,
+                # so reap it here too rather than only on TimeoutExpired.
+                if _group_running(proc.pid):
+                    survivors = _group_member_pids(proc.pid)
+                    kill_process_group(proc)
+                    count = len(survivors) if survivors else "some"
+                    note = (
+                        f"{PROG}: angle '{aid}' reviewer left {count} background "
+                        "process(es) running after exit; terminated\n"
+                    )
+                    logfh.write(note.encode())
+                    logfh.flush()
+                    print(note, end="", file=sys.stderr)
             except subprocess.TimeoutExpired:
                 kill_process_group(proc)
                 (run_dir / f"{aid}.status").write_text("124\n")
         return None
     except OSError as e:
         return str(e)
+
+
+def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
+    """Records that write-capable angle `aid` never ran at all (the
+    dirty-tree gate, or the compromised cascade after an earlier angle's
+    residue — see run_write_capable_angles). Clears any stale artifacts
+    first, so a later --from-dir re-merge of a reused --dir can never read
+    an old .out.json/.status left from a prior invocation and misreport
+    this angle CLEAN; writes the '<aid>.skipped.txt' marker
+    collect_angle_result checks for, so that re-merge reports the same
+    UNPARSED(<cause>) this run does; and records the in-memory AngleResult
+    for this run's own report."""
+    clear_stale_artifacts(aid, run_dir)
+    (run_dir / f"{aid}.skipped.txt").write_text(f"{cause}\n")
+    synthetic_results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
 
 
 def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
@@ -787,15 +883,20 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
     attribute any residue that follows to a specific angle. After each angle
     that does run, the tree is checked again: a non-empty `git status
     --porcelain` is recorded to <angle>.residue.txt and printed to stderr,
-    and the next angle runs anyway, from that dirty state — nothing is
-    reverted automatically here; that is the SKILL's job (inspect, restore).
+    that angle is marked UNPARSED(residue), and every write-capable angle
+    still to come is skipped as UNPARSED(compromised) rather than run
+    against a tree an earlier angle already modified — nothing is reverted
+    automatically here; that is the SKILL's job (inspect, restore).
 
     Returns (synthetic_results, spawn_failures). synthetic_results holds
     AngleResult objects for angles that never ran at all (the dirty-tree
-    skip) — there is no status/out file for those, so they bypass
-    collect_angle_result entirely. Angles that did run are left for the
-    caller's normal collect_angle_result pass, which also checks for a
-    residue marker."""
+    gate, or the compromised cascade) — there is no status/out file for
+    those, only the '<aid>.skipped.txt' marker (see _mark_skipped), so they
+    bypass collect_angle_result's normal read entirely in this run, though a
+    later --from-dir re-merge reads that same marker back through
+    collect_angle_result. Angles that did run are left for the caller's
+    normal collect_angle_result pass, which also checks for a residue
+    marker."""
     synthetic_results = {}
     spawn_failures = []
 
@@ -809,10 +910,14 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
             file=sys.stderr,
         )
         for aid in serial_ids:
-            synthetic_results[aid] = AngleResult(aid, angles_by_id[aid]["title"], "UNPARSED", cause="dirty-tree")
+            _mark_skipped(aid, angles_by_id[aid]["title"], "dirty-tree", run_dir, synthetic_results)
         return synthetic_results, spawn_failures
 
+    compromised = False
     for aid in serial_ids:
+        if compromised:
+            _mark_skipped(aid, angles_by_id[aid]["title"], "compromised", run_dir, synthetic_results)
+            continue
         err = run_angle(
             aid, angles_by_id[aid], plan, base_resolved, template,
             run_dir, root, schema_path, timeout_sec,
@@ -826,6 +931,7 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
             print(f"{PROG}: angle '{aid}' left the working tree dirty — not reverting:", file=sys.stderr)
             for line in status.splitlines():
                 print(f"  {line}", file=sys.stderr)
+            compromised = True
 
     return synthetic_results, spawn_failures
 
@@ -913,6 +1019,11 @@ def main(argv=None):
 
         if args.dir:
             run_dir.mkdir(parents=True, exist_ok=True)
+        # A reused --dir may carry a merged.json from an earlier invocation
+        # — clear it before any angle launches, so an abort further down
+        # (spawn failure) can never leave that previous verdict looking
+        # like this run's own result.
+        clear_merged_json(run_dir)
         (run_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
 
         template = load_angle_prompt_template(args.angle_prompt, script_dir)
@@ -950,6 +1061,7 @@ def main(argv=None):
         if spawn_failures:
             for aid, err in spawn_failures:
                 print(f"{PROG}: codex failed to start for angle '{aid}': {err}", file=sys.stderr)
+            clear_merged_json(run_dir)
             codex_error(
                 "codex could not be invoked for one or more angles — aborting without a "
                 "merged report (a review that never started is not the same as one that "

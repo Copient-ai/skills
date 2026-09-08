@@ -179,6 +179,13 @@ printf '%s\n' "$err7e"
 check "string contracts exits 2" test "$rc7e" -eq 2
 check "string contracts names the problem" grep -qi "'contracts' must be a list of strings" <<<"$err7e"
 
+dir7f=$(stage bad-plan-base-int)
+err7f=$(bash "$SH" --from-dir "$dir7f" 2>&1); rc7f=$?
+echo "--- case 7f: base is an int, not a string ---"
+printf '%s\n' "$err7f"
+check "int base exits 2" test "$rc7f" -eq 2
+check "int base names the problem" grep -qi "'base' must be a non-empty string" <<<"$err7f"
+
 # --- Case 8: the block format is exact -----------------------------------------
 dir8=$(stage exact-format)
 out8=$(bash "$SH" --from-dir "$dir8")
@@ -216,6 +223,32 @@ check "the residue angle's finding is still surfaced in the block" \
   grep -qF -- "- [P1] b.py:20" <<<"$out9"
 check "the surfaced finding is tagged with the residue angle" \
   grep -qF -- "[angles: writer]" <<<"$out9"
+
+# --- Case 9b: residue triggers a compromised cascade for later write-capable --
+# angles. compromised-cascade/ carries three angles in plan order — reader
+# (read-only, CLEAN), writer (workspace-write, left residue — same as
+# fixtures/residue/), writer2 (workspace-write, has only a
+# writer2.skipped.txt marker: what run_write_capable_angles now leaves for
+# an angle it never ran at all because an earlier one already compromised
+# the tree). Exercises collect_angle_result's marker read, not the live
+# cascade itself (see case 19b for that).
+dir9b=$(stage compromised-cascade)
+out9b=$(bash "$SH" --from-dir "$dir9b" 2>/dev/null); rc9b=$?
+echo "--- case 9b: compromised-cascade ---"
+printf '%s\n' "$out9b"
+
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out9b"
+check "exits 4" test "$rc9b" -eq 4
+check "the residue angle is labeled UNPARSED(residue)" \
+  grep -qx "writer: UNPARSED(residue)" <<<"$out9b"
+check "the later write-capable angle is labeled UNPARSED(compromised)" \
+  grep -qx "writer2: UNPARSED(compromised)" <<<"$out9b"
+check "the read-only angle before it still ran clean" \
+  grep -qx "reader: CLEAN" <<<"$out9b"
+check "counts show 3 angles, 1 ran, 2 unparsed" \
+  grep -qx "ANGLES=3  RAN=1  BLOCKED=0  UNPARSED=2" <<<"$out9b"
+check "the residue angle's finding is still surfaced in the block" \
+  grep -qF -- "- [P1] b.py:20" <<<"$out9b"
 
 # --- Case 10: BLOCKED with a nonempty findings array ----------------------------
 dir10=$(stage blocked-with-findings)
@@ -338,6 +371,36 @@ check "dir inside repo exits 2" test "$rc16" -eq 2
 check "dir inside repo names the problem" \
   grep -qi "run directory must live outside the repository so it cannot dirty the tree" <<<"$err16"
 
+# --- Case 16b: a spawn failure on a live run clears any stale merged.json ------
+# Regression: a reused --dir carrying a merged.json from an earlier
+# invocation must never be mistaken for this run's own verdict when this run
+# aborts on a spawn failure (exit 3) before ever writing a new one.
+# fixtures/fake-codex-unspawnable is a real, executable file that isn't a
+# valid program (no shebang, not a recognized binary format) — shutil.which
+# finds it fine, but the OS refuses to exec it (Exec format error), which is
+# the "codex could not be invoked at all" failure this exercises; a
+# CODEX_BIN that simply doesn't exist (e.g. /nonexistent) would instead be
+# caught earlier by main()'s own "codex CLI not found on PATH" check
+# (exit 1), never reaching this path.
+repo16b=$(make_throwaway_repo spawn-failure-stale-merged)
+cat > "$repo16b/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+rundir16b="$tmpdir/spawn-failure-stale-merged-run.$$.${RANDOM:-0}"
+mkdir -p "$rundir16b"
+echo '{"version": 1, "verdict": "CLEAN", "counts": {}, "angles": [], "findings": []}' > "$rundir16b/merged.json"
+
+err16b=$(cd "$repo16b" && CODEX_BIN="$FIXTURES/fake-codex-unspawnable" bash "$SH" --plan plan.json --base main --dir "$rundir16b" 2>&1); rc16b=$?
+echo "--- case 16b: spawn failure clears a stale merged.json ---"
+printf '%s\n' "$err16b"
+
+check "spawn failure exits 3" test "$rc16b" -eq 3
+check "spawn failure names the problem" grep -qi "codex could not be invoked" <<<"$err16b"
+check "the stale merged.json was deleted, not left behind" test ! -f "$rundir16b/merged.json"
+
+rm -rf "$rundir16b"
+
 # --- Case 17: a codex timeout kills the whole process group, not just codex ----
 # The one live-ish case here: CODEX_BIN points at fixtures/fake-codex-hang.sh,
 # a fake codex that backgrounds a marker-named `sleep 30` and then hangs
@@ -390,6 +453,55 @@ EOF
   fi
 
   rm -rf "$rundir17" "$linkdir17"
+fi
+
+# --- Case 17b: a normal (non-timeout) codex exit still reaps its process group --
+# fixtures/fake-codex-background-leak.sh exits 0 immediately after
+# backgrounding a marker-named `sleep 30`, output redirected so it detaches.
+# run_angle() must reap that leftover even though communicate() returned
+# without a TimeoutExpired — and the angle's own result must still be judged
+# by its out.json/status as usual (verdict CLEAN here), not by the leak.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 17b: a normal exit still reaps the process group ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo17b=$(make_throwaway_repo normal-exit-reap)
+  cat > "$repo17b/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+  rundir17b="$tmpdir/normal-exit-reap-run.$$.${RANDOM:-0}"
+  linkdir17b="$tmpdir/normal-exit-reap-links.$$.${RANDOM:-0}"
+  mkdir -p "$linkdir17b"
+  marker17b="normalexittest$$_${RANDOM:-0}"
+
+  out17b=$(cd "$repo17b" && \
+    CODEX_BIN="$FIXTURES/fake-codex-background-leak.sh" \
+    ADV_TEST_SLEEP_MARKER="$marker17b" \
+    ADV_TEST_SLEEP_LINKDIR="$linkdir17b" \
+    bash "$SH" --plan plan.json --base main --dir "$rundir17b" 2>&1)
+  rc17b=$?
+  echo "--- case 17b: a normal exit still reaps the process group ---"
+  printf '%s\n' "$out17b"
+
+  check "exits 0" test "$rc17b" -eq 0
+  check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out17b"
+  check "the angle's own result is still judged by its out.json/status" \
+    grep -qx "alpha: CLEAN" <<<"$out17b"
+  check "a note about the terminated leftover background process is printed" \
+    grep -qi "left 1 background process" <<<"$out17b"
+
+  # Give the kill a brief moment to land, then confirm no leftover sleep.
+  sleep 1
+  if pgrep -f "sleep-$marker17b" >/dev/null 2>&1; then
+    echo "  FAIL: leftover 'sleep 30' process from this run is still running"
+    fails=$((fails + 1))
+    pkill -f "sleep-$marker17b" 2>/dev/null || true
+  else
+    echo "  ok: no leftover 'sleep 30' process from this run"
+  fi
+
+  rm -rf "$rundir17b" "$linkdir17b"
 fi
 
 # --- Case 18: verdict FINDINGS with an empty findings array is never CLEAN -----
@@ -458,6 +570,47 @@ EOF
   rm -rf "$rundir19" "$linkdir19"
 fi
 
+# --- Case 19b: a dirty-tree skip clears an angle's stale artifacts first -------
+# Regression: stage a stale writer.out.json/.status (verdict CLEAN, as if
+# left behind by an earlier invocation of a reused --dir) and leave the
+# checkout itself dirty before this run, so the dirty-tree gate fires. The
+# skip must clear those stale files and write a 'writer.skipped.txt' marker
+# — never let a later --from-dir re-merge of this same --dir read the old
+# CLEAN out.json instead.
+repo19b=$(make_throwaway_repo dirty-tree-stale)
+cat > "$repo19b/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+rundir19b="$tmpdir/dirty-tree-stale-run.$$.${RANDOM:-0}"
+mkdir -p "$rundir19b"
+cat > "$rundir19b/writer.out.json" <<'EOF'
+{"angle": "writer", "verdict": "CLEAN", "summary": "stale run from an earlier invocation", "findings": []}
+EOF
+printf '0\n' > "$rundir19b/writer.status"
+echo "uncommitted" > "$repo19b/dirty.txt"
+
+out19b=$(cd "$repo19b" && CODEX_BIN=true bash "$SH" --plan plan.json --base main --dir "$rundir19b" 2>&1); rc19b=$?
+echo "--- case 19b: dirty-tree skip clears stale artifacts ---"
+printf '%s\n' "$out19b"
+
+check "exits 4" test "$rc19b" -eq 4
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out19b"
+check "counts show one UNPARSED angle, none RAN" \
+  grep -qx "ANGLES=1  RAN=0  BLOCKED=0  UNPARSED=1" <<<"$out19b"
+check "the angle is marked UNPARSED(dirty-tree), not the stale CLEAN" \
+  grep -qx "writer: UNPARSED(dirty-tree)" <<<"$out19b"
+check "the stale summary never appears in the report" \
+  bash -c '! grep -q "stale run from an earlier invocation" <<<"$1"' _ "$out19b"
+check "the stale out.json was deleted, not left behind" \
+  test ! -f "$rundir19b/writer.out.json"
+check "the stale status was deleted, not left behind" \
+  test ! -f "$rundir19b/writer.status"
+check "a dirty-tree marker was written for the skipped angle" \
+  grep -qx "dirty-tree" "$rundir19b/writer.skipped.txt"
+
+rm -rf "$rundir19b"
+
 # --- Case 20: --from-dir must never write merged.json into a real checkout -----
 # Regression: pointed directly at fixtures/all-clean (part of this repo, not
 # staged into the scratch tmpdir), the run must not dirty the tree — merged.json
@@ -488,6 +641,9 @@ fi
 # Regression: an embedded \r\n or \n in path/claim/evidence/reproduction must
 # never introduce a bare continuation line into the compact block — each
 # finding is exactly one '- [Pn] ...' line plus its evidence/reproduction lines.
+# The fixture's 'multiline' angle also carries a multiline summary, and a
+# second plain 'control' angle sits alongside it, so the SUMMARY section's
+# one-line-per-angle contract is exercised across more than a single angle.
 dir21=$(stage multiline-fields)
 out21=$(bash "$SH" --from-dir "$dir21"); rc21=$?
 echo "--- case 21: multiline-fields ---"
@@ -495,6 +651,8 @@ printf '%s\n' "$out21"
 
 check "exits 0" test "$rc21" -eq 0
 check "verdict is FINDINGS" grep -qx "ADVERSARIAL_REVIEW: FINDINGS" <<<"$out21"
+check "counts show both angles ran" \
+  grep -qx "ANGLES=2  RAN=2  BLOCKED=0  UNPARSED=0" <<<"$out21"
 check "exactly one '- [P' line per finding" \
   test "$(grep -c '^- \[P' <<<"$out21")" -eq 2
 check "exactly one 'evidence:' line per finding" \
@@ -509,6 +667,12 @@ check "the CRLF evidence's embedded newline is escaped" \
   grep -qF -- "Evidence line one\\nEvidence line two" <<<"$out21"
 check "the multiline reproduction's embedded newlines are escaped" \
   grep -qF -- "Repro step one\\nRepro step two\\nRepro step three" <<<"$out21"
+check "the SUMMARY section has exactly one line per angle (2)" \
+  test "$(awk '/^--- SUMMARY ---$/{f=1;next} /^--- FINDINGS ---$/{f=0} f && NF' <<<"$out21" | wc -l | tr -d ' ')" -eq 2
+check "the multiline summary's embedded newline is escaped, not a bare continuation line" \
+  grep -qF -- "multiline: Found two issues.\\nSecond line of the summary." <<<"$out21"
+check "the control angle's plain summary line is present" \
+  grep -qx "control: Control found nothing wrong." <<<"$out21"
 
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
@@ -539,6 +703,21 @@ echo "--- case: missing --from-dir directory ---"
 printf '%s\n' "$err_nodir"
 check "missing run directory exits 1" test "$rc_nodir" -eq 1
 
+# --- Wrapper pre-scan recognizes --from-dir=PATH (equals form) too -------------
+# Regression: the .sh dispatcher's own arg pre-scan matched only a
+# space-separated "--from-dir PATH", so a single "--from-dir=PATH" token
+# fell through to the default case and never set FROM_DIR — the wrapper
+# then wrongly required CODEX_BIN to exist on PATH even though --from-dir
+# mode needs no codex at all.
+dir_eqform=$(stage all-clean)
+out_eqform=$(CODEX_BIN=/nonexistent bash "$SH" --from-dir="$dir_eqform" 2>&1); rc_eqform=$?
+echo "--- case: --from-dir=PATH (equals form) skips the codex-on-PATH check ---"
+printf '%s\n' "$out_eqform"
+check "equals-form --from-dir succeeds even with an unusable CODEX_BIN" \
+  test "$rc_eqform" -eq 0
+check "equals-form --from-dir still merges the fixture" \
+  grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out_eqform"
+
 # --- Prompt template rendering (offline, no codex) ------------------------------
 # Exercises render_prompt directly, since the live codex-invocation path that
 # normally builds *.prompt.txt is not reachable from --from-dir mode.
@@ -565,6 +744,27 @@ PYEOF
 echo "--- prompt template rendering ---"
 printf '%s\n' "$render_check"
 check "placeholder substitution is exact" test "$render_check" = "OK"
+
+# --- The resolved base is shell-quoted in the generated DIFF_COMMAND ------------
+# Regression: a base containing shell metacharacters (however it got there —
+# a hand-edited plan, an odd branch name) must not be pasted unquoted into
+# the "git diff {{DIFF_COMMAND}}" a reviewer is told to run verbatim.
+quote_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from adversarial_review import render_prompt
+
+plan = {"promise": "Ship it.", "contracts": [], "invariants": []}
+angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.", "evidence": "A concrete case."}
+rendered = render_prompt("{{DIFF_COMMAND}}", plan, angle, "feature;echo")
+expected = "git diff 'feature;echo'...HEAD"
+print("OK" if rendered == expected else "MISMATCH:\n" + rendered)
+PYEOF
+)
+echo "--- prompt rendering: base is shell-quoted in DIFF_COMMAND ---"
+printf '%s\n' "$quote_check"
+check "a base with shell metacharacters is quoted in the generated diff command" \
+  test "$quote_check" = "OK"
 
 # --- Scheduling: read-only runs parallel, workspace-write runs serial ----------
 # The live serialization itself (thread pool, then one-at-a-time with the

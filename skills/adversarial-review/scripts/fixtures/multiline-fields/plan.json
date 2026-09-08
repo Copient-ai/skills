@@ -11,6 +11,13 @@
       "mandate": "Look for logic bugs.",
       "evidence": "A concrete failing input.",
       "execution": "read-only"
+    },
+    {
+      "id": "control",
+      "title": "Control angle",
+      "mandate": "Look for security holes.",
+      "evidence": "A concrete exploit.",
+      "execution": "read-only"
     }
   ]
 }

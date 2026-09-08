@@ -1,7 +1,7 @@
 {
   "angle": "multiline",
   "verdict": "FINDINGS",
-  "summary": "Found two issues.",
+  "summary": "Found two issues.\nSecond line of the summary.",
   "findings": [
     {
       "severity": "P1",
