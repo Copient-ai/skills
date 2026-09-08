@@ -295,18 +295,29 @@ def resolve_base(base, cwd):
     "origin/main"), even when no "origin" remote exists at all. Only once
     every actually-configured remote has been checked this way does this
     fall back to the plain local <base> (refs/heads/<base>), then to the
-    bare revision (a tag, a commit-ish, ...) as a last resort."""
+    bare revision (a tag, a commit-ish, ...) as a last resort.
+
+    Every verified case returns the fully-qualified ref
+    (refs/remotes/<remote>/<base>, refs/heads/<base>), not the shorthand —
+    for the same disambiguation-order reason above: a downstream `git diff`
+    or the rendered prompt handed the bare "<remote>/<base>" would resolve
+    it fresh, and a local branch literally named e.g. "origin/main" would
+    win over the remote-tracking ref this function actually verified. Only
+    the last-resort bare revision (a SHA, a tag — nothing this function can
+    qualify) is returned as given."""
     remotes_r = git(["remote"], cwd=cwd)
     remotes = [l for l in remotes_r.stdout.splitlines() if l.strip()] if remotes_r.returncode == 0 else []
     # origin tried first when present, matching the previous candidate order.
     ordered_remotes = [r for r in remotes if r == "origin"] + [r for r in remotes if r != "origin"]
 
     for remote in ordered_remotes:
-        if git_verify(f"refs/remotes/{remote}/{base}", cwd):
-            return f"{remote}/{base}"
+        qualified = f"refs/remotes/{remote}/{base}"
+        if git_verify(qualified, cwd):
+            return qualified
 
-    if git_verify(f"refs/heads/{base}", cwd):
-        return base
+    qualified_local = f"refs/heads/{base}"
+    if git_verify(qualified_local, cwd):
+        return qualified_local
     if git_verify(base, cwd):
         return base
 
@@ -1163,6 +1174,15 @@ def _mark_interrupted(aid, run_dir):
 
 
 def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
+    """Returns (error, spawned): error is None on a clean run, else a
+    message; spawned is True once Popen has actually started the codex
+    process, regardless of what happens afterward. A caller running
+    workspace-write angles serially needs `spawned` to tell a real spawn
+    failure (nothing to check — the tree was never touched) apart from a
+    post-spawn failure (writing .status, the background-leak note) that
+    still leaves a process that may have dirtied the tree — see
+    run_write_capable_angles."""
+    spawned = False
     # Stale artifacts for `aid` are cleared by main(), synchronously, before
     # either phase (parallel or serial) schedules any angle — not here, so a
     # queued angle whose run_angle body never gets to run before an
@@ -1206,7 +1226,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             # handler's own exit would have implied.
             if _CANCELLED:
                 _mark_interrupted(aid, run_dir)
-                return None
+                return None, spawned
             # start_new_session makes this process its own process-group
             # leader, so a timeout can reap everything it spawned via
             # killpg — not just its own pid, which is all subprocess.run's
@@ -1218,6 +1238,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                     cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
                     cwd=root, start_new_session=True,
                 )
+                spawned = True
                 _track_proc(proc)
             finally:
                 # Removed even if Popen itself raised (OSError, caught
@@ -1229,7 +1250,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                 kill_process_group(proc)
                 _untrack_proc(proc)
                 _mark_interrupted(aid, run_dir)
-                return None
+                return None, spawned
             try:
                 try:
                     proc.communicate(timeout=timeout_sec)
@@ -1267,9 +1288,9 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                     raise
             finally:
                 _untrack_proc(proc)
-        return None
+        return None, spawned
     except OSError as e:
-        return str(e)
+        return str(e), spawned
 
 
 def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
@@ -1298,7 +1319,9 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
     at that point, every write-capable angle is skipped without running, as
     UNPARSED(dirty-tree) — contract, not policy: a dirty tree means we can't
     attribute any residue that follows to a specific angle. After each angle
-    that does run, the tree is checked again: a non-empty `git status
+    whose codex process actually spawned (run_angle's `spawned` flag — a true
+    spawn failure is the only case with nothing to check, since the tree was
+    never touched), the tree is checked again: a non-empty `git status
     --porcelain` is recorded to <angle>.residue.txt and printed to stderr,
     that angle is marked UNPARSED(residue), and every write-capable angle
     still to come is skipped as UNPARSED(compromised) rather than run
@@ -1335,13 +1358,20 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
         if compromised:
             _mark_skipped(aid, angles_by_id[aid]["title"], "compromised", run_dir, synthetic_results)
             continue
-        err = run_angle(
+        err, spawned = run_angle(
             aid, angles_by_id[aid], plan, base_resolved, template,
             run_dir, root, schema_path, timeout_sec,
         )
         if err is not None:
             spawn_failures.append((aid, err))
-            continue
+            # A true spawn failure (Popen itself never started the process)
+            # never touched the tree, so there's nothing to check. Any error
+            # after that — the .status write, the background-leak note —
+            # leaves a codex process that may already have run against the
+            # shared checkout, so the residue check below must still run,
+            # exactly as it does after a normal finish.
+            if not spawned:
+                continue
         status = git_status_porcelain(root)
         if status.strip():
             (run_dir / f"{aid}.residue.txt").write_text(status)
@@ -1543,7 +1573,10 @@ def main(argv=None):
                     if _CANCELLED:
                         break
                 for fut in cf.as_completed(future_to_id):
-                    err = fut.result()
+                    # spawned is irrelevant here: read-only angles never
+                    # write to the checkout, so there is no residue check
+                    # to gate (contrast run_write_capable_angles).
+                    err, _spawned = fut.result()
                     if err is not None:
                         spawn_failures.append((future_to_id[fut], err))
                 ex.shutdown(wait=True)

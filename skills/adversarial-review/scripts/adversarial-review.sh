@@ -74,11 +74,13 @@ ADVERSARIAL_REVIEW_VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Single pass over the raw args: answer --version/--help immediately, and
-# note whether --from-dir was given (codex is not needed in that mode). Skips
-# the VALUE of every flag that takes one, so a value that happens to spell
-# "--version" is never misread as the flag itself.
+# note whether --from-dir or --print-base was given (codex is not needed in
+# either mode — --print-base invokes no reviewer, it only resolves and
+# prints a ref). Skips the VALUE of every flag that takes one, so a value
+# that happens to spell "--version" is never misread as the flag itself.
 ORIG_ARGS=("$@")
 FROM_DIR=false
+PRINT_BASE=false
 n=${#ORIG_ARGS[@]}
 i=0
 while [ "$i" -lt "$n" ]; do
@@ -103,6 +105,12 @@ while [ "$i" -lt "$n" ]; do
       FROM_DIR=true
       i=$((i + 1))
       ;;
+    --print-base)
+      # Boolean flag, no value — unlike --from-dir, there is no "=VALUE"
+      # form to account for.
+      PRINT_BASE=true
+      i=$((i + 1))
+      ;;
     --plan|--base|--jobs|--timeout|--dir|--only|--angle-prompt)
       i=$((i + 2))
       ;;
@@ -125,7 +133,7 @@ python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' || {
   exit 1
 }
 
-if [ "$FROM_DIR" = false ]; then
+if [ "$FROM_DIR" = false ] && [ "$PRINT_BASE" = false ]; then
   CODEX_BIN="${CODEX_BIN:-codex}"
   command -v "$CODEX_BIN" >/dev/null 2>&1 || {
     echo "adversarial-review: codex CLI ('$CODEX_BIN') not found on PATH." >&2

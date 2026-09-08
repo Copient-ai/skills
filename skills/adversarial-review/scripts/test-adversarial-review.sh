@@ -1233,7 +1233,9 @@ fi
 # planner can ask it directly instead of reimplementing the rule. Builds a
 # repo whose local 'main' is deliberately stale (behind origin/main, by
 # committing on a clone and pushing back) and confirms --print-base prints
-# "origin/main", not the stale local ref.
+# the fully-qualified "refs/remotes/origin/main", not the stale local ref
+# (nor the unqualified "origin/main" shorthand — see case 25d for why that
+# distinction matters).
 repo25="$tmpdir/print-base.$$.${RANDOM:-0}"
 mkdir -p "$repo25"
 git init -q -b main "$repo25"
@@ -1270,8 +1272,8 @@ printf '%s\n' "$out25"
 check "the local branch really is stale (differs from origin/main)" \
   test "$local_sha25" != "$origin_sha25"
 check "exits 0" test "$rc25" -eq 0
-check "--print-base prints origin/main, not the stale local branch" \
-  test "$out25" = "origin/main"
+check "--print-base prints the fully-qualified refs/remotes/origin/main, not the stale local branch" \
+  test "$out25" = "refs/remotes/origin/main"
 
 # --- Case 25b: --print-base without --base is a usage error --------------------
 err25b=$(CODEX_BIN=true bash "$SH" --print-base 2>&1); rc25b=$?
@@ -1290,8 +1292,8 @@ check "missing --base names the problem" grep -qi -- "--print-base requires --ba
 # configured at all -- resolving to the wrong ref entirely. Builds a repo
 # with a local branch named "origin/main" (no remote, so no real
 # refs/remotes/origin/main exists) and a real local "main", and confirms
-# --print-base --base main correctly falls through to "main" rather than
-# being fooled by the decoy branch name.
+# --print-base --base main correctly falls through to the fully-qualified
+# "refs/heads/main" rather than being fooled by the decoy branch name.
 repo25c="$tmpdir/remote-ref-namespace.$$.${RANDOM:-0}"
 mkdir -p "$repo25c"
 git init -q -b main "$repo25c"
@@ -1307,8 +1309,113 @@ echo "--- case 25c: resolve_base is not fooled by a local branch named like a re
 printf '%s\n' "$out25c"
 
 check "exits 0" test "$rc25c" -eq 0
-check "--print-base prints main, not the decoy 'origin/main' branch" \
-  test "$out25c" = "main"
+check "--print-base prints refs/heads/main, not the decoy 'origin/main' branch" \
+  test "$out25c" = "refs/heads/main"
+
+# --- Case 25d: a qualified base survives a same-named decoy local branch ------
+# Regression: resolve_base used to verify the remote candidate through the
+# fully-qualified refs/remotes/<remote>/<base> path but then RETURN the bare
+# "<remote>/<base>" shorthand -- correct verification, wrong value handed
+# downstream. git's own ref disambiguation (gitrevisions(7)) checks
+# refs/heads/<name> before refs/remotes/<name>, so a bare "origin/main"
+# resolved fresh by a downstream `git diff` or the rendered prompt would hit
+# a *local* branch literally named "origin/main" instead of the remote-
+# tracking ref resolve_base actually verified, whenever both exist. Builds
+# a repo with a REAL refs/remotes/origin/main (a genuine bare-remote push)
+# sitting behind HEAD, AND a decoy local branch literally named
+# "origin/main" built identical to HEAD (so a diff against the decoy comes
+# back empty -- the exact "looks clean" failure mode the shorthand bug
+# produced). --print-base must print the fully-qualified
+# "refs/remotes/origin/main", and a live run must diff non-empty and carry
+# that same qualified ref into the rendered prompt -- proving the runner's
+# own diff used it too, not a fresh unqualified re-resolution.
+repo25d="$tmpdir/qualified-vs-decoy.$$.${RANDOM:-0}"
+mkdir -p "$repo25d"
+git init -q -b main "$repo25d"
+git -C "$repo25d" config user.email "test@example.com"
+git -C "$repo25d" config user.name "Test"
+echo base > "$repo25d/f.txt"
+git -C "$repo25d" add -A
+git -C "$repo25d" commit -q -m base
+
+remote25d="$tmpdir/qualified-vs-decoy-remote.$$.${RANDOM:-0}.git"
+git init -q --bare "$remote25d"
+git -C "$repo25d" remote add origin "$remote25d"
+git -C "$repo25d" push -q origin main
+git -C "$repo25d" fetch -q origin
+
+# HEAD moves ahead of the just-pushed origin/main -- the remote-tracking
+# ref stays behind, at the base commit.
+echo "ahead of origin" >> "$repo25d/f.txt"
+git -C "$repo25d" commit -qam "HEAD moves ahead of origin/main"
+
+# The decoy: a LOCAL branch literally named "origin/main", built at HEAD's
+# current (ahead) commit -- so a diff against it comes back empty.
+git -C "$repo25d" branch "origin/main"
+
+# The fully-qualified path, not bare "origin/main" -- once the decoy branch
+# below exists, the bare form is itself ambiguous (git warns and picks one),
+# which would silently corrupt this very sanity check with the same bug
+# this case exists to catch.
+origin_sha25d=$(git -C "$repo25d" rev-parse refs/remotes/origin/main)
+head_sha25d=$(git -C "$repo25d" rev-parse HEAD)
+decoy_sha25d=$(git -C "$repo25d" rev-parse refs/heads/origin/main)
+
+out25d=$(cd "$repo25d" && CODEX_BIN=true bash "$SH" --print-base --base main 2>&1); rc25d=$?
+echo "--- case 25d: --print-base survives a same-named decoy local branch ---"
+printf '%s\n' "$out25d"
+
+check "setup: the remote-tracking ref is really behind HEAD" \
+  test "$origin_sha25d" != "$head_sha25d"
+check "setup: the decoy local branch is really identical to HEAD" \
+  test "$decoy_sha25d" = "$head_sha25d"
+check "exits 0" test "$rc25d" -eq 0
+check "--print-base prints the fully-qualified refs/remotes/origin/main" \
+  test "$out25d" = "refs/remotes/origin/main"
+
+# Live run: the runner's own diff must be computed from that same
+# fully-qualified value, not a bare "origin/main" re-resolved downstream --
+# if it were, the diff would hit the decoy (identical to HEAD) and
+# env_error out on an empty diff before ever spawning codex.
+argvdir25d="$tmpdir/argv-log-25d.$$.${RANDOM:-0}"
+rundir25d="$tmpdir/qualified-vs-decoy-run.$$.${RANDOM:-0}"
+cat > "$repo25d/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+
+out25d_live=$(cd "$repo25d" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir25d" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir25d" 2>&1); rc25d_live=$?
+echo "--- case 25d: live run diffs against the remote-tracking commit ---"
+printf '%s\n' "$out25d_live"
+
+check "live run exits 0 (the diff was non-empty)" test "$rc25d_live" -eq 0
+check "live run verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out25d_live"
+
+argv_n25d=0
+for f in "$argvdir25d"/[0-9]*; do
+  [ -e "$f" ] && argv_n25d=$((argv_n25d + 1))
+done
+last25d=$((argv_n25d - 1))
+check "argv has at least one element logged" test "$argv_n25d" -ge 1
+check "the rendered prompt's diff command names the fully-qualified ref" \
+  grep -qF "git diff refs/remotes/origin/main...HEAD" "$argvdir25d/$last25d"
+
+rm -rf "$rundir25d"
+
+# --- Case 25e: --print-base does not require the codex CLI on PATH ------------
+# Regression: adversarial-review.sh's argument pre-scan required codex on
+# PATH even for --print-base, which invokes no reviewer at all -- the same
+# exemption --from-dir already gets. --print-base is now tracked the same
+# way through the pre-scan and skips that requirement.
+repo25e=$(make_throwaway_repo print-base-no-codex)
+out25e=$(cd "$repo25e" && CODEX_BIN=/nonexistent/codex bash "$SH" --print-base --base main 2>&1); rc25e=$?
+echo "--- case 25e: --print-base skips the codex-on-PATH check ---"
+printf '%s\n' "$out25e"
+
+check "exits 0 even with an unusable CODEX_BIN" test "$rc25e" -eq 0
+check "--print-base still prints the resolved base" \
+  test "$out25e" = "refs/heads/main"
 
 # --- Case 26: the codex exec argv gets an option terminator before the prompt --
 # Regression: a rendered prompt is arbitrary text a plan or a custom
@@ -1389,6 +1496,63 @@ check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out27"
 check "argv0 was logged" test -f "$argvdir27/argv0"
 check "argv0 is an absolute path, not the raw relative CODEX_BIN string" \
   bash -c 'case "$(cat "$1")" in /*) exit 0 ;; *) exit 1 ;; esac' _ "$argvdir27/argv0"
+
+# --- Case 28: a post-spawn failure still runs the residue check ----------------
+# Regression: run_angle() used to fold every error into a single "spawn
+# failed" outcome, whether Popen itself never started the process or the
+# process ran fine and only a later step (writing .status, the background-
+# leak note) failed. run_write_capable_angles then skipped the post-angle
+# residue check on ANY error -- so a reviewer that actually ran and dirtied
+# the shared checkout, but hit a post-spawn write failure, could slip past
+# both the residue check and the compromised cascade, letting the next
+# workspace-write angle run against an already-modified tree. run_angle now
+# reports whether the process actually spawned; the residue check runs
+# whenever it did, error or not -- only a true spawn failure (nothing ever
+# ran, nothing to check) skips it. fixtures/fake-codex-dirty-tree.sh plays
+# the reviewer that ran, dirtied a tracked file, and (right before exiting)
+# turns its own <aid>.status path into a directory, so run_angle's own
+# write_text() of that path fails with IsADirectoryError right after a
+# real, tree-dirtying process has already exited. Plan has two
+# workspace-write angles in order (writer, writer2); only writer's fake
+# codex dirties the tree, so writer2 must show up as skipped, never run.
+repo28=$(make_throwaway_repo post-spawn-residue)
+# The plan lives outside repo28, not inside it (see case 22c): a
+# workspace-write angle's dirty-tree gate requires a genuinely clean tree
+# before the first angle runs, and an untracked plan.json sitting in the
+# checkout would itself trip that gate before writer ever gets to run.
+plan28="$tmpdir/post-spawn-residue-plan.$$.${RANDOM:-0}.json"
+cat > "$plan28" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"},
+   {"id": "writer2", "title": "Writer2", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+rundir28="$tmpdir/post-spawn-residue-run.$$.${RANDOM:-0}"
+
+out28=$(cd "$repo28" && CODEX_BIN="$FIXTURES/fake-codex-dirty-tree.sh" ADV_TEST_DIRTY_FILE="f.txt" \
+  bash "$SH" --plan "$plan28" --base main --dir "$rundir28" 2>&1); rc28=$?
+echo "--- case 28: a post-spawn failure still runs the residue check ---"
+printf '%s\n' "$out28"
+
+check "exits 3 (a spawn-phase error, not a normal per-angle outcome)" \
+  test "$rc28" -eq 3
+check "the post-spawn write failure is reported" \
+  grep -qi "writer" <<<"$out28"
+check "the dirty tree left by the fake codex was caught: a residue marker was written" \
+  test -f "$rundir28/writer.residue.txt"
+check "the residue marker names the dirtied file" \
+  grep -qF "f.txt" "$rundir28/writer.residue.txt"
+check "the working-tree-dirty warning was printed for writer" \
+  grep -qF "angle 'writer' left the working tree dirty" <<<"$out28"
+check "writer2 never ran: it was skipped as compromised" \
+  test -f "$rundir28/writer2.skipped.txt"
+check "writer2's skip marker names the cause" \
+  grep -qx "compromised" "$rundir28/writer2.skipped.txt"
+check "writer2 has no out.json -- it truly never ran" \
+  test ! -f "$rundir28/writer2.out.json"
+
+rm -rf "$rundir28"
 
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
@@ -1727,13 +1891,16 @@ plan = {"promise": "Ships a thing.", "contracts": [], "invariants": []}
 
 with tempfile.TemporaryDirectory() as d:
     run_dir = Path(d)
-    err = ar.run_angle(
+    err, spawned = ar.run_angle(
         "alpha", angle, plan, "main", "template {{ANGLE_ID}}",
         run_dir, "/tmp", "schema.json", 5,
     )
     result = ar.collect_angle_result(angle, run_dir)
-    ok = err is None and result.kind == "UNPARSED" and result.cause == "interrupted"
-    print("OK" if ok else f"MISMATCH: err={err!r} kind={result.kind!r} cause={result.cause!r}")
+    ok = (
+        err is None and spawned is False
+        and result.kind == "UNPARSED" and result.cause == "interrupted"
+    )
+    print("OK" if ok else f"MISMATCH: err={err!r} spawned={spawned!r} kind={result.kind!r} cause={result.cause!r}")
 PYEOF
 )
 echo "--- run_angle: cancellation is checked before Popen ---"

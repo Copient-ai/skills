@@ -29,20 +29,27 @@ the two stay aligned — consult it directly if anything here is unclear.
    Reviewing the wrong checkout is the one failure that can look like a
    completed review.
 1. Determine the base branch — the caller gives you one (`{{BASE}}`); resolve
-   it to a ref that actually exists. Do **not** assume a remote named
-   `origin` — a checkout may have no remote, or name it something else, and
-   `git diff origin/$BASE...HEAD` then dies with `unknown revision` and
-   prints nothing, which looks exactly like an empty diff. Take the first
-   candidate that resolves:
+   it to a ref that actually exists. The runner already resolved this to a
+   fully-qualified ref (`refs/remotes/<remote>/<base>` or
+   `refs/heads/<base>`) whenever one verified, so verify `"$BASE"` directly
+   first. Fall back to the shorthand candidates only if that fails — do
+   **not** assume a remote named `origin` — a checkout may have no remote,
+   or name it something else, and `git diff origin/$BASE...HEAD` then dies
+   with `unknown revision` and prints nothing, which looks exactly like an
+   empty diff:
 
    ```bash
    BASE={{BASE_SHELL}}
    BASE_REF=""
-   for candidate in "origin/$BASE" $(git remote | sed "s@.*@&/$BASE@") "$BASE"; do
-     if git rev-parse --verify --quiet "$candidate" >/dev/null; then
-       BASE_REF="$candidate"; break
-     fi
-   done
+   if git rev-parse --verify --quiet "$BASE" >/dev/null; then
+     BASE_REF="$BASE"
+   else
+     for candidate in "origin/$BASE" $(git remote | sed "s@.*@&/$BASE@"); do
+       if git rev-parse --verify --quiet "$candidate" >/dev/null; then
+         BASE_REF="$candidate"; break
+       fi
+     done
+   fi
    ```
 
    If nothing resolves, stop: report that the base could not be resolved and
