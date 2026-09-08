@@ -1,4 +1,4 @@
 {
   "test": "bash skills/codex-review-loop/scripts/test-codex-review.sh && bash skills/adversarial-review/scripts/test-adversarial-review.sh",
-  "lint": "shellcheck --severity=warning skills/codex-review-loop/scripts/*.sh skills/adversarial-review/scripts/*.sh && python3 -m py_compile skills/adversarial-review/scripts/adversarial_review.py"
+  "lint": "shellcheck --severity=warning skills/codex-review-loop/scripts/*.sh skills/adversarial-review/scripts/*.sh && PYTHONPYCACHEPREFIX=\"${TMPDIR:-/tmp}/adversarial-review-pyc\" python3 -m py_compile skills/adversarial-review/scripts/adversarial_review.py"
 }

@@ -135,8 +135,22 @@ Each angle runs as its own `codex exec --ephemeral -s read-only` (or
 tests or reproductions — under read-only, `git` works but a test runner that
 writes caches fails), stdin closed, `--output-schema` enforcing
 `scripts/findings.schema.json` (`angle-prompt.md` shows the reviewer the same
-shape). The run directory keeps `plan.json`, `<angle>.prompt.txt`,
-`<angle>.out.json`, `<angle>.log`, `<angle>.status`, and `merged.json`.
+shape). Write-capable angles run against the shared checkout — a `git
+worktree` was rejected because reviewers need the project's real environment
+(`.venv`, caches) that a worktree lacks — so the runner schedules
+accordingly: every `read-only` angle runs together in the shared thread pool,
+then every `workspace-write` angle runs one at a time, never overlapping
+another angle. The first write-capable angle requires a clean tree
+(`git status --porcelain` empty); if the tree is already dirty, every
+write-capable angle is skipped and marked `UNPARSED(dirty-tree)` without
+running. After each write-capable angle the tree is checked again; a
+non-empty result is recorded to `<angle>.residue.txt`, that angle is marked
+`UNPARSED(residue)` (its findings still surface in `merged.json` and the
+block, just not counted as `RAN`), and the run continues from that dirty
+state — nothing is auto-reverted, so inspect and restore by hand. The run
+directory keeps `plan.json`, `<angle>.prompt.txt`, `<angle>.out.json`,
+`<angle>.log`, `<angle>.status`, `<angle>.residue.txt` (write-capable angles
+only, when the tree came back dirty), and `merged.json`.
 
 Output:
 

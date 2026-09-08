@@ -159,6 +159,65 @@ else
 fi
 rm -f /tmp/adversarial-review-format.diff
 
+# --- Case 9: a write-capable angle left residue --------------------------------
+# The live serialization path (parallel read-only, then serial
+# workspace-write with a clean-tree gate) is not reachable offline — this
+# exercises the merge side: an angle dir carrying <angle>.residue.txt must
+# never be treated as a clean run, even though its out.json parsed fine.
+dir9=$(stage residue)
+out9=$(bash "$SH" --from-dir "$dir9" 2>/dev/null); rc9=$?
+echo "--- case 9: residue ---"
+printf '%s\n' "$out9"
+
+check "verdict is UNPARSED (residue is never a clean run)" \
+  grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out9"
+check "exits 4" test "$rc9" -eq 4
+check "the residue angle is labeled UNPARSED(residue)" \
+  grep -qx "writer: UNPARSED(residue)" <<<"$out9"
+check "the residue angle does not count as RAN" \
+  grep -qx "ANGLES=2  RAN=1  BLOCKED=0  UNPARSED=1" <<<"$out9"
+check "the residue angle's finding is still surfaced in the block" \
+  grep -qF -- "- [P1] b.py:20" <<<"$out9"
+check "the surfaced finding is tagged with the residue angle" \
+  grep -qF -- "[angles: writer]" <<<"$out9"
+
+# --- Case 10: BLOCKED with a nonempty findings array ----------------------------
+dir10=$(stage blocked-with-findings)
+out10=$(bash "$SH" --from-dir "$dir10" 2>/dev/null); rc10=$?
+echo "--- case 10: blocked-with-findings ---"
+printf '%s\n' "$out10"
+
+check "verdict is UNPARSED (BLOCKED wins over its own findings)" \
+  grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out10"
+check "exits 4" test "$rc10" -eq 4
+check "the angle is labeled BLOCKED, not FINDINGS" \
+  grep -qx "reviewer1: BLOCKED" <<<"$out10"
+check "BLOCKED still counts as RAN (it produced parseable output)" \
+  grep -qx "ANGLES=2  RAN=2  BLOCKED=1  UNPARSED=0" <<<"$out10"
+check "the BLOCKED angle's finding is still surfaced in the block" \
+  grep -qF -- "- [P1] c.py:5" <<<"$out10"
+check "the surfaced finding is tagged with the BLOCKED angle" \
+  grep -qF -- "[angles: reviewer1]" <<<"$out10"
+
+# --- Case 11: --from-dir resolves a relative path -------------------------------
+# Regression for codex's --output-schema/-o paths landing under root (its
+# subprocess cwd) instead of the caller's --dir: --plan, --dir and
+# --from-dir are all resolved to absolute paths up front. This exercises
+# --from-dir specifically, run from a subdirectory several levels below the
+# fixture tree with a relative path back up to it.
+dir11=$(stage all-clean)
+mkdir -p "$dir11/nested/deeper"
+out11=$(cd "$dir11/nested/deeper" && bash "$SH" --from-dir ../..); rc11=$?
+echo "--- case 11: --from-dir with a relative path from a subdirectory ---"
+printf '%s\n' "$out11"
+
+check "exits 0" test "$rc11" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out11"
+check "all 3 angles still merge from the resolved directory" \
+  grep -qx "ANGLES=3  RAN=3  BLOCKED=0  UNPARSED=0" <<<"$out11"
+check "DIR= in the report is absolute" \
+  grep -qE '^DIR=/' <<<"$out11"
+
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
 py_ver=$(python3 "$PY" --version | awk '{print $2}')
@@ -214,6 +273,41 @@ PYEOF
 echo "--- prompt template rendering ---"
 printf '%s\n' "$render_check"
 check "placeholder substitution is exact" test "$render_check" = "OK"
+
+# --- Scheduling: read-only runs parallel, workspace-write runs serial ----------
+# The live serialization itself (thread pool, then one-at-a-time with the
+# clean-tree gate) needs a real git repo and isn't reachable offline; this
+# unit-tests the pure split that decides it, directly in Python.
+partition_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from adversarial_review import partition_angles
+
+angles_by_id = {
+    "a": {"execution": "read-only"},
+    "b": {"execution": "workspace-write"},
+    "c": {"execution": "read-only"},
+    "d": {"execution": "workspace-write"},
+    "e": {"execution": "read-only"},
+}
+angle_ids = ["a", "b", "c", "d", "e"]
+parallel, serial = partition_angles(angle_ids, angles_by_id)
+
+ok = parallel == ["a", "c", "e"] and serial == ["b", "d"]
+
+all_ro = partition_angles(["a", "c", "e"], angles_by_id)
+ok = ok and all_ro == (["a", "c", "e"], [])
+
+all_ww = partition_angles(["b", "d"], angles_by_id)
+ok = ok and all_ww == ([], ["b", "d"])
+
+print("OK" if ok else f"MISMATCH: parallel={parallel} serial={serial}")
+PYEOF
+)
+echo "--- partition_angles scheduling ---"
+printf '%s\n' "$partition_check"
+check "read-only/workspace-write split preserves plan order in each group" \
+  test "$partition_check" = "OK"
 
 echo
 if [ "$fails" -eq 0 ]; then

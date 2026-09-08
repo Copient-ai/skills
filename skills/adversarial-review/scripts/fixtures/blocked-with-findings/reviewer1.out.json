@@ -1,0 +1,15 @@
+{
+  "angle": "reviewer1",
+  "verdict": "BLOCKED",
+  "summary": "Ran out of tool calls partway through; reporting one finding made before that.",
+  "findings": [
+    {
+      "severity": "P1",
+      "path": "c.py",
+      "line": 5,
+      "claim": "The session token is logged in plaintext",
+      "evidence": "logger.info(f\"session={token}\") on the request path",
+      "reproduction": "make an authenticated request and grep the log for 'session='"
+    }
+  ]
+}

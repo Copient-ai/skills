@@ -190,6 +190,23 @@ def parse_only(only_arg, known_ids):
     return [aid for aid in known_ids if aid in wanted]
 
 
+def partition_angles(angle_ids, angles_by_id):
+    """Splits angle_ids into (parallel, serial) execution groups by each
+    angle's 'execution' field, preserving plan order within each group.
+
+    read-only angles are safe to run together in the shared thread pool —
+    they don't write to the checkout. workspace-write angles run against the
+    same shared checkout (isolating them in a git worktree was rejected: a
+    worktree lacks the project's real environment — .venv, caches — that
+    reviewers need), so they must run one at a time, never concurrently with
+    each other or with a read-only angle, to avoid racing writes. See
+    run_write_capable_angles for the clean-tree gate and residue handling
+    that go with running them serially."""
+    parallel = [aid for aid in angle_ids if angles_by_id[aid]["execution"] == "read-only"]
+    serial = [aid for aid in angle_ids if angles_by_id[aid]["execution"] == "workspace-write"]
+    return parallel, serial
+
+
 # --- git helpers (live mode only) --------------------------------------------
 
 def git(args, cwd):
@@ -206,6 +223,16 @@ def repo_root():
 def git_verify(ref, cwd):
     r = git(["rev-parse", "--verify", "--quiet", ref], cwd=cwd)
     return r.returncode == 0
+
+
+def git_status_porcelain(cwd):
+    """Raw `git status --porcelain` output (empty string means a clean
+    tree). Used to gate and police the write-capable angles, which run
+    against the shared checkout rather than an isolated worktree."""
+    r = git(["status", "--porcelain"], cwd=cwd)
+    if r.returncode != 0:
+        env_error(f"git status --porcelain failed: {r.stderr.strip()}")
+    return r.stdout
 
 
 def resolve_base(base, cwd):
@@ -319,6 +346,7 @@ def collect_angle_result(angle, run_dir):
     aid = angle["id"]
     status_path = run_dir / f"{aid}.status"
     out_path = run_dir / f"{aid}.out.json"
+    residue_path = run_dir / f"{aid}.residue.txt"
 
     exit_code = None
     if status_path.is_file():
@@ -345,13 +373,30 @@ def collect_angle_result(angle, run_dir):
         return AngleResult(aid, angle["title"], "UNPARSED", cause="schema")
 
     findings = data["findings"]
+
+    # A write-capable angle that left the checkout dirty (see
+    # run_write_capable_angles) is never trusted as a clean run, however its
+    # output parsed — the environment it ran in, and every serial angle
+    # after it, may be compromised. Its findings are still surfaced (merged
+    # by presence, not by kind — see merge_findings) so nothing is lost, but
+    # the angle itself does not count as RAN.
+    if residue_path.is_file():
+        return AngleResult(
+            aid, angle["title"], "UNPARSED", cause="residue",
+            summary=data["summary"], findings=findings,
+        )
+
+    # BLOCKED takes precedence over a nonempty findings array: a reviewer
+    # that could not complete its mandate is never "clean" just because it
+    # also reported partial findings before giving up.
+    if data["verdict"] == "BLOCKED":
+        return AngleResult(aid, angle["title"], "BLOCKED", summary=data["summary"], findings=findings)
+
     # Trust the findings array over the self-reported verdict text: a model
     # that mislabels verdict="CLEAN" while still listing findings must not
     # have those findings silently dropped.
     if findings:
         return AngleResult(aid, angle["title"], "FINDINGS", summary=data["summary"], findings=findings)
-    if data["verdict"] == "BLOCKED":
-        return AngleResult(aid, angle["title"], "BLOCKED", summary=data["summary"])
     return AngleResult(aid, angle["title"], "CLEAN", summary=data["summary"])
 
 
@@ -366,7 +411,11 @@ def merge_findings(results):
     merged = {}
     order = []
     for r in results:
-        if r.kind != "FINDINGS":
+        # Merge by presence, not by kind — a BLOCKED or UNPARSED(residue)
+        # angle can still carry real findings (see collect_angle_result) and
+        # those must not be silently dropped just because the angle itself
+        # didn't count as a clean FINDINGS run.
+        if not r.findings:
             continue
         for f in r.findings:
             key = dedup_key(f)
@@ -489,7 +538,7 @@ def build_arg_parser():
     p = argparse.ArgumentParser(prog=PROG, add_help=True)
     p.add_argument("--plan", help="plan JSON file (required unless --from-dir)")
     p.add_argument("--base", help="override the plan's base branch")
-    p.add_argument("--jobs", type=int, help="angles run in parallel (default: min(#angles, 4))")
+    p.add_argument("--jobs", type=int, help="read-only angles run in parallel (default: min(#read-only, 4)); workspace-write angles always run serially")
     p.add_argument("--timeout", type=int, default=900, help="per-angle codex timeout, seconds")
     p.add_argument("--dir", help="run directory (default: a fresh mktemp -d)")
     p.add_argument("--only", help="comma-separated angle ids to restrict to")
@@ -529,6 +578,62 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         return str(e)
 
 
+def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
+    """Runs workspace-write angles one at a time against the shared checkout
+    (never concurrently with each other or with a read-only angle — see
+    partition_angles: isolating them in a git worktree was rejected because
+    reviewers need the project's real environment — .venv, caches — which a
+    worktree lacks).
+
+    Requires a clean tree before the first one; if the tree is already dirty
+    at that point, every write-capable angle is skipped without running, as
+    UNPARSED(dirty-tree) — contract, not policy: a dirty tree means we can't
+    attribute any residue that follows to a specific angle. After each angle
+    that does run, the tree is checked again: a non-empty `git status
+    --porcelain` is recorded to <angle>.residue.txt and printed to stderr,
+    and the next angle runs anyway, from that dirty state — nothing is
+    reverted automatically here; that is the SKILL's job (inspect, restore).
+
+    Returns (synthetic_results, spawn_failures). synthetic_results holds
+    AngleResult objects for angles that never ran at all (the dirty-tree
+    skip) — there is no status/out file for those, so they bypass
+    collect_angle_result entirely. Angles that did run are left for the
+    caller's normal collect_angle_result pass, which also checks for a
+    residue marker."""
+    synthetic_results = {}
+    spawn_failures = []
+
+    if not serial_ids:
+        return synthetic_results, spawn_failures
+
+    if git_status_porcelain(root).strip():
+        print(
+            f"{PROG}: working tree is dirty before the first write-capable angle — "
+            f"not running (UNPARSED(dirty-tree)): {', '.join(serial_ids)}",
+            file=sys.stderr,
+        )
+        for aid in serial_ids:
+            synthetic_results[aid] = AngleResult(aid, angles_by_id[aid]["title"], "UNPARSED", cause="dirty-tree")
+        return synthetic_results, spawn_failures
+
+    for aid in serial_ids:
+        err = run_angle(
+            aid, angles_by_id[aid], plan, base_resolved, template,
+            run_dir, root, schema_path, timeout_sec,
+        )
+        if err is not None:
+            spawn_failures.append((aid, err))
+            continue
+        status = git_status_porcelain(root)
+        if status.strip():
+            (run_dir / f"{aid}.residue.txt").write_text(status)
+            print(f"{PROG}: angle '{aid}' left the working tree dirty — not reverting:", file=sys.stderr)
+            for line in status.splitlines():
+                print(f"  {line}", file=sys.stderr)
+
+    return synthetic_results, spawn_failures
+
+
 def main(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -540,7 +645,7 @@ def main(argv=None):
     script_dir = Path(__file__).resolve().parent
 
     if args.from_dir:
-        run_dir = Path(args.from_dir)
+        run_dir = Path(args.from_dir).resolve()
         if not run_dir.is_dir():
             env_error(f"no such run directory: {run_dir}")
         plan_path = run_dir / "plan.json"
@@ -554,7 +659,7 @@ def main(argv=None):
     else:
         if not args.plan:
             usage_error("--plan FILE is required unless --from-dir is given")
-        plan_path = Path(args.plan)
+        plan_path = Path(args.plan).resolve()
         if not plan_path.is_file():
             env_error(f"no such plan file: {plan_path}")
         plan = load_plan(plan_path)
@@ -581,10 +686,13 @@ def main(argv=None):
             usage_error("--jobs must be >= 1")
         if args.timeout < 1:
             usage_error("--timeout must be >= 1")
-        jobs = args.jobs or min(len(angle_ids), 4)
 
         if args.dir:
-            run_dir = Path(args.dir)
+            # Resolved before mkdir and before any use in an -o path passed to
+            # codex, which runs with cwd=root — a relative --dir would
+            # otherwise land codex's output under root instead of where the
+            # caller meant.
+            run_dir = Path(args.dir).resolve()
             run_dir.mkdir(parents=True, exist_ok=True)
         else:
             run_dir = Path(tempfile.mkdtemp(prefix="adversarial-review.", dir=os.environ.get("TMPDIR", "/tmp")))
@@ -593,19 +701,34 @@ def main(argv=None):
         template = load_angle_prompt_template(args.angle_prompt, script_dir)
         schema_path = script_dir / "findings.schema.json"
 
+        # Read-only angles don't write to the checkout, so they're safe to
+        # race in the shared thread pool. workspace-write angles run against
+        # the same shared checkout and must never race each other or a
+        # read-only angle — see partition_angles and
+        # run_write_capable_angles.
+        parallel_ids, serial_ids = partition_angles(angle_ids, angles_by_id)
+
         spawn_failures = []
-        with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
-            future_to_id = {
-                ex.submit(
-                    run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
-                    run_dir, root, schema_path, args.timeout,
-                ): aid
-                for aid in angle_ids
-            }
-            for fut in cf.as_completed(future_to_id):
-                err = fut.result()
-                if err is not None:
-                    spawn_failures.append((future_to_id[fut], err))
+        if parallel_ids:
+            jobs = args.jobs or min(len(parallel_ids), 4)
+            with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+                future_to_id = {
+                    ex.submit(
+                        run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
+                        run_dir, root, schema_path, args.timeout,
+                    ): aid
+                    for aid in parallel_ids
+                }
+                for fut in cf.as_completed(future_to_id):
+                    err = fut.result()
+                    if err is not None:
+                        spawn_failures.append((future_to_id[fut], err))
+
+        synthetic_results, serial_spawn_failures = run_write_capable_angles(
+            serial_ids, angles_by_id, plan, base_resolved, template,
+            run_dir, root, schema_path, args.timeout,
+        )
+        spawn_failures.extend(serial_spawn_failures)
 
         if spawn_failures:
             for aid, err in spawn_failures:
@@ -617,7 +740,11 @@ def main(argv=None):
                 "UNPARSED result)"
             )
 
-        results_by_id = {aid: collect_angle_result(angles_by_id[aid], run_dir) for aid in angle_ids}
+        results_by_id = {
+            aid: synthetic_results[aid] if aid in synthetic_results
+            else collect_angle_result(angles_by_id[aid], run_dir)
+            for aid in angle_ids
+        }
 
     merged_findings = merge_findings([results_by_id[aid] for aid in angle_ids])
     report, rc, banner, counts = build_report(angle_ids, results_by_id, merged_findings, run_dir)
