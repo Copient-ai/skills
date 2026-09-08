@@ -251,8 +251,25 @@ def git_verify(ref, cwd):
 def git_status_porcelain(cwd):
     """Raw `git status --porcelain` output (empty string means a clean
     tree). Used to gate and police the write-capable angles, which run
-    against the shared checkout rather than an isolated worktree."""
-    r = git(["status", "--porcelain"], cwd=cwd)
+    against the shared checkout rather than an isolated worktree — so a
+    reviewer dropping a new, merely-untracked file counts as dirtying the
+    tree exactly like modifying a tracked one does. Both `--untracked-
+    files=all` (recurses into untracked directories instead of collapsing
+    them to one line, and can't be shadowed by a `status.showUntrackedFiles
+    no` in the user's git config) and `-c status.showUntrackedFiles=all`
+    (belt and suspenders — forces the same thing at the config layer, in
+    case some other -c or a repo-local setting fights the flag) are passed
+    so this can never be blinded to exactly the kind of residue a careless
+    reviewer is most likely to leave. `--ignored=no` keeps genuinely
+    gitignored paths (build output, caches) out of the picture, same as
+    plain `git status` already defaults to."""
+    r = git(
+        [
+            "-c", "status.showUntrackedFiles=all",
+            "status", "--porcelain", "--untracked-files=all", "--ignored=no",
+        ],
+        cwd=cwd,
+    )
     if r.returncode != 0:
         env_error(f"git status --porcelain failed: {r.stderr.strip()}")
     return r.stdout
@@ -651,29 +668,80 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir, merged_path
     return "\n".join(lines), rc, banner, counts
 
 
+# Every environment variable that can redirect git's own repository
+# discovery away from the ordinary cwd-walks-up-to-.git search — scrubbed
+# from the probe subprocess in dir_in_git_repo so a caller's ambient
+# environment (a stray GIT_CEILING_DIRECTORIES from an outer script, a
+# leftover GIT_DIR from a prior `git -C` invocation elsewhere in the same
+# shell, ...) can't make a directory that is genuinely inside a checkout
+# read back as "not a repository".
+_GIT_DISCOVERY_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def _ancestor_has_dotgit(path):
+    """Walks `path` and its ancestors (no git involved at all) looking for a
+    `.git` entry — a directory for an ordinary repo root, a file for a
+    worktree or submodule. The second, independent signal dir_in_git_repo
+    combines with the (env-scrubbed) git probe: this one can't be fooled by
+    any GIT_* environment variable because it never runs git."""
+    cur = Path(path).resolve()
+    while True:
+        if (cur / ".git").exists():
+            return True
+        parent = cur.parent
+        if parent == cur:
+            return False
+        cur = parent
+
+
 def dir_in_git_repo(path):
     """Whether `path` sits inside a git working tree (any repo — not just
     the one adversarial-review would review, and no relation to whether
     `path` itself is version-controlled). Used only to decide where
-    merged.json is safe to land. Fails closed: only a probe that positively
-    confirms "not a repo" — git runs and exits nonzero with the canonical
-    "not a git repository (or any of the parent directories)" stderr — is
-    trusted as such. Any other nonzero exit (a bad GIT_DIR, a safe.directory
-    rejection, a permissions surprise — each prints a different fatal:
-    message that doesn't match that phrase) never actually answered the
-    question, same as git not being runnable at all (missing from PATH, bad
-    cwd, ...) — both are treated as "possibly inside a checkout" so
-    merged.json diverts to a temp file instead of risking a write into one."""
+    merged.json is safe to land. Fails closed and combines two independent
+    signals with OR — either one saying "inside" wins:
+
+    1. `git rev-parse --is-inside-work-tree`, run with every discovery-
+       altering GIT_* variable (see _GIT_DISCOVERY_ENV_VARS) stripped from
+       its environment, so ambient env left over from some outer caller
+       can't steer git's search away from the real answer. Only a probe
+       that positively confirms "not a repo" — git runs and exits nonzero
+       with the canonical "not a git repository (or any of the parent
+       directories)" stderr — is trusted as such. Any other nonzero exit (a
+       bad GIT_DIR that survived because it wasn't in the scrub list, a
+       safe.directory rejection, a permissions surprise — each prints a
+       different fatal: message that doesn't match that phrase) never
+       actually answered the question, same as git not being runnable at
+       all (missing from PATH, bad cwd, ...) — both are treated as
+       "possibly inside a checkout".
+    2. _ancestor_has_dotgit(path) — a plain filesystem walk for a `.git`
+       entry, immune to environment entirely.
+
+    merged.json diverts to a temp file instead of risking a write into a
+    checkout whenever either signal says (or fails closed toward) "inside"."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=path, capture_output=True, text=True,
+            cwd=path, capture_output=True, text=True, env=env,
         )
     except OSError:
-        return True
-    if r.returncode == 0:
-        return r.stdout.strip() == "true"
-    return "not a git repository (or any of the parent directories)" not in r.stderr
+        probe_inside = True
+    else:
+        if r.returncode == 0:
+            probe_inside = r.stdout.strip() == "true"
+        else:
+            probe_inside = "not a git repository (or any of the parent directories)" not in r.stderr
+    return probe_inside or _ancestor_has_dotgit(path)
 
 
 def resolve_merged_json_path(run_dir, from_dir_mode):
@@ -1300,19 +1368,19 @@ def main(argv=None):
 
         spawn_failures = []
         # SIGINT/SIGTERM anywhere in here — blocked on a parallel angle in
-        # cf.as_completed, or on a serial one inside run_write_capable_angles
+        # cf.as_completed, or on the serial phase's own serial_future.result()
         # — is handled by the signal.signal handlers installed above; this
         # `except KeyboardInterrupt` is a defensive backstop, not the primary
-        # path (cf.as_completed's wait is an unbounded pthread condition-
-        # variable wait, which a signal merely flagged pending — the
-        # mechanism behind the default SIGINT-raises-KeyboardInterrupt
-        # handler — does not reliably interrupt; only an actively installed
-        # handler like ours does, which is why one is installed for SIGINT
-        # too, not just SIGTERM). Deliberately no `finally: ex.shutdown(wait=
-        # True)` around the executor block below — that would block waiting
-        # for a worker thread that's stuck on the very process an interrupt
-        # exists to kill. The non-interrupt path shuts the executor down
-        # inline instead, after its work is already done.
+        # path (both are an unbounded pthread condition-variable wait, which
+        # a signal merely flagged pending — the mechanism behind the default
+        # SIGINT-raises-KeyboardInterrupt handler — does not reliably
+        # interrupt; only an actively installed handler like ours does,
+        # which is why one is installed for SIGINT too, not just SIGTERM).
+        # Deliberately no `finally: ex.shutdown(wait=True)` around either
+        # executor block below — that would block waiting for a worker
+        # thread that's stuck on the very process an interrupt exists to
+        # kill. The non-interrupt path shuts each executor down inline
+        # instead, after its work is already done.
         try:
             if parallel_ids:
                 jobs = args.jobs or min(len(parallel_ids), 4)
@@ -1340,10 +1408,34 @@ def main(argv=None):
                         spawn_failures.append((future_to_id[fut], err))
                 ex.shutdown(wait=True)
 
-            synthetic_results, serial_spawn_failures = run_write_capable_angles(
+            # Run on a dedicated single worker thread, never inline on the
+            # main thread. signal.signal handlers always run on the main
+            # thread, so if run_angle's Popen call happened here directly, a
+            # SIGINT landing inside its own _IN_FLIGHT window (see that
+            # comment) would preempt the very main-thread frame that was
+            # about to register the process and clear the sentinel —
+            # _wait_for_in_flight's wait could then only ever be satisfied
+            # by timing out (2s), never by real progress, because the thing
+            # it's waiting on is itself, one frame further down a stack it
+            # can no longer return to until the handler does. Handing the
+            # whole serial phase to its own worker (mirroring the parallel
+            # phase's ThreadPoolExecutor) keeps every Popen for a
+            # workspace-write angle off the main thread, so that wait is
+            # always satisfied by the worker's own forward progress instead.
+            # No `finally: shutdown(wait=True)` here either, for the same
+            # reason the parallel block above has none: that would block
+            # waiting on a worker stuck on the very process an interrupt
+            # exists to kill. On the real interrupt path the signal
+            # handler's os._exit ends the process before shutdown() below is
+            # ever reached, exactly as for the parallel phase.
+            serial_ex = cf.ThreadPoolExecutor(max_workers=1)
+            serial_future = serial_ex.submit(
+                run_write_capable_angles,
                 serial_ids, angles_by_id, plan, base_resolved, template,
                 run_dir, root, schema_path, args.timeout,
             )
+            synthetic_results, serial_spawn_failures = serial_future.result()
+            serial_ex.shutdown(wait=True)
             spawn_failures.extend(serial_spawn_failures)
         except KeyboardInterrupt:
             _interrupt_and_exit()

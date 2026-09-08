@@ -639,6 +639,37 @@ check "a dirty-tree marker was written for the skipped angle" \
 
 rm -rf "$rundir19b"
 
+# --- Case 19c: git_status_porcelain sees untracked files under -----------------
+# status.showUntrackedFiles=no
+# Regression: a user-level (or repo-local) `git config status.showUntracked
+# Files no` used to make plain `git status --porcelain` collapse untracked
+# directories or omit untracked files, so a reviewer dropping a new file
+# during a workspace-write angle could slip past both the clean-tree gate
+# and the post-angle residue check unseen. git_status_porcelain now forces
+# `--untracked-files=all` on the command line and `-c
+# status.showUntrackedFiles=all` at the config layer (belt and suspenders),
+# so this can't happen regardless of the ambient git config. Unit-tests the
+# helper directly against a throwaway repo with that config set and one
+# untracked file.
+repo19c=$(make_throwaway_repo untracked-visible)
+git -C "$repo19c" config status.showUntrackedFiles no
+echo "new" > "$repo19c/untracked.txt"
+
+untracked_check=$(python3 - "$SCRIPT_DIR" "$repo19c" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+status = ar.git_status_porcelain(sys.argv[2])
+ok = "untracked.txt" in status
+print("OK" if ok else f"MISMATCH: status={status!r}")
+PYEOF
+)
+echo "--- case 19c: git_status_porcelain sees untracked files despite status.showUntrackedFiles=no ---"
+printf '%s\n' "$untracked_check"
+check "an untracked file is reported even under status.showUntrackedFiles=no" \
+  test "$untracked_check" = "OK"
+
 # --- Case 20: --from-dir must never write merged.json into a real checkout -----
 # Regression: pointed directly at fixtures/all-clean (part of this repo, not
 # staged into the scratch tmpdir), the run must not dirty the tree — merged.json
@@ -814,6 +845,82 @@ printf '%s\n' "$inflight_check"
 check "the wait observed the in-flight list clear at ~0.5s (0.5s <= elapsed < 2.5s)" \
   test "$inflight_check" = "OK"
 
+# --- Case 22c: SIGINT during a hanging workspace-write angle -------------------
+# The serial-phase sibling of case 22. Regression: run_write_capable_angles
+# used to run inline on the main thread, so a SIGINT landing inside
+# run_angle's own _IN_FLIGHT window (see that comment, and the one on the
+# serial ThreadPoolExecutor in main()) would preempt the very main-thread
+# frame that was about to finish registering the process -- the interrupt
+# handler's own _wait_for_in_flight wait could then only ever be satisfied
+# by timing out (2s), never by real forward progress, since the thing it
+# was waiting on was itself, one frame further down a stack that couldn't
+# resume until the handler returned. The serial phase now runs on its own
+# dedicated worker thread, so this must behave exactly like case 22: a
+# single workspace-write angle using fake-codex-hang.sh (same fixture,
+# same marker-named backgrounded `sleep 30` that ignores SIGTERM), SIGINT
+# sent once codex has actually been spawned, and a prompt exit 130 with no
+# leftover process -- well inside the 300s --timeout that must never be the
+# thing that actually ends this run.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 22c: SIGINT during a hanging workspace-write angle ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo22c=$(make_throwaway_repo sigint-killpg-serial)
+  # The plan lives outside repo22c (not inside it, unlike most --plan cases
+  # above): a workspace-write angle's dirty-tree gate (run_write_capable_
+  # angles) requires a clean tree before it runs at all, and an untracked
+  # plan.json sitting in the checkout would itself now correctly trip that
+  # gate (see case 19c) before SIGINT ever gets a chance to land.
+  plan22c="$tmpdir/sigint-killpg-serial-plan.$$.${RANDOM:-0}.json"
+  cat > "$plan22c" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+  rundir22c="$tmpdir/sigint-killpg-serial-run.$$.${RANDOM:-0}"
+  linkdir22c="$tmpdir/sigint-killpg-serial-links.$$.${RANDOM:-0}"
+  mkdir -p "$linkdir22c"
+  marker22c="sigintserialtest$$_${RANDOM:-0}"
+  stdout22c="$tmpdir/sigint-killpg-serial.stdout"
+  stderr22c="$tmpdir/sigint-killpg-serial.stderr"
+
+  CODEX_BIN="$FIXTURES/fake-codex-hang.sh" \
+  ADV_TEST_SLEEP_MARKER="$marker22c" \
+  ADV_TEST_SLEEP_LINKDIR="$linkdir22c" \
+  bash -c 'cd "$1" && exec bash "$2" --plan "$4" --base main --dir "$3" --timeout 300' \
+    _ "$repo22c" "$SH" "$rundir22c" "$plan22c" >"$stdout22c" 2>"$stderr22c" &
+  runner_pid=$!
+
+  sleep 2
+  kill -INT "$runner_pid" 2>/dev/null || true
+
+  start22c=$(date +%s)
+  wait "$runner_pid"
+  rc22c=$?
+  end22c=$(date +%s)
+  elapsed22c=$((end22c - start22c))
+
+  echo "--- case 22c: SIGINT during a hanging workspace-write angle ---"
+  cat "$stderr22c"
+  echo "  elapsed after SIGINT: ${elapsed22c}s"
+
+  check "exits 130" test "$rc22c" -eq 130
+  check "finishes within a few seconds of SIGINT (not the 300s --timeout)" \
+    test "$elapsed22c" -le 10
+  check "stderr reports the interruption" grep -qi "interrupted" "$stderr22c"
+
+  # Give the kill a brief moment to land, then confirm no leftover sleep.
+  sleep 1
+  if pgrep -f "sleep-$marker22c" >/dev/null 2>&1; then
+    echo "  FAIL: leftover 'sleep 30' process from this run is still running"
+    fails=$((fails + 1))
+    pkill -f "sleep-$marker22c" 2>/dev/null || true
+  else
+    echo "  ok: no leftover 'sleep 30' process from this run"
+  fi
+
+  rm -rf "$rundir22c" "$linkdir22c"
+fi
+
 # --- Case 23: dir_in_git_repo fails closed when git cannot be run --------------
 # Regression: dir_in_git_repo returned False -- "not in a repo, safe to write
 # merged.json in place" -- whenever `git rev-parse` itself could not even be
@@ -844,32 +951,47 @@ check "merged.json was not written into the staged fixture dir" \
 
 rm -f "$merged23"
 
-# --- Case 23b: an inconclusive git probe (bad GIT_DIR) still diverts -----------
+# --- Case 23b: an inconclusive git probe (permission denied) still diverts ----
 # Regression: dir_in_git_repo used to treat ANY nonzero `git rev-parse` exit
 # as a confident "not a repo" (safe to write merged.json in place) as long as
 # git itself was runnable at all -- conflating a real "not a repo" answer
-# with a probe that never actually answered the question, e.g. a bad GIT_DIR.
-# GIT_DIR pointing at a directory that doesn't exist reproduces exactly that:
-# git's own message is "fatal: not a git repository: '/nonexistent-dir'",
-# which does NOT match the canonical "...(or any of the parent directories):
-# .git" git prints when a directory is genuinely outside any repo (case
-# 23c) -- so this must fail closed and divert, the same as case 23's
-# git-unavailable probe.
-dir23b=$(stage all-clean)
-out23b=$(GIT_DIR=/nonexistent-dir python3 "$PY" --from-dir "$dir23b" 2>&1); rc23b=$?
-echo "--- case 23b: dir_in_git_repo diverts on an inconclusive git probe (bad GIT_DIR) ---"
-printf '%s\n' "$out23b"
+# with a probe that never actually answered the question. A directory git
+# cannot `cd` into (mode 000) reproduces exactly that: git's own message is
+# "fatal: cannot change to '...': Permission denied", which does NOT match
+# the canonical "...(or any of the parent directories): .git" git prints
+# when a directory is genuinely outside any repo (case 23c) -- so this must
+# fail closed, the same as case 23's git-unavailable probe. (A bad GIT_DIR
+# used to reproduce this same kind of inconclusive error, but
+# dir_in_git_repo now deliberately scrubs GIT_DIR from the probe's own
+# environment -- see case 23d -- so a caller-set GIT_DIR can no longer reach
+# it at all; permission denial is a real fact about the directory itself,
+# not an environment variable, so the scrub can't neutralize it.)
+# Unit-tests dir_in_git_repo directly rather than through --from-dir end to
+# end: mode 000 also blocks the tool's own earlier reads (plan.json, angle
+# outputs) inside that directory, which would fail the run before ever
+# reaching this check.
+if [ "$(id -u)" = "0" ]; then
+  echo "--- case 23b: dir_in_git_repo diverts on an inconclusive git probe (permission denied) ---"
+  echo "  SKIP: running as root, permission bits don't block access"
+else
+  dir23b="$tmpdir/noperm23b.$$.${RANDOM:-0}"
+  mkdir -p "$dir23b"
+  chmod 000 "$dir23b"
+  probe23b=$(python3 - "$SCRIPT_DIR" "$dir23b" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
 
-check "exits 0" test "$rc23b" -eq 0
-merged23b=$(grep '^MERGED=' <<<"$out23b" | sed 's/^MERGED=//')
-check "a MERGED= line was printed" test -n "$merged23b"
-check "the MERGED= path exists" test -f "$merged23b"
-check "merged.json was diverted outside the staged fixture dir" \
-  bash -c '[[ "$1" != "$2"/* ]]' _ "$merged23b" "$dir23b"
-check "merged.json was not written into the staged fixture dir" \
-  test ! -f "$dir23b/merged.json"
-
-rm -f "$merged23b"
+print(ar.dir_in_git_repo(sys.argv[2]))
+PYEOF
+)
+  chmod 755 "$dir23b"
+  echo "--- case 23b: dir_in_git_repo diverts on an inconclusive git probe (permission denied) ---"
+  echo "  dir_in_git_repo result: $probe23b"
+  check "an inconclusive probe (permission denied, not the canonical message) fails closed to True" \
+    test "$probe23b" = "True"
+  rm -rf "$dir23b"
+fi
 
 # --- Case 23c: a directory genuinely outside any repo writes in place ----------
 # The other half of case 23b: no GIT_DIR override, and the staged fixture
@@ -886,6 +1008,42 @@ check "exits 0" test "$rc23c" -eq 0
 check "no MERGED= diversion line was printed" \
   bash -c '! grep -q "^MERGED=" <<<"$1"' _ "$out23c"
 check "merged.json was written in place" test -f "$dir23c/merged.json"
+
+# --- Case 23d: a hostile GIT_CEILING_DIRECTORIES can't fool dir_in_git_repo ----
+# Regression: dir_in_git_repo used to run its git probe with whatever
+# environment the caller happened to have. GIT_CEILING_DIRECTORIES pointed
+# at (or above) the directory being checked stops git's own upward search
+# before it ever reaches the real .git, so the probe got back the same
+# canonical "not a git repository (or any of the parent directories)"
+# message a directory genuinely outside any repo would produce (case 23c)
+# -- and merged.json was wrongly written in place. dir_in_git_repo now (a)
+# scrubs every discovery-altering GIT_* variable, GIT_CEILING_DIRECTORIES
+# included, from the probe's own environment, and (b) independently walks
+# path's ancestors for a .git entry -- either signal alone is enough here.
+# Run against fixtures/all-clean (part of this repo, not staged into the
+# scratch tmpdir -- see case 20) with GIT_CEILING_DIRECTORIES pointed at
+# the fixture's own parent, which reproduces the bug (verified directly:
+# `GIT_CEILING_DIRECTORIES=.../fixtures git -C .../fixtures/all-clean
+# rev-parse --is-inside-work-tree` exits 128 with the canonical message,
+# even though all-clean sits squarely inside this repo).
+if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "--- case 23d: a hostile GIT_CEILING_DIRECTORIES can't fool dir_in_git_repo ---"
+  echo "  SKIP: this checkout of the skill is not itself a git repository"
+else
+  out23d=$(GIT_CEILING_DIRECTORIES="$FIXTURES" python3 "$PY" --from-dir "$FIXTURES/all-clean" 2>&1); rc23d=$?
+  echo "--- case 23d: a hostile GIT_CEILING_DIRECTORIES can't fool dir_in_git_repo ---"
+  printf '%s\n' "$out23d"
+
+  check "exits 0" test "$rc23d" -eq 0
+  merged23d=$(grep '^MERGED=' <<<"$out23d" | sed 's/^MERGED=//')
+  check "a MERGED= line was printed (still diverted, not fooled by GIT_CEILING_DIRECTORIES)" \
+    test -n "$merged23d"
+  check "the MERGED= path exists" test -f "$merged23d"
+  check "merged.json was not created next to the fixture" \
+    test ! -f "$FIXTURES/all-clean/merged.json"
+
+  rm -f "$merged23d" "$FIXTURES/all-clean/merged.json"
+fi
 
 # --- Case 24: stale artifacts are cleared for every selected angle up front ----
 # Regression: clear_stale_artifacts(aid, run_dir) ran at the top of run_angle
