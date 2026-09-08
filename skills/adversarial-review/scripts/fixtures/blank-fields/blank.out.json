@@ -1,0 +1,1 @@
+{"angle": "blank", "verdict": "FINDINGS", "summary": "found something", "findings": [{"severity": "P2", "path": "x.py", "line": 1, "claim": "   ", "evidence": "e", "reproduction": "r"}]}

@@ -61,7 +61,7 @@ perspectives regardless. None of the three replaces the formal gate — step 6.
 One-time setup per machine:
 
 1. Install the `codex` CLI and sign in — `codex login`.
-2. `python3` (stdlib only) on `PATH` — the runner uses it, no venv needed.
+2. `python3` (3.9 or newer, stdlib only) on `PATH` — the runner uses it, no venv needed.
 3. For the optional Claude pass: nothing beyond Claude Code and its `Task` tool.
 
 ## Locating the helper

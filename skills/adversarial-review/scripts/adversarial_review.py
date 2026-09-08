@@ -18,6 +18,8 @@ Exit codes (same contract as the .sh wrapper):
      of which are folded into a per-angle UNPARSED result instead (see
      collect_angle_result) so the run still produces a merged report.
   4  unparsed-never-clean (any angle UNPARSED or BLOCKED)
+130  interrupted (SIGINT/Ctrl-C, or SIGTERM) — every tracked reviewer
+     process group is killed before exiting.
 """
 import argparse
 import concurrent.futures as cf
@@ -30,13 +32,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # Bump alongside adversarial-review.sh's ADVERSARIAL_REVIEW_VERSION — the two
 # must always match (the test suite checks this).
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 PROG = "adversarial-review"
 
@@ -189,8 +192,11 @@ def validate_plan(data, source):
 
 def parse_only(only_arg, known_ids):
     """Returns the subset of known_ids named by --only, in plan order, or
-    None when --only was not given (meaning: every angle)."""
-    if not only_arg:
+    None when --only was not given at all (meaning: every angle). An
+    explicitly empty --only (only_arg == "", as opposed to argparse's own
+    default of None when the flag is absent) is not "every angle" — it falls
+    through to the empty-`requested` check below and is a usage error."""
+    if only_arg is None:
         return None
     requested = [x.strip() for x in only_arg.split(",") if x.strip()]
     if not requested:
@@ -287,27 +293,33 @@ def load_angle_prompt_template(path_arg, script_dir):
     return DEFAULT_ANGLE_PROMPT
 
 
+PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
 def render_prompt(template, plan, angle, base_resolved):
-    subs = {
-        "{{BASE}}": base_resolved,
-        "{{PROMISE}}": plan.get("promise", ""),
-        "{{CONTRACTS}}": bulleted(plan.get("contracts"), "(none)"),
-        "{{INVARIANTS}}": bulleted(plan.get("invariants"), "(none)"),
-        "{{ANGLE_ID}}": angle["id"],
-        "{{ANGLE_TITLE}}": angle["title"],
-        "{{MANDATE}}": angle["mandate"],
-        "{{EVIDENCE}}": angle["evidence"],
-        "{{FILES}}": bulleted(angle.get("files"), "(all changed files)"),
+    values = {
+        "BASE": base_resolved,
+        "PROMISE": plan.get("promise", ""),
+        "CONTRACTS": bulleted(plan.get("contracts"), "(none)"),
+        "INVARIANTS": bulleted(plan.get("invariants"), "(none)"),
+        "ANGLE_ID": angle["id"],
+        "ANGLE_TITLE": angle["title"],
+        "MANDATE": angle["mandate"],
+        "EVIDENCE": angle["evidence"],
+        "FILES": bulleted(angle.get("files"), "(all changed files)"),
         # shlex.quote only the base — the quoted and unquoted pieces
         # concatenate to the same single shell token, and a base with shell
         # metacharacters (e.g. from a hand-edited plan) can never break out
         # of the command a reviewer is told to paste and run.
-        "{{DIFF_COMMAND}}": f"git diff {shlex.quote(base_resolved)}...HEAD",
+        "DIFF_COMMAND": f"git diff {shlex.quote(base_resolved)}...HEAD",
     }
-    out = template
-    for k, v in subs.items():
-        out = out.replace(k, v)
-    return out
+    # A single re.sub pass over the *original* template — never a substituted
+    # placeholder over its own prior output — so inserted plan/angle text
+    # (promise, mandate, ...) is never re-scanned for further placeholders. A
+    # promise or mandate that happens to contain a literal "{{MANDATE}}" (a
+    # hand-edited plan, an adversarial one) must render as that literal text,
+    # not be replaced a second time.
+    return PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), m.group(0)), template)
 
 
 # --- Findings schema validation (no external jsonschema dependency) ----------
@@ -339,13 +351,14 @@ def validate_findings_json(data):
             return False, f"findings[{i}] missing keys: {sorted(FINDING_REQUIRED - fkeys)}"
         if f["severity"] not in SEVERITIES:
             return False, f"findings[{i}].severity must be one of {SEVERITIES}, got {f['severity']!r}"
-        if not isinstance(f["path"], str):
-            return False, f"findings[{i}].path must be a string"
         if not isinstance(f["line"], int) or isinstance(f["line"], bool):
             return False, f"findings[{i}].line must be an integer"
-        for key in ("claim", "evidence", "reproduction"):
-            if not isinstance(f[key], str):
-                return False, f"findings[{i}].{key} must be a string"
+        # Mirrors findings.schema.json's minLength/pattern on these four —
+        # a present-but-blank field (isinstance str, all whitespace) is
+        # schema-invalid, not a hollow-but-technically-valid finding.
+        for key in ("path", "claim", "evidence", "reproduction"):
+            if not isinstance(f[key], str) or not f[key].strip():
+                return False, f"findings[{i}].{key} must be a non-empty string"
     # verdict="FINDINGS" with an empty findings array is self-contradictory —
     # never trust it as CLEAN (or as FINDINGS with nothing to show); treat it
     # the same as any other schema violation.
@@ -783,6 +796,76 @@ def kill_process_group(proc, grace_sec=2):
         time.sleep(0.05)
 
 
+# --- Interrupt handling (Ctrl-C / SIGTERM during a live run) -----------------
+#
+# Every reviewer Popen currently in flight — across the parallel read-only
+# pool and the serial workspace-write phase — is tracked here so a Ctrl-C or
+# SIGTERM can kill all of them, not just whichever one the shell happened to
+# signal directly. Codex is started with start_new_session=True precisely so
+# each one's whole process group, not just its own pid, can be reaped this
+# way (see kill_process_group).
+_LIVE_PROCS_LOCK = threading.Lock()
+_LIVE_PROCS = set()
+
+# The parallel-phase ThreadPoolExecutor, while one is running — None the rest
+# of the time (including throughout the serial phase, which uses no
+# executor). Lets the interrupt handler cancel not-yet-started futures
+# without main() having to thread the executor through to it.
+_CURRENT_EXECUTOR = None
+
+
+def _track_proc(proc):
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.add(proc)
+
+
+def _untrack_proc(proc):
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.discard(proc)
+
+
+def _set_current_executor(ex):
+    global _CURRENT_EXECUTOR
+    _CURRENT_EXECUTOR = ex
+
+
+def _interrupt_and_exit(signum=None, frame=None):
+    """Installed directly (via signal.signal) as the handler for both SIGINT
+    and SIGTERM, and also called from main()'s own `except KeyboardInterrupt`
+    as a defensive backstop. A direct signal.signal handler — not Python's
+    default SIGINT-raises-KeyboardInterrupt behavior, caught with a bare
+    `except` — is what actually works here: cf.as_completed's wait is an
+    unbounded pthread condition-variable wait that a signal merely flagged
+    pending does not interrupt (only an actively installed handler does),
+    and relying on the default handler also assumes SIGINT's disposition is
+    still SIG_DFL by the time this process starts, which it is not in every
+    embedding context (e.g. a backgrounded job under a non-interactive
+    parent shell already set it to SIG_IGN) — signal.signal() always installs
+    an active handler regardless of prior disposition. May also run for an
+    angle's own subprocess.communicate() being interrupted directly (see
+    run_angle's matching except BaseException, which kills that one angle's
+    group immediately, before this function's sweep, so a SIGKILL escalation
+    on the same group here is a harmless no-op rather than a race). Cancels
+    every not-yet-started future in the parallel-phase pool, kills every
+    tracked reviewer's process group, prints one line, and exits — 130, the
+    conventional 128+SIGINT code, used for SIGTERM here too since either
+    means "the run is being cancelled", never "codex could not be spawned"
+    (exit 3) or any other structured exit this tool defines. Uses os._exit,
+    not sys.exit, so it terminates immediately and correctly even when
+    called from inside a signal handler on the main thread, without waiting
+    on any worker thread still blocked in a subprocess call."""
+    ex = _CURRENT_EXECUTOR
+    if ex is not None:
+        ex.shutdown(wait=False, cancel_futures=True)
+    with _LIVE_PROCS_LOCK:
+        procs = list(_LIVE_PROCS)
+    for proc in procs:
+        kill_process_group(proc)
+    print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(130)
+
+
 # Every file collect_angle_result (or a human re-running --from-dir) would
 # read for one angle. A reused --dir (an explicit --dir re-run of the same
 # plan, or --only re-running just a few ids) must never let one of these
@@ -828,28 +911,44 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                 cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
                 cwd=root, start_new_session=True,
             )
+            _track_proc(proc)
             try:
-                proc.communicate(timeout=timeout_sec)
-                (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
-                # A normal exit only proves the reviewer process itself is
-                # gone, not anything it backgrounded (a detached
-                # reproduction, a leftover server) — that survives in the
-                # same process group exactly as it would after a timeout,
-                # so reap it here too rather than only on TimeoutExpired.
-                if _group_running(proc.pid):
-                    survivors = _group_member_pids(proc.pid)
+                try:
+                    proc.communicate(timeout=timeout_sec)
+                    (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
+                    # A normal exit only proves the reviewer process itself is
+                    # gone, not anything it backgrounded (a detached
+                    # reproduction, a leftover server) — that survives in the
+                    # same process group exactly as it would after a timeout,
+                    # so reap it here too rather than only on TimeoutExpired.
+                    if _group_running(proc.pid):
+                        survivors = _group_member_pids(proc.pid)
+                        kill_process_group(proc)
+                        count = len(survivors) if survivors else "some"
+                        note = (
+                            f"{PROG}: angle '{aid}' reviewer left {count} background "
+                            "process(es) running after exit; terminated\n"
+                        )
+                        logfh.write(note.encode())
+                        logfh.flush()
+                        print(note, end="", file=sys.stderr)
+                except subprocess.TimeoutExpired:
                     kill_process_group(proc)
-                    count = len(survivors) if survivors else "some"
-                    note = (
-                        f"{PROG}: angle '{aid}' reviewer left {count} background "
-                        "process(es) running after exit; terminated\n"
-                    )
-                    logfh.write(note.encode())
-                    logfh.flush()
-                    print(note, end="", file=sys.stderr)
-            except subprocess.TimeoutExpired:
-                kill_process_group(proc)
-                (run_dir / f"{aid}.status").write_text("124\n")
+                    (run_dir / f"{aid}.status").write_text("124\n")
+                except BaseException:
+                    # Belt-and-suspenders: SIGINT/SIGTERM during the serial
+                    # (workspace-write) phase are normally handled by
+                    # main()'s own signal.signal handlers, which kill every
+                    # _LIVE_PROCS-tracked group (this one included) and
+                    # os._exit before ever returning control here — but if a
+                    # KeyboardInterrupt/BaseException reaches this call some
+                    # other way, kill this angle's own group immediately,
+                    # before the finally below drops it from _LIVE_PROCS.
+                    # Re-raised so the normal caller handling still runs.
+                    kill_process_group(proc)
+                    raise
+            finally:
+                _untrack_proc(proc)
         return None
     except OSError as e:
         return str(e)
@@ -944,6 +1043,26 @@ def main(argv=None):
         print(f"adversarial_review.py {VERSION}")
         return 0
 
+    # Both installed explicitly and unconditionally (harmless in --from-dir
+    # mode, where no reviewer process is ever tracked). SIGTERM has no
+    # Python-level default handler at all, so it needs this to get any
+    # "kill every tracked group and exit 130" treatment instead of the OS's
+    # silent default termination. SIGINT is normally caught by Python's own
+    # default handler (which raises KeyboardInterrupt, caught around the
+    # parallel/serial phases below) — but an explicit handler here is not
+    # redundant: it also fires reliably while blocked inside
+    # cf.as_completed()'s unbounded wait, which is built on a pthread
+    # condition variable that a signal merely flagged-as-pending (the
+    # KeyboardInterrupt-on-next-bytecode mechanism) does not interrupt, only
+    # a real, actively-installed handler does. It also does not depend on
+    # SIGINT's default disposition being SIG_DFL at process start, which it
+    # is not in every embedding context (e.g. a backgrounded job under a
+    # non-interactive parent shell) — signal.signal() always installs an
+    # active handler regardless of what disposition it had before. See
+    # _interrupt_and_exit.
+    signal.signal(signal.SIGINT, _interrupt_and_exit)
+    signal.signal(signal.SIGTERM, _interrupt_and_exit)
+
     script_dir = Path(__file__).resolve().parent
 
     if args.from_dir:
@@ -1037,9 +1156,25 @@ def main(argv=None):
         parallel_ids, serial_ids = partition_angles(angle_ids, angles_by_id)
 
         spawn_failures = []
-        if parallel_ids:
-            jobs = args.jobs or min(len(parallel_ids), 4)
-            with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        # SIGINT/SIGTERM anywhere in here — blocked on a parallel angle in
+        # cf.as_completed, or on a serial one inside run_write_capable_angles
+        # — is handled by the signal.signal handlers installed above; this
+        # `except KeyboardInterrupt` is a defensive backstop, not the primary
+        # path (cf.as_completed's wait is an unbounded pthread condition-
+        # variable wait, which a signal merely flagged pending — the
+        # mechanism behind the default SIGINT-raises-KeyboardInterrupt
+        # handler — does not reliably interrupt; only an actively installed
+        # handler like ours does, which is why one is installed for SIGINT
+        # too, not just SIGTERM). Deliberately no `finally: ex.shutdown(wait=
+        # True)` around the executor block below — that would block waiting
+        # for a worker thread that's stuck on the very process an interrupt
+        # exists to kill. The non-interrupt path shuts the executor down
+        # inline instead, after its work is already done.
+        try:
+            if parallel_ids:
+                jobs = args.jobs or min(len(parallel_ids), 4)
+                ex = cf.ThreadPoolExecutor(max_workers=jobs)
+                _set_current_executor(ex)
                 future_to_id = {
                     ex.submit(
                         run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
@@ -1051,12 +1186,16 @@ def main(argv=None):
                     err = fut.result()
                     if err is not None:
                         spawn_failures.append((future_to_id[fut], err))
+                ex.shutdown(wait=True)
+                _set_current_executor(None)
 
-        synthetic_results, serial_spawn_failures = run_write_capable_angles(
-            serial_ids, angles_by_id, plan, base_resolved, template,
-            run_dir, root, schema_path, args.timeout,
-        )
-        spawn_failures.extend(serial_spawn_failures)
+            synthetic_results, serial_spawn_failures = run_write_capable_angles(
+                serial_ids, angles_by_id, plan, base_resolved, template,
+                run_dir, root, schema_path, args.timeout,
+            )
+            spawn_failures.extend(serial_spawn_failures)
+        except KeyboardInterrupt:
+            _interrupt_and_exit()
 
         if spawn_failures:
             for aid, err in spawn_failures:

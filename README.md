@@ -134,7 +134,7 @@ Optionally, each angle also gets an isolated Claude pass. Either way, findings
 go through the same verify → fix → re-review discipline as the other two
 skills.
 
-Host requirements: bash, git, and `python3` (stdlib only) on `PATH`, plus the
+Host requirements: bash, git, and `python3` (3.9 or newer, stdlib only) on `PATH`, plus the
 `codex` CLI as above. The optional Claude pass needs Claude Code — same
 `Task`-subagent-is-the-isolation reason as `pr-review-loop`.
 

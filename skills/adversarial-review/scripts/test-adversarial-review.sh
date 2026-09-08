@@ -130,6 +130,24 @@ check "exits 4" test "$rc5" -eq 4
 check "the bad-schema angle names its cause" \
   grep -qx "a1: UNPARSED(schema)" <<<"$out5"
 
+# --- Case 5b: a required finding field is blank (empty or whitespace-only) -----
+# Regression: findings.schema.json and validate_findings_json both require
+# non-empty path/claim/evidence/reproduction (minLength + a non-space
+# pattern in the schema; strip-and-check in the Python validator) — a
+# whitespace-only "claim" must never be accepted as a hollow-but-valid
+# finding.
+dir5b=$(stage blank-fields)
+out5b=$(bash "$SH" --from-dir "$dir5b" 2>/dev/null); rc5b=$?
+echo "--- case 5b: blank-fields ---"
+printf '%s\n' "$out5b"
+
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out5b"
+check "exits 4" test "$rc5b" -eq 4
+check "the blank-claim angle names its cause" \
+  grep -qx "blank: UNPARSED(schema)" <<<"$out5b"
+check "the control angle still ran clean" \
+  grep -qx "control: CLEAN" <<<"$out5b"
+
 # --- Case 6: --only restricts --------------------------------------------------
 dir6=$(stage all-clean)
 out6=$(bash "$SH" --from-dir "$dir6" --only alpha,gamma); rc6=$?
@@ -674,6 +692,77 @@ check "the multiline summary's embedded newline is escaped, not a bare continuat
 check "the control angle's plain summary line is present" \
   grep -qx "control: Control found nothing wrong." <<<"$out21"
 
+# --- Case 22: SIGINT during a live run kills every reviewer process group ------
+# fixtures/fake-codex-hang.sh backgrounds a marker-named `sleep 30` (which
+# ignores SIGTERM, same as case 17) and then hangs itself well past any
+# reasonable --timeout. Sends SIGINT to the runner ~2s in — once codex has
+# actually been spawned and the main thread is blocked waiting on it — and
+# expects a prompt exit 130 with no leftover process, proving the interrupt
+# handler kills the whole tracked process group itself rather than relying on
+# a --timeout that (deliberately, --timeout 300 here) will never fire in the
+# time this test takes.
+#
+# The runner is launched via `bash -c '... && exec bash "$SH" ...'`, not a
+# plain `bash "$SH" ... &`: adversarial-review.sh itself execs into
+# adversarial_review.py, so once startup completes the whole chain shares one
+# pid, and `exec`ing into it from bash -c (rather than relying on bash's
+# unguaranteed last-command tail-call optimization for a `cd x && cmd`
+# compound) makes that pid deterministic — it's the one `$!` captures and the
+# one SIGINT is sent to.
+if ! command -v pgrep >/dev/null 2>&1; then
+  echo "--- case 22: SIGINT kills every reviewer process group ---"
+  echo "  SKIP: pgrep not available on this system"
+else
+  repo22=$(make_throwaway_repo sigint-killpg)
+  cat > "$repo22/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+  rundir22="$tmpdir/sigint-killpg-run.$$.${RANDOM:-0}"
+  linkdir22="$tmpdir/sigint-killpg-links.$$.${RANDOM:-0}"
+  mkdir -p "$linkdir22"
+  marker22="siginttest$$_${RANDOM:-0}"
+  stdout22="$tmpdir/sigint-killpg.stdout"
+  stderr22="$tmpdir/sigint-killpg.stderr"
+
+  CODEX_BIN="$FIXTURES/fake-codex-hang.sh" \
+  ADV_TEST_SLEEP_MARKER="$marker22" \
+  ADV_TEST_SLEEP_LINKDIR="$linkdir22" \
+  bash -c 'cd "$1" && exec bash "$2" --plan plan.json --base main --dir "$3" --timeout 300' \
+    _ "$repo22" "$SH" "$rundir22" >"$stdout22" 2>"$stderr22" &
+  runner_pid=$!
+
+  sleep 2
+  kill -INT "$runner_pid" 2>/dev/null || true
+
+  start22=$(date +%s)
+  wait "$runner_pid"
+  rc22=$?
+  end22=$(date +%s)
+  elapsed22=$((end22 - start22))
+
+  echo "--- case 22: SIGINT kills every reviewer process group ---"
+  cat "$stderr22"
+  echo "  elapsed after SIGINT: ${elapsed22}s"
+
+  check "exits 130" test "$rc22" -eq 130
+  check "finishes within a few seconds of SIGINT (not the 300s --timeout)" \
+    test "$elapsed22" -le 10
+  check "stderr reports the interruption" grep -qi "interrupted" "$stderr22"
+
+  # Give the kill a brief moment to land, then confirm no leftover sleep.
+  sleep 1
+  if pgrep -f "sleep-$marker22" >/dev/null 2>&1; then
+    echo "  FAIL: leftover 'sleep 30' process from this run is still running"
+    fails=$((fails + 1))
+    pkill -f "sleep-$marker22" 2>/dev/null || true
+  else
+    echo "  ok: no leftover 'sleep 30' process from this run"
+  fi
+
+  rm -rf "$rundir22" "$linkdir22"
+fi
+
 # --- --version: sh and py versions must match ----------------------------------
 sh_ver=$(bash "$SH" --version | awk '{print $2}')
 py_ver=$(python3 "$PY" --version | awk '{print $2}')
@@ -696,6 +785,18 @@ echo "--- case: unknown --only id ---"
 printf '%s\n' "$err_badonly"
 check "unknown --only id exits 2" test "$rc_badonly" -eq 2
 check "unknown --only id names the problem" grep -qi "unknown angle id" <<<"$err_badonly"
+
+# --- An explicitly empty --only "" is a usage error, not "every angle" ---------
+# Regression: parse_only used to treat only_arg == "" the same as --only never
+# given at all (both falsy in Python), silently running every angle instead
+# of rejecting the empty value as a usage error.
+dir_only_empty=$(stage all-clean)
+err_emptyonly=$(bash "$SH" --from-dir "$dir_only_empty" --only "" 2>&1); rc_emptyonly=$?
+echo "--- case: --only \"\" (explicitly empty) ---"
+printf '%s\n' "$err_emptyonly"
+check "explicitly empty --only exits 2" test "$rc_emptyonly" -eq 2
+check "explicitly empty --only names the problem" \
+  grep -qi "no angle ids parsed" <<<"$err_emptyonly"
 
 # --- Environment errors: missing --from-dir directory --------------------------
 err_nodir=$(bash "$SH" --from-dir "$tmpdir/does-not-exist" 2>&1); rc_nodir=$?
@@ -766,6 +867,33 @@ printf '%s\n' "$quote_check"
 check "a base with shell metacharacters is quoted in the generated diff command" \
   test "$quote_check" = "OK"
 
+# --- Prompt rendering is single-pass: inserted plan text is never re-scanned ---
+# Regression: render_prompt used to substitute placeholders one at a time via
+# repeated str.replace() calls over the *whole* running string, so a plan
+# field's own text (promise, mandate, ...) that happened to contain a literal
+# "{{MANDATE}}" would get replaced a second time by a later iteration. A
+# single re.sub pass over the original template must never re-scan its own
+# substitutions.
+reinject_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from adversarial_review import render_prompt
+
+plan = {"promise": "Ship it, handling the literal token {{MANDATE}} verbatim.",
+        "contracts": [], "invariants": []}
+angle = {"id": "logic", "title": "Logic", "mandate": "Find bugs.",
+         "evidence": "A concrete case."}
+rendered = render_prompt("promise={{PROMISE}} mandate={{MANDATE}}", plan, angle, "main")
+expected = ("promise=Ship it, handling the literal token {{MANDATE}} verbatim. "
+            "mandate=Find bugs.")
+print("OK" if rendered == expected else "MISMATCH:\n" + rendered)
+PYEOF
+)
+echo "--- prompt rendering: inserted plan text is never re-scanned (single pass) ---"
+printf '%s\n' "$reinject_check"
+check "a literal {{MANDATE}} inside inserted plan text survives untouched" \
+  test "$reinject_check" = "OK"
+
 # --- Scheduling: read-only runs parallel, workspace-write runs serial ----------
 # The live serialization itself (thread pool, then one-at-a-time with the
 # clean-tree gate) needs a real git repo and isn't reachable offline; this
@@ -800,6 +928,27 @@ echo "--- partition_angles scheduling ---"
 printf '%s\n' "$partition_check"
 check "read-only/workspace-write split preserves plan order in each group" \
   test "$partition_check" = "OK"
+
+# --- Python version gate: python3 must be 3.9+ ----------------------------------
+# adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh
+# gates on `python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'`
+# before ever invoking the runner. This unit-tests that exact expression
+# against whatever python3 is actually on PATH here — expected to pass, since
+# the rest of this suite already depends on 3.9+ behavior (e.g. the runner's
+# own use of is_relative_to). Simulating an old python3 well enough to
+# exercise the *rejection* path in a hermetic shell fixture is impractical —
+# faking sys.version_info convincingly needs a real, older CPython build, not
+# a shell shim pretending to be python3 — so that path (the expression exits
+# nonzero -> the wrapper prints a message and exits 1) is a direct five-line
+# `cmd || { ...; exit 1; }`, the same idiom the two checks above it already
+# use, and is verified by inspection rather than an automated negative test.
+version_gate_check=$(python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'; echo $?)
+echo "--- python3 version gate check ---"
+echo "version-gate expression exit code (0 = 3.9+, matches this environment's python3): $version_gate_check"
+check "the version-gate expression exits 0 against this environment's python3 (3.9+)" \
+  test "$version_gate_check" -eq 0
+check "adversarial-review.sh itself runs successfully under this python3 (implicitly exercises the gate)" \
+  bash -c 'bash "$1" --version >/dev/null 2>&1' _ "$SH"
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -63,11 +63,13 @@
 #   4  unparsed-never-clean — any angle UNPARSED or BLOCKED. A review that did
 #      not fully run is not a clean review, even if every angle that did run
 #      came back CLEAN.
+# 130  interrupted — SIGINT (Ctrl-C) or SIGTERM during a live run. Every
+#      tracked reviewer process group is killed before exiting.
 set -euo pipefail
 
 # Bump on every change to CLI/output behaviour. Kept equal to VERSION in
 # adversarial_review.py — an installed copy can be checked with --version.
-ADVERSARIAL_REVIEW_VERSION="1.0.0"
+ADVERSARIAL_REVIEW_VERSION="1.1.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -112,6 +114,14 @@ done
 
 command -v python3 >/dev/null 2>&1 || {
   echo "adversarial-review: python3 not found on PATH." >&2
+  exit 1
+}
+
+# adversarial_review.py uses Path.is_relative_to, added in 3.9 — check
+# explicitly and fail with a clear message rather than let the runner die
+# mid-run with an AttributeError on anything older.
+python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' || {
+  echo "adversarial-review: python3 3.9 or newer is required (this one is older)." >&2
   exit 1
 }
 
