@@ -41,7 +41,7 @@ Composes with, doesn't replace:
 |---|---|---|
 | Asks | "Is this branch broadly OK?" | "Does THIS branch's own promise survive an attacker who read the diff?" |
 | Scope per pass | whatever the reviewer notices | one derived, falsifiable angle |
-| Angles | none — one generic reviewer | 3–6, derived from this diff, run in parallel |
+| Angles | none — one generic reviewer | up to 6, derived from this diff, run in parallel |
 
 Run either loop before or after this one; run both for two independent generic
 perspectives regardless. None of the three replaces the formal gate — step 6.
@@ -227,8 +227,9 @@ what to derive (the promise, the contracts/invariants, what enforces them),
 how to phrase an angle — a mandate is an instruction to construct a
 counterexample ("produce a concrete input/program/sequence for which
 `<guarantee>` fails, and show it"), not a topic — what evidence each angle
-demands, the read-only/workspace-write choice, and the 3-to-6 cap with the
-rule that a generic angle gets dropped, not kept as padding.
+demands, the read-only/workspace-write choice, and the cap of 6 with the rule
+that a generic angle gets dropped rather than kept as padding — there is no
+minimum, so a focused diff earning one or two sharp angles gets exactly that.
 
 Write the plan to `${TMPDIR:-/tmp}/adversarial-review/<branch>-<timestamp>.json`
 (create the directory if needed) and print the full path to the user for

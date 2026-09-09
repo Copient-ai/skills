@@ -84,13 +84,15 @@ For each angle also decide:
 - **files** — optional hint: paths most relevant to this angle, if the diff
   makes that obvious. Not exhaustive, and the reviewer isn't bound by it.
 
-## 4. Keep 3 to 6, and only the specific ones
+## 4. Keep only the specific ones — at most 6
 
-Write 3 to 6 angles, no more. Before finalizing, drop any angle that would read
-the same on a different PR — if you could paste it, unedited, into a review of
-an unrelated change, it isn't derived from this diff and doesn't belong. Two
-or three sharp angles beat six generic ones; each one costs a full reviewer
-pass.
+Write as few angles as the diff honestly supports, and never more than 6.
+There is no minimum: two sharp angles beat six generic ones, and one is a
+legitimate plan for a small, focused diff. Before finalizing, drop any angle
+that would read the same on a different PR — if you could paste it, unedited,
+into a review of an unrelated change, it isn't derived from this diff and
+doesn't belong. Padding the plan to hit a number is the failure this step
+exists to prevent; each angle also costs a full reviewer pass.
 
 ## 5. Write the plan file
 
@@ -134,9 +136,19 @@ Every angle you write must earn its place the same way these do: name the
 specific promise, name the specific way to break it, name what proof would
 look like.
 
-## Example
+## A worked example — read it for wording, not for subject matter
 
 `example-plan.json` in this skill's directory is a real plan from the pilot
-(copient-trainer#6165) — worth a look for the shape of a good, specific,
-non-generic angle, and for how each mandate is worded as verification of a
-stated guarantee rather than an attack recipe, per "Wording matters" above.
+(copient-trainer#6165). Read it for one thing: how each mandate is worded as
+verification of a stated guarantee rather than an attack recipe, per "Wording
+matters" above.
+
+Two warnings, because it is the only complete example here and anchors
+harder than the three abstract ones above. It is a **single domain** — Python,
+Django, threads — chosen because it was the branch on hand, not because that
+subject matter is a template; a plan for a frontend or infrastructure diff
+should look nothing like it. And its mandates run 900–1,250 characters
+because that diff's contracts genuinely needed the detail. **That length is
+not a target.** A mandate is as long as naming the guarantee, the input, and
+the observation requires, and no longer — a short mandate for a small
+contract is a good mandate, not a lazy one.

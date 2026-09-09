@@ -42,7 +42,7 @@ BLOCKING_SEVERITIES = ("P0", "P1")
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 EXECUTIONS = ("read-only", "workspace-write")
 ANGLE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-MAX_ANGLES = 6  # sane plan-size cap; SKILL.md documents 3-6 angles per plan.
+MAX_ANGLES = 6  # ceiling only — a plan may hold as few as one angle.
 TOP_REQUIRED = {"angle", "verdict", "summary", "findings"}
 FINDING_REQUIRED = {"severity", "path", "line", "claim", "evidence", "reproduction"}
 # Per-angle artifacts a live run writes; cleared before relaunching an angle
