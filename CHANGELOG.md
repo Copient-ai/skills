@@ -9,134 +9,33 @@ bash <skill-dir>/scripts/codex-review.sh --version
 bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
 
-## 1.2.0
-
-`adversarial-review`'s runner version bumps to `1.2.0`
-(`adversarial-review.sh --version`). The threat model changes: **the branch
-under review is now trusted** — this skill reviews your own branches before
-you push them, not an adversarial submission — so the machinery that existed
-to defend against a hostile branch is gone:
-
-- **No more per-angle `CODEX_HOME`/`auth.json` copying.** Every angle now runs
-  under the ambient `CODEX_HOME` directly, which incidentally fixes
-  keyring-backed codex logins — they never worked through the old
-  copy-and-rotate-back mechanism.
-- **No more provenance metadata or hashing** (`<angle>.meta.json`, plan/base/
-  template hashes, the `"_run"` stamp in `plan.json`), and no more symlink/
-  hardlink-safe artifact writes, HEAD/ref-drift detection, the residue/
-  compromise cascade, or the sandbox-writable-root containment logic
-  (`_cache_root`, `_sandbox_writable_roots`, and the git-discovery-env-
-  scrubbing probes that backed them).
-- **Execution mode is now run-wide, not per-angle.** A plan's per-angle
-  `execution` field is advisory only from here on; a new `--allow-writes` flag
-  decides the sandbox for the whole invocation instead (default stays
-  `read-only`). Two isolation flags stay regardless — `-c
-  project_doc_max_bytes=0` and `-c skills.include_instructions=false` — but
-  now for independence of judgment, not security.
-- The runner is cut from ~2800 to under 700 lines. The test suite is cut from
-  83 cases and ~130 fixture directories to about a dozen cases, offline-only
-  via `--from-dir` (matching `codex-review-loop`'s `--from-log` pattern), plus
-  two fixture directories kept only as documentation of the run-directory
-  shape.
-
 ## 1.1.0
 
 `codex-review.sh`'s parser is unchanged — it still reports `1.0.0`, and
 `codex-review-loop` and `pr-review-loop` are byte-identical to their 1.0.0
 release.
 
-New skill: `adversarial-review`, with its own runner version `1.1.0`
-(`adversarial-review.sh --version`). Where the other two skills converge a
-generic review, this one plans first — a serialized planning phase reads the
-diff and derives what the branch itself promises, then turns each promise
-into a falsifiable attack angle. It adds:
+New skill: `adversarial-review`, runner version `1.1.0`. Where the other two
+converge a generic review, this one plans first: a serialized planning phase
+reads the diff, derives what the branch promises, and turns each promise into
+up to 6 falsifiable attack angles — no fixed checklist, and no minimum. Each
+angle then runs as its own ephemeral `codex exec` in parallel, `--output-schema`
+enforcing a reproduction per finding, merged into one compact block; `UNPARSED`
+and `BLOCKED` angles never count as clean. An optional Claude pass per angle
+reuses `pr-review-loop`'s reviewer contract.
 
-- A **plan phase** that derives contracts, invariants, and 3–6 attack angles
-  from the diff itself — nothing pre-baked, no fixed checklist.
-- **Parallel `codex exec` angles** — one isolated, ephemeral Codex pass per
-  angle, plus an optional isolated Claude pass per angle.
-- **Schema-enforced findings** — each pass's output is validated against
-  `scripts/findings.schema.json`, so a reviewer hands back a reproduction,
-  not prose.
-- Exit-code discipline matching the sibling skills: `UNPARSED` and `BLOCKED`
-  angles are never counted as clean, even when the rest of the run reports
-  `CLEAN`.
-- A new host requirement: `python3` (stdlib only) on `PATH`, for the runner.
-- **Branch-owned instructions and configuration are never loaded.** Each
-  Codex pass runs with `project_doc_max_bytes=0` and `-c skills.include_
-  instructions=false`, and under its own fresh, this-angle-only throwaway
-  `CODEX_HOME` holding only a copy of `auth.json`, so the reviewed branch's
-  own `AGENTS.md`, `.agents/skills/`, and `.codex/config.toml` (hooks, MCP
-  servers, exec policy) cannot steer the reviewer even on a checkout the
-  user has marked trusted; the Claude pass is told to read such files and
-  skills as part of the diff, never as instructions.
-- **Write-capable isolation model.** A workspace-write angle's own
-  reproduction is already free to write anywhere its sandbox allows — the
-  checkout, `tempfile.gettempdir()`/`$TMPDIR`/`/tmp`/`/var/tmp` — so nothing
-  the runner needs safe from it is placed anywhere within reach: each
-  angle's own throwaway `CODEX_HOME` is created and torn down around that
-  one angle, not shared for the whole run; the run directory itself is
-  refused (or, by default, relocated to a stable cache directory) under any
-  of those roots whenever the plan has a write-capable angle; every result
-  is collected into memory the instant its own angle finishes, never
-  re-read from the run directory afterward; the post-angle compromise check
-  now also compares HEAD's own commit and branch, not just `git status`, so
-  a reproduction that commits, checks out, or hard-resets — each of which
-  can leave the tree looking clean again — is still caught and cascades the
-  same way residue does; and a `--from-dir` merge reads `<angle>.skipped.txt`
-  defensively (never following a symlink, never trusting content outside
-  its own known cause tokens).
-- **Auth rotation, cache-root ancestry, and two more isolation gaps
-  closed.** A `-c projects."<root>".trust_level="untrusted"` override was
-  tried, live, as a way to run every angle against the real `CODEX_HOME`
-  directly instead of copying `auth.json` per angle — rejected: it left an
-  already-trusted project still loading its own `config.toml`, and
-  separately failed to grant trust to one with no persisted entry, on
-  codex-cli 0.145.0. Copying stays, with a fix: a file-backed ChatGPT
-  login's mid-run token rotation now propagates back to the real
-  `CODEX_HOME` (locked, only when changed) before each angle's throwaway
-  copy is deleted, instead of stranding the rotated token there. The
-  sandbox-writable-root check the default run directory and every
-  throwaway `CODEX_HOME` rely on now rejects a candidate that's a
-  *descendant* of `tempfile.gettempdir()`/`$TMPDIR`/`/tmp`/`/var/tmp`, not
-  only an exact match — an `XDG_CACHE_HOME` pointed inside one of those
-  used to pass through. A reused `--dir`'s broad stale-artifact clear now
-  compares only the same provenance fields the per-angle backstop already
-  does (plan hash, resolved base and its commit, angle-prompt template
-  hash) instead of the whole run record, so HEAD moving alone between two
-  runs sharing a `--dir` — a commit made in response to the first run's own
-  findings, say — no longer wipes an angle `--only` left out of the second
-  run. And throwaway `CODEX_HOME` creation itself now happens inside the
-  same in-flight window Popen already used, so a worker cancelled at
-  exactly the wrong moment never creates one at all.
-- **`--strict-config` on every `codex exec` call, a `--plan` sandbox-
-  writable-root warning, and locale-independent file I/O.** A codex-cli build
-  that doesn't recognize one of the `-c` isolation keys above silently
-  ignores it rather than erroring — `--strict-config` (codex-cli 0.145.0 or
-  newer; verified live against that version with the full current argv)
-  turns that into a startup failure instead. `main()` now also warns on
-  stderr when an incoming `--plan` sits under a sandbox-writable root while
-  the plan has a workspace-write angle — the same hazard class the existing
-  `--dir` refusal covers: a plan file kept there is exactly what an earlier
-  round's reproduction could have altered before a later rerun loads it
-  again. And every `read_text()`/`open()`/`fdopen()` this runner uses for a
-  plan, prompt, metadata, or artifact file now passes `encoding="utf-8"`
-  explicitly rather than depending on the host's preferred encoding — under
-  `LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0` that default falls back to
-  ASCII, and a plan or prompt holding anything outside it (an em dash) used
-  to raise `UnicodeDecodeError` and crash the run instead of merging.
-- **Planning is documented as untrusted-code execution, not exempt from
-  it.** SKILL.md's planning step now says plainly that the ambient agent
-  running it may already have loaded the branch under review's own
-  `AGENTS.md`/`CLAUDE.md`/repo-scoped skills as its own instructions before
-  planning even starts — the same branch the plan is about to judge — and
-  names a `--plan-with-codex` runner mode, giving planning the identical
-  isolation every angle already gets, as the recommended fix (not yet
-  implemented here). Until it exists, this path is restricted to checkouts
-  already trusted, repo instruction files and skills are treated as data
-  under review, and every re-run in a round-trip is told to switch `--plan`/
-  `--dir` to the run directory's own protected copy after the first run,
-  instead of reusing the original plan path a write-capable angle can reach.
+- **Requires** `python3` 3.9+ (stdlib only) and codex-cli **0.145.0+**.
+- **The branch under review is trusted** — this reviews your own branches
+  pre-push, so the runner is thin and the value sits in the angle prompts.
+  `-c project_doc_max_bytes=0` and `-c skills.include_instructions=false` stay
+  on every call anyway, for independence of judgment rather than security, with
+  `--strict-config` so an unrecognized key fails loudly instead of leaving an
+  angle unisolated.
+- **Sandbox mode is run-wide:** `-s read-only` unless `--allow-writes`, which
+  also prints `git status --porcelain` when done. A plan's per-angle
+  `execution` field is advisory.
+- Reviewers run in their own process group, so a timeout or Ctrl-C reaps what
+  they spawned; both signals exit `130`.
 
 ## 1.0.0
 

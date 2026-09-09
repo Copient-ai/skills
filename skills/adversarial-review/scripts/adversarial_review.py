@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Bump alongside adversarial-review.sh's ADVERSARIAL_REVIEW_VERSION — the two
 # must always match (the test suite checks this).
-VERSION = "1.2.0"
+VERSION = "1.1.0"
 PROG = "adversarial-review"
 
 CODEX_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-5.6-sol")

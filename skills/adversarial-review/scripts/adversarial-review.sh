@@ -85,7 +85,7 @@ set -euo pipefail
 
 # Bump on every change to CLI/output behaviour. Kept equal to VERSION in
 # adversarial_review.py — an installed copy can be checked with --version.
-ADVERSARIAL_REVIEW_VERSION="1.2.0"
+ADVERSARIAL_REVIEW_VERSION="1.1.0"
 
 # Single pass over the raw args: answer --version/--help immediately, and
 # note whether --from-dir or --print-base was given (codex is not needed in
