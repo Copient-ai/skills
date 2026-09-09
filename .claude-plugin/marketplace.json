@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "copient",
-      "description": "Local review→fix loops that converge a branch before you push it: an OpenAI Codex reviewer and an isolated-subagent Claude reviewer.",
+      "description": "Local review→fix loops that converge a branch before you push it: an OpenAI Codex reviewer, an isolated-subagent Claude reviewer, and an adversarial planning pass that derives falsifiable attack angles from the diff.",
       "author": {
         "name": "Copient AI",
         "url": "https://github.com/Copient-ai"

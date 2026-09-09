@@ -41,3 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: shellcheck --severity=warning skills/codex-review-loop/scripts/*.sh
+
+  review-loop-config:
+    # adversarial-review's own regression suite, plus its lint pass
+    # (shellcheck over both skills' scripts and a Python compile check) —
+    # sourced straight from .review-loop.json's "test" and "lint" commands
+    # (the same file codex-review-loop/pr-review-loop read at runtime to
+    # find this project's own checks), instead of retyping those command
+    # strings here, so this workflow and that config file can never drift
+    # apart.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run .review-loop.json's "test" command
+        run: python3 -c "import json,subprocess,sys; sys.exit(subprocess.call(json.load(open('.review-loop.json'))['test'], shell=True))"
+      - name: Run .review-loop.json's "lint" command
+        run: python3 -c "import json,subprocess,sys; sys.exit(subprocess.call(json.load(open('.review-loop.json'))['lint'], shell=True))"

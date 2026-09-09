@@ -1,11 +1,41 @@
 # Changelog
 
-Versions here track `codex-review.sh`'s parser, which is what `--version`
-reports. Compare it against your install before trusting a clean verdict:
+Versions here track the plugin. Each helper script reports its own
+parser/runner version via `--version` — compare it against your install
+before trusting a clean verdict:
 
 ```bash
 bash <skill-dir>/scripts/codex-review.sh --version
+bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
+
+## 1.1.0
+
+`codex-review.sh`'s parser is unchanged — it still reports `1.0.0`, and
+`codex-review-loop` and `pr-review-loop` are byte-identical to their 1.0.0
+release.
+
+New skill: `adversarial-review`, runner version `1.1.0`. Where the other two
+converge a generic review, this one plans first: a serialized planning phase
+reads the diff, derives what the branch promises, and turns each promise into
+up to 6 falsifiable attack angles — no fixed checklist, and no minimum. Each
+angle then runs as its own ephemeral `codex exec` in parallel, `--output-schema`
+enforcing a reproduction per finding, merged into one compact block; `UNPARSED`
+and `BLOCKED` angles never count as clean. An optional Claude pass per angle
+reuses `pr-review-loop`'s reviewer contract.
+
+- **Requires** `python3` 3.9+ (stdlib only) and codex-cli **0.145.0+**.
+- **The branch under review is trusted** — this reviews your own branches
+  pre-push, so the runner is thin and the value sits in the angle prompts.
+  `-c project_doc_max_bytes=0` and `-c skills.include_instructions=false` stay
+  on every call anyway, for independence of judgment rather than security, with
+  `--strict-config` so an unrecognized key fails loudly instead of leaving an
+  angle unisolated.
+- **Sandbox mode is run-wide:** `-s read-only` unless `--allow-writes`, which
+  also prints `git status --porcelain` when done. A plan's per-angle
+  `execution` field is advisory.
+- Reviewers run in their own process group, so a timeout or Ctrl-C reaps what
+  they spawned; both signals exit `130`.
 
 ## 1.0.0
 

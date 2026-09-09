@@ -2,16 +2,18 @@
 
 Public, project-agnostic developer skills from [Copient AI](https://github.com/Copient-ai).
 
-Two so far, and they are one idea reviewed by two different models: a
+Three so far. Two are one idea reviewed by two different models: a
 **review → fix → re-review** loop on your branch, run locally, that keeps the
 review's bulk out of your working context. No PR, no push, no GitHub round-trip.
+The third plans a targeted review first, then runs that same loop angle by angle.
 
 | Skill | Reviewer | Runs on |
 |---|---|---|
 | `codex-review-loop` | OpenAI Codex, via the `codex` CLI | **Any agent that can run bash** |
 | `pr-review-loop` | Claude, in an isolated subagent | **Claude Code only** |
+| `adversarial-review` | OpenAI Codex per angle, optionally Claude | **Any agent that can run bash** (Claude pass needs Claude Code) |
 
-Run both before a PR — they surface different classes of problem.
+Run all three before a PR — they surface different classes of problem.
 
 `pr-review-loop`'s host requirement is not packaging trivia. Its isolation *is*
 the `Task` subagent; on an agent without subagents the review runs in your main
@@ -120,6 +122,32 @@ reviewed it. Silence it only for a copy outside any checkout:
 alongside, as above.
 
 Approving a prompt is fine. Skipping the check to avoid one is not.
+
+## Adversarial review before the PR
+
+`adversarial-review` is a third loop, not a third generic reviewer. Its
+planning phase reads the diff itself and derives what *this* branch promises —
+nothing pre-baked — then turns each promise into a falsifiable attack angle.
+Each angle runs as its own parallel `codex exec` pass, findings enforced
+against a JSON schema so a reviewer hands back a reproduction, not prose.
+Optionally, each angle also gets an isolated Claude pass. Either way, findings
+go through the same verify → fix → re-review discipline as the other two
+skills.
+
+Host requirements: bash, git, and `python3` (3.9 or newer, stdlib only) on `PATH`, plus the
+`codex` CLI as above. The optional Claude pass needs Claude Code — same
+`Task`-subagent-is-the-isolation reason as `pr-review-loop`.
+
+```bash
+bash ~/.claude/skills/adversarial-review/scripts/adversarial-review.sh --version
+# adversarial-review.sh 1.1.0
+
+bash ~/.claude/skills/adversarial-review/scripts/test-adversarial-review.sh
+# ALL PASS
+```
+
+Same permission story as the helper script above: only the plugin-root copy
+is pre-approved, for the same reason — see Permissions.
 
 ## Staying current
 

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "base": "origin/main",
+  "promise": "Ships a working thing without breaking anything else.",
+  "contracts": ["The public API keeps its documented behavior."],
+  "invariants": ["No request can bypass authentication."],
+  "angles": [
+    {
+      "id": "alpha",
+      "title": "Alpha angle",
+      "mandate": "Look for logic bugs.",
+      "evidence": "A concrete failing input.",
+      "execution": "read-only"
+    },
+    {
+      "id": "beta",
+      "title": "Beta angle",
+      "mandate": "Look for security holes.",
+      "evidence": "A concrete exploit.",
+      "execution": "read-only"
+    },
+    {
+      "id": "gamma",
+      "title": "Gamma angle",
+      "mandate": "Look for contract violations.",
+      "evidence": "A concrete broken contract.",
+      "execution": "workspace-write"
+    }
+  ]
+}
