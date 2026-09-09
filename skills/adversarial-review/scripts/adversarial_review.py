@@ -162,7 +162,7 @@ def load_plan(path, drop_run=False):
     --from-dir needs "_run" left intact (it reads plan["_run"] back as
     expected_run_meta), so it never passes drop_run."""
     try:
-        text = Path(path).read_text()
+        text = Path(path).read_text(encoding="utf-8")
     except OSError as e:
         env_error(f"cannot read plan file {path}: {e}")
     try:
@@ -474,10 +474,10 @@ def load_angle_prompt_template(path_arg, script_dir):
         candidate = Path(path_arg)
         if not candidate.is_file():
             env_error(f"no such angle prompt template: {candidate}")
-        return candidate.read_text()
+        return candidate.read_text(encoding="utf-8")
     default_path = script_dir.parent / "angle-prompt.md"
     if default_path.is_file():
-        return default_path.read_text()
+        return default_path.read_text(encoding="utf-8")
     return DEFAULT_ANGLE_PROMPT
 
 
@@ -639,7 +639,7 @@ def log_refused(log_path):
     the prompt, rather than the angle crashing or misbehaving on its own."""
     if not log_path.is_file():
         return False
-    text = log_path.read_text(errors="replace").lower()
+    text = log_path.read_text(encoding="utf-8", errors="replace").lower()
     return any(marker in text for marker in REFUSAL_MARKERS)
 
 
@@ -674,8 +674,8 @@ def _read_skip_marker(skipped_path):
     if not stat.S_ISREG(st.st_mode):
         return "badmarker"
     try:
-        text = skipped_path.read_text().strip()
-    except OSError:
+        text = skipped_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
         return "badmarker"
     return text if text in _KNOWN_SKIP_CAUSES else "badmarker"
 
@@ -725,8 +725,8 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
         if not meta_path.is_file():
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
         try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, json.JSONDecodeError):
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
         if not isinstance(meta, dict) or any(
             meta.get(k) != expected_run_meta.get(k) for k in STABLE_RUN_META_FIELDS
@@ -740,7 +740,10 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
     # earlier run, or partially written mid-crash.
     if not status_path.is_file():
         return AngleResult(aid, angle["title"], "UNPARSED", cause="nostatus")
-    status_text = status_path.read_text().strip()
+    try:
+        status_text = status_path.read_text(encoding="utf-8").strip()
+    except UnicodeDecodeError:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="nostatus")
     try:
         exit_code = int(status_text)
     except ValueError:
@@ -1268,7 +1271,7 @@ def write_artifact_text(path, text):
         if e.errno == errno.ELOOP:
             env_error(f"refusing to write through a symlink: {path}")
         raise
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
 
 
@@ -1920,6 +1923,14 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     angle_env["CODEX_HOME"] = str(codex_home)
     cmd = [
         CODEX_BIN, "exec", "--ephemeral",
+        # A codex-cli build that doesn't recognize one of the -c keys below
+        # (an older release, a key renamed upstream) silently ignores it
+        # rather than erroring, so an isolation knob could fail open with no
+        # sign anything was skipped. --strict-config turns that into a
+        # startup error instead. Verified live against codex-cli 0.145.0:
+        # the full argv below, every current -c key included, is accepted
+        # under this flag (see SKILL.md's minimum-version note).
+        "--strict-config",
         "-s", angle["execution"],
         "-C", root,
         "--output-schema", str(schema_path),
@@ -1956,10 +1967,11 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         # feature flag `codex features list` exposes) left it unchanged.
         # `-c skills.include_instructions=false` is the knob that actually
         # works — with it, `codex debug prompt-input`'s output no longer
-        # contains a "## Skills" section or the repo's skill at all (checked
-        # under `--strict-config`, which also confirms `skills.include_
-        # instructions` — unlike guesses such as `skills.enabled` — is a
-        # real `SkillsConfig` field, not silently ignored). It disables
+        # contains a "## Skills" section or the repo's skill at all,
+        # confirmed under the `--strict-config` flag added above (which
+        # also confirms `skills.include_instructions` — unlike guesses such
+        # as `skills.enabled` — is a real `SkillsConfig` field, not one
+        # that flag would catch as unrecognized). It disables
         # every skill, global and project alike, not just the repo-local
         # one — acceptable here since a reviewer angle has no legitimate use
         # for any skill at all.
@@ -2372,6 +2384,30 @@ def main(argv=None):
             angles_by_id[aid]["execution"] == "workspace-write" for aid in angle_ids
         )
 
+        # --plan itself, not just --dir (see the sandbox-writable --dir
+        # refusal below), can sit somewhere a workspace-write angle's own
+        # reproduction can reach: a plan kept under $TMPDIR/tmp/var-tmp for
+        # reuse across rounds is exactly what an earlier round's
+        # reproduction could have altered before this rerun ever loads it
+        # again. Unlike --dir this is a warning, not a refusal — the run
+        # directory already receives its own protected copy of this same
+        # content as plan.json (see below), so the operator has a safe
+        # path (--plan <DIR>/plan.json) to switch to without this run
+        # itself needing to be blocked.
+        if has_write_capable:
+            for sandbox_root in _sandbox_writable_roots():
+                if plan_path.is_relative_to(Path(sandbox_root)):
+                    print(
+                        f"{PROG}: warning: --plan {plan_path} sits under a "
+                        f"sandbox-writable root ({sandbox_root}) while this plan has "
+                        "a workspace-write angle — an earlier round's reproduction "
+                        "could have altered it before this rerun; once a run "
+                        "directory exists, point --plan at its own plan.json copy "
+                        "instead (--plan <DIR>/plan.json)",
+                        file=sys.stderr,
+                    )
+                    break
+
         global CODEX_BIN
         resolved_codex_bin = shutil.which(CODEX_BIN)
         if resolved_codex_bin is None:
@@ -2564,8 +2600,8 @@ def main(argv=None):
         old_plan_path = run_dir / "plan.json"
         if old_plan_path.is_file():
             try:
-                old_doc = json.loads(old_plan_path.read_text())
-            except (OSError, json.JSONDecodeError):
+                old_doc = json.loads(old_plan_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 old_doc = None
             old_ids = set()
             if isinstance(old_doc, dict) and isinstance(old_doc.get("angles"), list):

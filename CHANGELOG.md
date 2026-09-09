@@ -79,6 +79,34 @@ into a falsifiable attack angle. It adds:
   run. And throwaway `CODEX_HOME` creation itself now happens inside the
   same in-flight window Popen already used, so a worker cancelled at
   exactly the wrong moment never creates one at all.
+- **`--strict-config` on every `codex exec` call, a `--plan` sandbox-
+  writable-root warning, and locale-independent file I/O.** A codex-cli build
+  that doesn't recognize one of the `-c` isolation keys above silently
+  ignores it rather than erroring — `--strict-config` (codex-cli 0.145.0 or
+  newer; verified live against that version with the full current argv)
+  turns that into a startup failure instead. `main()` now also warns on
+  stderr when an incoming `--plan` sits under a sandbox-writable root while
+  the plan has a workspace-write angle — the same hazard class the existing
+  `--dir` refusal covers: a plan file kept there is exactly what an earlier
+  round's reproduction could have altered before a later rerun loads it
+  again. And every `read_text()`/`open()`/`fdopen()` this runner uses for a
+  plan, prompt, metadata, or artifact file now passes `encoding="utf-8"`
+  explicitly rather than depending on the host's preferred encoding — under
+  `LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0` that default falls back to
+  ASCII, and a plan or prompt holding anything outside it (an em dash) used
+  to raise `UnicodeDecodeError` and crash the run instead of merging.
+- **Planning is documented as untrusted-code execution, not exempt from
+  it.** SKILL.md's planning step now says plainly that the ambient agent
+  running it may already have loaded the branch under review's own
+  `AGENTS.md`/`CLAUDE.md`/repo-scoped skills as its own instructions before
+  planning even starts — the same branch the plan is about to judge — and
+  names a `--plan-with-codex` runner mode, giving planning the identical
+  isolation every angle already gets, as the recommended fix (not yet
+  implemented here). Until it exists, this path is restricted to checkouts
+  already trusted, repo instruction files and skills are treated as data
+  under review, and every re-run in a round-trip is told to switch `--plan`/
+  `--dir` to the run directory's own protected copy after the first run,
+  instead of reusing the original plan path a write-capable angle can reach.
 
 ## 1.0.0
 

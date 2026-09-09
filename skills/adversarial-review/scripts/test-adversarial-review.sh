@@ -2285,6 +2285,51 @@ check "writer1's throwaway CODEX_HOME was already removed before writer2's codex
 
 rm -rf "$rundir29c"
 
+# --- Case 29d: --strict-config is passed for every angle ----------------------
+# Security regression (item 3): a codex-cli build that doesn't recognize one
+# of the -c keys above (an older release, a key renamed upstream) silently
+# ignores it rather than erroring, so an isolation knob (project_doc_max_bytes,
+# skills.include_instructions) could fail open on such a build with no sign
+# anything was skipped. run_angle now always includes "--strict-config" in
+# the codex exec argv it builds, for every angle regardless of execution
+# mode. Same per-angle, per-execution-mode shape as case 29, but --strict-
+# config is a bare flag (no paired value), so the search just looks for the
+# literal token rather than a "-c"/value pair.
+repo29d=$(make_throwaway_repo strict-config-flag)
+plan29d="$tmpdir/strict-config-flag-plan.$$.${RANDOM:-0}.json"
+cat > "$plan29d" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+
+for aid29d in alpha beta; do
+  argvdir29d="$tmpdir/argv-log-strict-config-$aid29d.$$.${RANDOM:-0}"
+  rundir29d="$safe_tmpdir/strict-config-$aid29d-run.$$.${RANDOM:-0}"
+  out29d=$(cd "$repo29d" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29d" \
+    bash "$SH" --plan "$plan29d" --base main --dir "$rundir29d" --only "$aid29d" 2>&1); rc29d=$?
+  echo "--- case 29d: --strict-config is present for angle '$aid29d' (execution=$([ "$aid29d" = alpha ] && echo read-only || echo workspace-write)) ---"
+  printf '%s\n' "$out29d"
+
+  check "angle '$aid29d' run exits 0" test "$rc29d" -eq 0
+  check "angle '$aid29d' verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out29d"
+
+  found29d=false
+  for f in "$argvdir29d"/[0-9]*; do
+    [ -e "$f" ] || continue
+    if [ "$(cat "$f")" = "--strict-config" ]; then
+      found29d=true
+      break
+    fi
+  done
+  check "angle '$aid29d''s codex exec argv includes --strict-config" \
+    test "$found29d" = true
+
+  rm -rf "$rundir29d"
+done
+
 # --- Case 30: a reused --dir with a changed plan + --only never leaks an -------
 # unselected angle's stale verdict into a later --from-dir merge
 # Regression: run_angle now stamps each angle's own <aid>.meta.json with the
@@ -3725,6 +3770,46 @@ check "the real CODEX_HOME's auth.json no longer carries the pre-rotation token"
   bash -c '! grep -q "pre-rotation-token" "$1"' _ "$fakerealhome51/auth.json"
 
 rm -rf "$rundir51"
+
+# --- Case 52: every text read/write is locale-independent (item 4) ------------
+# Regression: every read_text()/open(...)/fdopen(...) this runner uses for a
+# plan, prompt, metadata, or artifact file now passes encoding="utf-8"
+# explicitly, rather than depending on locale.getpreferredencoding(). Under
+# LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 (C-locale coercion and UTF-8
+# mode both disabled), that default falls back to ASCII, so load_plan()'s
+# own read of plan.json used to raise UnicodeDecodeError -- not caught by
+# its "except OSError" -- and crash the run instead of merging, the moment
+# the plan held anything outside ASCII. Reruns the suite's own basic
+# --from-dir case (case 1's all-clean fixture, staged fresh here so case 1
+# itself is untouched) with an em dash spliced into plan.json's "promise"
+# field, under that exact hostile locale.
+dir52=$(stage all-clean)
+python3 - "$dir52/plan.json" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    doc = json.load(f)
+doc["promise"] = "Ships a thing — nothing more, nothing less."
+with open(path, "w", encoding="utf-8") as f:
+    # ensure_ascii=False -- the whole point is a literal, un-escaped em
+    # dash (UTF-8 bytes \xe2\x80\x94) sitting in plan.json on disk. The
+    # default, ensure_ascii=True, backslash-escapes it to six plain-ASCII
+    # characters instead, which decodes under any single-byte codec fine
+    # and would never exercise the bug this case regresses.
+    json.dump(doc, f, ensure_ascii=False)
+PYEOF
+
+out52=$(LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 bash "$SH" --from-dir "$dir52" 2>&1); rc52=$?
+echo "--- case 52: --from-dir under LC_ALL=C/PYTHONUTF8=0/PYTHONCOERCECLOCALE=0 with a non-ASCII plan ---"
+printf '%s\n' "$out52"
+
+check "exits 0" test "$rc52" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out52"
+check "counts show all 3 ran, none blocked/unparsed" \
+  grep -qx "ANGLES=3  RAN=3  BLOCKED=0  UNPARSED=0" <<<"$out52"
+check "merged.json was written" test -f "$dir52/merged.json"
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh
