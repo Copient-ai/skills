@@ -32,10 +32,13 @@ into a falsifiable attack angle. It adds:
   angles are never counted as clean, even when the rest of the run reports
   `CLEAN`.
 - A new host requirement: `python3` (stdlib only) on `PATH`, for the runner.
-- **Branch-owned instructions are never loaded.** Each Codex pass runs with
-  `project_doc_max_bytes=0`, so the reviewed branch's own `AGENTS.md` cannot
-  tell the reviewer what to conclude; the Claude pass is told to read such
-  files as part of the diff, never as instructions.
+- **Branch-owned instructions and configuration are never loaded.** Each
+  Codex pass runs with `project_doc_max_bytes=0` and under a throwaway
+  `CODEX_HOME` holding only a copy of `auth.json`, so the reviewed branch's
+  own `AGENTS.md` and `.codex/config.toml` (hooks, MCP servers, exec policy)
+  cannot steer the reviewer even on a checkout the user has marked trusted;
+  the Claude pass is told to read such files as part of the diff, never as
+  instructions.
 
 ## 1.0.0
 

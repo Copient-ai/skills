@@ -22,6 +22,7 @@ Exit codes (same contract as the .sh wrapper):
      process group is killed before exiting.
 """
 import argparse
+import atexit
 import concurrent.futures as cf
 import json
 import os
@@ -52,6 +53,10 @@ BLOCKING_SEVERITIES = ("P0", "P1")
 SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 EXECUTIONS = ("read-only", "workspace-write")
 ANGLE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# SKILL.md documents 3-6 angles per plan (a generic angle gets dropped, not
+# kept as padding); only the upper bound is enforced here — a malformed plan
+# past it launches one paid codex pass per entry.
+MAX_ANGLES = 6
 
 TOP_REQUIRED = {"angle", "verdict", "summary", "findings"}
 FINDING_REQUIRED = {"severity", "path", "line", "claim", "evidence", "reproduction"}
@@ -165,6 +170,12 @@ def validate_plan(data, source):
     angles = data.get("angles")
     if not isinstance(angles, list) or not angles:
         usage_error(f"plan {source} must have a non-empty 'angles' array")
+    if len(angles) > MAX_ANGLES:
+        usage_error(
+            f"plan {source} has {len(angles)} angles, more than the max of "
+            f"{MAX_ANGLES} (see SKILL.md's 3-to-6 cap: drop a generic angle "
+            "rather than pad the plan)"
+        )
     seen_ids = set()
     for a in angles:
         if not isinstance(a, dict):
@@ -1043,6 +1054,14 @@ def kill_process_group(proc, grace_sec=2):
 _LIVE_PROCS_LOCK = threading.Lock()
 _LIVE_PROCS = []
 
+# Set once by main() (live-run mode only) right after make_throwaway_codex_home
+# creates the run's throwaway CODEX_HOME — the directory _kill_all_and_exit
+# below must also remove on an interrupt, since os._exit bypasses atexit
+# handlers entirely (main() additionally registers an atexit cleanup for the
+# ordinary sys.exit paths). Read-only outside of that one assignment; never
+# locked, same as _LIVE_PROCS's own handler-side reads.
+_THROWAWAY_CODEX_HOME = None
+
 # One sentinel per Popen call currently between "returned" and "registered in
 # _LIVE_PROCS" — appended immediately before Popen, removed immediately after
 # _track_proc completes (see run_angle). Closes the same spawn/track race
@@ -1103,6 +1122,12 @@ def _kill_all_and_exit(exit_fn=None):
     procs = list(_LIVE_PROCS)
     for proc in procs:
         kill_process_group(proc)
+    # os._exit below bypasses atexit entirely, so the run's throwaway
+    # CODEX_HOME (holding a copy of the user's auth.json — see
+    # make_throwaway_codex_home) would otherwise survive an interrupted run
+    # forever instead of being cleaned up like every other exit path.
+    if _THROWAWAY_CODEX_HOME is not None:
+        shutil.rmtree(_THROWAWAY_CODEX_HOME, ignore_errors=True)
     print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
     sys.stderr.flush()
     (exit_fn or os._exit)(130)
@@ -1173,7 +1198,51 @@ def _mark_interrupted(aid, run_dir):
     (run_dir / f"{aid}.skipped.txt").write_text("interrupted\n")
 
 
-def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
+def make_throwaway_codex_home():
+    """Creates a fresh, empty CODEX_HOME containing only a copy of the real
+    one's auth.json, and returns its Path.
+
+    Security fix, not a convenience: `codex exec -C <root>` on a *trusted*
+    checkout (`[projects."<root>"] trust_level = "trusted"` in the real
+    CODEX_HOME's config.toml — set once a person accepts the interactive
+    trust prompt for that path, in any unrelated session, at any time in the
+    past) loads that checkout's own `.codex/config.toml` — hooks, MCP
+    servers, exec-policy rules, model overrides — ahead of every angle's
+    prompt. All of it is branch-controlled, same hazard class as the
+    AGENTS.md-loading `project_doc_max_bytes=0` guards against just above.
+    Verified empirically against codex-cli 0.145.0: a throwaway repo with a
+    `.codex/config.toml` setting `model_reasoning_effort = "minimal"` left
+    `codex exec`'s own header reading `reasoning effort: xhigh` (the
+    ambient CODEX_HOME's own setting) while the project was untrusted, and
+    `reasoning effort: minimal` — the repo-local value, loaded and applied —
+    the moment a throwaway CODEX_HOME's config.toml marked the same path
+    trusted; a CODEX_HOME holding only a copy of auth.json (no config.toml
+    at all) authenticated and ran normally while leaving the header back at
+    the built-in default, proving the project's own config was not loaded.
+    `--ephemeral` (already passed for every angle) means no session state
+    needs to survive between runs, so a brand new CODEX_HOME each run costs
+    nothing beyond re-fetching the model catalog.
+
+    Never touches the real CODEX_HOME/~/.codex — only reads its auth.json.
+    Best-effort on the copy's permissions (chmod 600); a missing auth.json
+    is not fatal here — some setups authenticate purely via an environment
+    variable this process's own environ (inherited by every angle's Popen
+    call) already carries, so the throwaway, otherwise-empty CODEX_HOME
+    still closes off project-local config for them too."""
+    real_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    throwaway = Path(tempfile.mkdtemp(prefix="adversarial-review-codex-home."))
+    real_auth = real_home / "auth.json"
+    if real_auth.is_file():
+        dest_auth = throwaway / "auth.json"
+        shutil.copyfile(real_auth, dest_auth)
+        try:
+            os.chmod(dest_auth, 0o600)
+        except OSError:
+            pass
+    return throwaway
+
+
+def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home):
     """Returns (error, spawned): error is None on a clean run, else a
     message; spawned is True once Popen has actually started the codex
     process, regardless of what happens afterward. A caller running
@@ -1191,6 +1260,15 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
     out_path = run_dir / f"{aid}.out.json"
     log_path = run_dir / f"{aid}.log"
+    # Every other environment variable passes through unchanged (an
+    # OPENAI_API_KEY-based auth setup, proxy settings, ...) — only CODEX_HOME
+    # is overridden, to the run's own throwaway one (see
+    # make_throwaway_codex_home) so this angle can never see the real
+    # CODEX_HOME's own config.toml, in particular any `[projects.<root>]
+    # trust_level = "trusted"` entry that would let `-C root` below load
+    # root's own repo-local .codex/config.toml.
+    angle_env = dict(os.environ)
+    angle_env["CODEX_HOME"] = str(codex_home)
     cmd = [
         CODEX_BIN, "exec", "--ephemeral",
         "-s", angle["execution"],
@@ -1207,7 +1285,10 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         # discovery — verified against codex-cli 0.145.0 with `codex debug
         # prompt-input`, which shows the "# AGENTS.md instructions for
         # <dir>" block disappear from the model-visible prompt at this
-        # setting.
+        # setting. The throwaway CODEX_HOME set below (see angle_env) closes
+        # the remaining project-local surface this alone doesn't: a trusted
+        # checkout's own .codex/config.toml (hooks, MCP servers, exec-policy
+        # rules, model overrides).
         "-c", "project_doc_max_bytes=0",
         # The option terminator: a rendered prompt is arbitrary text a plan
         # or a custom --angle-prompt template controls, not this runner —
@@ -1246,7 +1327,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             try:
                 proc = subprocess.Popen(
                     cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                    cwd=root, start_new_session=True,
+                    cwd=root, start_new_session=True, env=angle_env,
                 )
                 spawned = True
                 _track_proc(proc)
@@ -1318,7 +1399,7 @@ def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
     synthetic_results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
 
 
-def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec):
+def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home):
     """Runs workspace-write angles one at a time against the shared checkout
     (never concurrently with each other or with a read-only angle — see
     partition_angles: isolating them in a git worktree was rejected because
@@ -1370,7 +1451,7 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
             continue
         err, spawned = run_angle(
             aid, angles_by_id[aid], plan, base_resolved, template,
-            run_dir, root, schema_path, timeout_sec,
+            run_dir, root, schema_path, timeout_sec, codex_home,
         )
         if err is not None:
             spawn_failures.append((aid, err))
@@ -1471,6 +1552,18 @@ def main(argv=None):
         # cwd is still the invocation directory, makes it unambiguous.
         CODEX_BIN = os.path.abspath(resolved_codex_bin)
 
+        # One throwaway CODEX_HOME for the whole run (every angle, parallel
+        # and serial alike, shares it) — see make_throwaway_codex_home for
+        # why. Registered for cleanup immediately, before any angle can
+        # spawn: atexit covers every ordinary sys.exit path below (a usage
+        # or environment error, a spawn-failure abort, the normal return),
+        # and the global lets _kill_all_and_exit clean it up on an interrupt
+        # too, since os._exit bypasses atexit.
+        global _THROWAWAY_CODEX_HOME
+        codex_home = make_throwaway_codex_home()
+        _THROWAWAY_CODEX_HOME = codex_home
+        atexit.register(shutil.rmtree, codex_home, ignore_errors=True)
+
         root = repo_root()
         base = args.base or plan.get("base")
         if not base:
@@ -1487,6 +1580,18 @@ def main(argv=None):
             usage_error("--jobs must be >= 1")
         if args.timeout < 1:
             usage_error("--timeout must be >= 1")
+
+        # Every fallible input (plan and base are already validated above;
+        # this is the last one) is resolved before run_dir is even computed,
+        # let alone mutated — a reused --dir must never have its plan.json
+        # overwritten or its merged.json cleared only to then abort on a bad
+        # --angle-prompt, leaving the new plan paired with a previous run's
+        # stale <angle>.status/<angle>.out.json (cleared only later, in the
+        # per-angle loop below): a subsequent --from-dir would merge that
+        # mismatched pair and could report a false verdict for a run that
+        # never actually happened.
+        template = load_angle_prompt_template(args.angle_prompt, script_dir)
+        schema_path = script_dir / "findings.schema.json"
 
         if args.dir:
             # Resolved before mkdir and before any use in an -o path passed to
@@ -1524,9 +1629,6 @@ def main(argv=None):
         # like this run's own result.
         clear_merged_json(run_dir)
         (run_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-
-        template = load_angle_prompt_template(args.angle_prompt, script_dir)
-        schema_path = script_dir / "findings.schema.json"
 
         # Read-only angles don't write to the checkout, so they're safe to
         # race in the shared thread pool. workspace-write angles run against
@@ -1578,7 +1680,7 @@ def main(argv=None):
                 for aid in parallel_ids:
                     future_to_id[ex.submit(
                         run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
-                        run_dir, root, schema_path, args.timeout,
+                        run_dir, root, schema_path, args.timeout, codex_home,
                     )] = aid
                     if _CANCELLED:
                         break
@@ -1615,7 +1717,7 @@ def main(argv=None):
             serial_future = serial_ex.submit(
                 run_write_capable_angles,
                 serial_ids, angles_by_id, plan, base_resolved, template,
-                run_dir, root, schema_path, args.timeout,
+                run_dir, root, schema_path, args.timeout, codex_home,
             )
             synthetic_results, serial_spawn_failures = serial_future.result()
             serial_ex.shutdown(wait=True)

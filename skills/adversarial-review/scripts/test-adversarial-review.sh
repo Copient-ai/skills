@@ -221,6 +221,17 @@ printf '%s\n' "$err7g"
 check "id with trailing newline exits 2" test "$rc7g" -eq 2
 check "id with trailing newline names the problem" grep -qi "invalid angle id" <<<"$err7g"
 
+# Regression: SKILL.md documents a 3-to-6 angle plan (drop a generic angle
+# rather than pad the plan); validate_plan enforced no upper bound at all, so
+# a malformed 7+ angle plan launched one paid codex pass per entry instead of
+# failing fast at plan-validation time.
+dir7h=$(stage bad-plan-too-many-angles)
+err7h=$(bash "$SH" --from-dir "$dir7h" 2>&1); rc7h=$?
+echo "--- case 7h: more than 6 angles ---"
+printf '%s\n' "$err7h"
+check "7-angle plan exits 2 (usage/plan-validation)" test "$rc7h" -eq 2
+check "7-angle plan names the problem" grep -qi "more than the max of 6" <<<"$err7h"
+
 # --- Case 8: the block format is exact -----------------------------------------
 dir8=$(stage exact-format)
 out8=$(bash "$SH" --from-dir "$dir8")
@@ -676,6 +687,70 @@ echo "--- case 19c: git_status_porcelain sees untracked files despite status.sho
 printf '%s\n' "$untracked_check"
 check "an untracked file is reported even under status.showUntrackedFiles=no" \
   test "$untracked_check" = "OK"
+
+# --- Case 19d: a bad --angle-prompt on a reused --dir must not corrupt it ------
+# Regression: main() used to clear merged.json and overwrite run_dir/plan.json
+# with the new plan *before* validating --angle-prompt. A reused --dir whose
+# previous invocation completed normally, re-run with a typo'd
+# --angle-prompt, would exit on that typo only after plan.json had already
+# been replaced (and merged.json deleted) but before the per-angle
+# clear_stale_artifacts loop ran — leaving the new plan paired with the
+# *previous* run's <angle>.status/<angle>.out.json. A later --from-dir on
+# that directory would then merge the new (never-run) plan with the old
+# angle outputs and could report a false verdict for a run that never
+# happened. Every fallible input, --angle-prompt included, is now resolved
+# before run_dir is touched at all, so this aborts before plan.json,
+# merged.json, or any angle artifact is modified.
+repo19d=$(make_throwaway_repo bad-angle-prompt-reuse)
+rundir19d="$tmpdir/bad-angle-prompt-reuse-run.$$.${RANDOM:-0}"
+mkdir -p "$rundir19d"
+cat > "$rundir19d/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Mandate A — the plan that actually ran.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "Mandate A", "evidence": "e", "execution": "read-only"}]}
+EOF
+printf '0\n' > "$rundir19d/alpha.status"
+cat > "$rundir19d/alpha.out.json" <<'EOF'
+{"angle": "alpha", "verdict": "CLEAN", "summary": "the earlier valid run", "findings": []}
+EOF
+echo '{"version": 1, "verdict": "CLEAN", "counts": {}, "angles": [], "findings": []}' > "$rundir19d/merged.json"
+expected_plan19d="$tmpdir/bad-angle-prompt-reuse-planA-expected.$$.${RANDOM:-0}.json"
+cp "$rundir19d/plan.json" "$expected_plan19d"
+
+planB19d="$tmpdir/bad-angle-prompt-reuse-planB.$$.${RANDOM:-0}.json"
+cat > "$planB19d" <<'EOF'
+{"version": 1, "base": "main", "promise": "Mandate B — never actually ran.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "Mandate B", "evidence": "e", "execution": "read-only"}]}
+EOF
+
+err19d=$(cd "$repo19d" && CODEX_BIN=true bash "$SH" --plan "$planB19d" --base main \
+  --dir "$rundir19d" --angle-prompt "$tmpdir/no-such-angle-prompt-19d.md" 2>&1)
+rc19d=$?
+echo "--- case 19d: bad --angle-prompt on a reused --dir ---"
+printf '%s\n' "$err19d"
+
+check "bad --angle-prompt on live run exits 1 (environment error)" test "$rc19d" -eq 1
+check "bad --angle-prompt names the problem" \
+  grep -qi "no such angle prompt template" <<<"$err19d"
+check "plan.json in the reused dir is untouched (still plan A, never overwritten with plan B)" \
+  cmp -s "$rundir19d/plan.json" "$expected_plan19d"
+check "plan.json does not carry plan B's promise" \
+  bash -c '! grep -q "Mandate B" "$1"' _ "$rundir19d/plan.json"
+check "the earlier run's alpha.status is untouched" \
+  test "$(cat "$rundir19d/alpha.status")" = "0"
+check "the earlier run's alpha.out.json is untouched" \
+  grep -q "the earlier valid run" "$rundir19d/alpha.out.json"
+check "the earlier run's merged.json was not cleared" test -f "$rundir19d/merged.json"
+
+out19d=$(bash "$SH" --from-dir "$rundir19d" 2>&1); rc19d_merge=$?
+echo "--- case 19d: --from-dir after the failed reuse reflects the untouched, earlier run ---"
+printf '%s\n' "$out19d"
+check "--from-dir exits 0" test "$rc19d_merge" -eq 0
+check "--from-dir reports CLEAN for the actual (plan A) run that happened, not a false verdict for plan B" \
+  grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out19d"
+check "--from-dir's summary is the earlier run's own, not something implying plan B ran" \
+  grep -qF "the earlier valid run" <<<"$out19d"
+
+rm -rf "$rundir19d"
 
 # --- Case 20: --from-dir must never write merged.json into a real checkout -----
 # Regression: pointed directly at fixtures/all-clean (part of this repo, not
@@ -1900,7 +1975,7 @@ with tempfile.TemporaryDirectory() as d:
     run_dir = Path(d)
     err, spawned = ar.run_angle(
         "alpha", angle, plan, "main", "template {{ANGLE_ID}}",
-        run_dir, "/tmp", "schema.json", 5,
+        run_dir, "/tmp", "schema.json", 5, Path("/tmp/unused-codex-home"),
     )
     result = ar.collect_angle_result(angle, run_dir)
     ok = (
@@ -1972,6 +2047,81 @@ for aid29 in alpha beta; do
     test "$found29" = true
 
   rm -rf "$rundir29"
+done
+
+# --- Case 29b: each angle's codex exec gets an isolated, throwaway CODEX_HOME --
+# Security regression: `codex exec -C <root>` on a checkout the *real*
+# CODEX_HOME's config.toml marks trusted (a `[projects."<root>"]
+# trust_level = "trusted"` entry, set once by accepting the interactive
+# trust prompt in any unrelated session, at any point in the past) loads
+# that checkout's own repo-local .codex/config.toml -- hooks, MCP servers,
+# exec-policy rules, model overrides, all branch-controlled, same hazard
+# class as the AGENTS.md guard project_doc_max_bytes=0 closes above.
+# Verified empirically against codex-cli 0.145.0 (see
+# make_throwaway_codex_home's docstring): a throwaway repo's
+# .codex/config.toml setting model_reasoning_effort = "minimal" left `codex
+# exec`'s own startup header reading the *ambient* CODEX_HOME's setting
+# while the project was untrusted, and switched to "minimal" -- the
+# repo-local value, loaded and applied -- the instant a CODEX_HOME's
+# config.toml marked that same path trusted; a CODEX_HOME holding only a
+# copy of auth.json (no config.toml at all) authenticated normally while
+# leaving the header at the built-in default. run_angle now overrides
+# CODEX_HOME, per angle, to a fresh run-scoped throwaway directory holding
+# only a copy of the real auth.json (see make_throwaway_codex_home) --
+# closing that surface regardless of what the real CODEX_HOME's config.toml
+# says about the checkout under review.
+#
+# CODEX_HOME=$fakerealhome29b simulates "the real one" for this test alone
+# (never the actual developer machine's ~/.codex); fake-codex-argv-log.sh's
+# env_CODEX_HOME log (added alongside its argv log) reveals exactly what
+# CODEX_HOME each angle's codex exec process actually saw. Checks both
+# execution modes, one angle at a time via --only, same as case 29.
+repo29b=$(make_throwaway_repo codex-home-isolation)
+plan29b="$tmpdir/codex-home-isolation-plan.$$.${RANDOM:-0}.json"
+cat > "$plan29b" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+fakerealhome29b="$tmpdir/fake-real-codex-home.$$.${RANDOM:-0}"
+mkdir -p "$fakerealhome29b"
+echo '{"marker": "the-real-users-auth"}' > "$fakerealhome29b/auth.json"
+# A separate reference copy, diffed against after each run below, so
+# "the ambient CODEX_HOME's auth.json was never touched" is a plain file
+# comparison rather than a hand-quoted content check.
+expected_auth29b="$tmpdir/fake-real-codex-home-auth-expected.$$.${RANDOM:-0}.json"
+cp "$fakerealhome29b/auth.json" "$expected_auth29b"
+
+for aid29b in alpha beta; do
+  argvdir29b="$tmpdir/argv-log-codex-home-$aid29b.$$.${RANDOM:-0}"
+  rundir29b="$tmpdir/codex-home-isolation-$aid29b-run.$$.${RANDOM:-0}"
+  out29b=$(cd "$repo29b" && CODEX_HOME="$fakerealhome29b" \
+    CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29b" \
+    bash "$SH" --plan "$plan29b" --base main --dir "$rundir29b" --only "$aid29b" 2>&1)
+  rc29b=$?
+  echo "--- case 29b: isolated CODEX_HOME for angle '$aid29b' (execution=$([ "$aid29b" = alpha ] && echo read-only || echo workspace-write)) ---"
+  printf '%s\n' "$out29b"
+
+  check "angle '$aid29b' run exits 0" test "$rc29b" -eq 0
+  check "angle '$aid29b' verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out29b"
+
+  seen_home29b=""
+  if [ -f "$argvdir29b/env_CODEX_HOME" ]; then
+    seen_home29b=$(cat "$argvdir29b/env_CODEX_HOME")
+  fi
+  check "angle '$aid29b''s codex exec saw a non-empty CODEX_HOME" test -n "$seen_home29b"
+  check "angle '$aid29b''s CODEX_HOME is not the ambient/real one" \
+    test "$seen_home29b" != "$fakerealhome29b"
+  check "angle '$aid29b''s throwaway CODEX_HOME carried a copy of the real auth.json" \
+    grep -q "the-real-users-auth" "$argvdir29b/env_CODEX_HOME_AUTH_JSON"
+  check "angle '$aid29b''s throwaway CODEX_HOME was cleaned up after the run" \
+    test ! -d "$seen_home29b"
+  check "the ambient/real CODEX_HOME's auth.json (fakerealhome29b) was never modified" \
+    cmp -s "$fakerealhome29b/auth.json" "$expected_auth29b"
+
+  rm -rf "$rundir29b"
 done
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
