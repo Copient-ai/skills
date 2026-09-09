@@ -175,7 +175,23 @@ closing the surface without breaking login. Giving each angle its own
 CODEX_HOME, rather than one shared for the whole run, closes a further gap: a
 workspace-write angle's reproduction is already free to write anywhere its
 own sandbox allows, so a shared CODEX_HOME would let it delete the next
-angle's copy of `auth.json` or plant a `config.toml` of its own.
+angle's copy of `auth.json` or plant a `config.toml` of its own. Running every
+angle against the real CODEX_HOME directly and neutralizing project trust
+with a `-c projects."<root>".trust_level="untrusted"` override instead of
+copying `auth.json` at all was tried and rejected: proven live against
+codex-cli 0.145.0, the override left a project already marked trusted still
+loading its own config.toml, and separately failed to grant trust to a
+project with no persisted entry — the CLI's own `-c` dotted-path parsing
+does not resolve a TOML-quoted `"<path>"` segment the way the config file's
+`[projects."<path>"]` table header does, so the override reaches no real
+entry either way. Copying `auth.json` per angle therefore stays, with one
+addition: if a file-backed ChatGPT login rotates its token mid-run, `codex`
+persists the new one into CODEX_HOME/auth.json — here, the throwaway copy —
+so each angle's copy is compared against itself right after creation, and
+any change is written back to the real CODEX_HOME (locked, so two angles
+finishing at once don't interleave) before that copy is deleted; two angles
+racing the *same* rotation can still leave one of them holding a token the
+provider already invalidated.
 
 Write-capable angles run against the shared checkout — a `git worktree` was
 rejected because reviewers need the project's real environment (`.venv`,

@@ -64,6 +64,18 @@ MAX_ANGLES = 6
 TOP_REQUIRED = {"angle", "verdict", "summary", "findings"}
 FINDING_REQUIRED = {"severity", "path", "line", "claim", "evidence", "reproduction"}
 
+# The run_meta fields that actually identify WHAT was reviewed — what a
+# stale check (collect_angle_result's per-angle backstop, and main()'s own
+# broad reused-`--dir` clear) must compare, not run_meta's every key.
+# head_sha (and head_ref) ride along in run_meta for provenance and for
+# _head_drift_note's own comparison, but head moving between two live runs
+# in the same --dir — a commit made to fix something the first run found,
+# say — describes a different moment of the SAME review, not a different
+# one: the diff each angle actually reviewed is pinned to base_sha, and
+# base_sha, not head_sha, is what a rerun must match to trust an earlier
+# angle's own artifacts.
+STABLE_RUN_META_FIELDS = ("plan_hash", "base_resolved", "base_sha", "template_hash")
+
 # Used only when no angle-prompt.md is found next to this skill (the file the
 # sibling agent owns) — keeps this runner testable and usable standalone.
 # Must carry every placeholder render_prompt substitutes, {{EXECUTION}}
@@ -717,8 +729,7 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
         except (OSError, json.JSONDecodeError):
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
         if not isinstance(meta, dict) or any(
-            meta.get(k) != expected_run_meta.get(k)
-            for k in ("plan_hash", "base_resolved", "base_sha", "template_hash")
+            meta.get(k) != expected_run_meta.get(k) for k in STABLE_RUN_META_FIELDS
         ):
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
 
@@ -1139,16 +1150,20 @@ def select_dir_outside_git_checkouts(purpose, exclude_sandbox_writable=False):
     unusable (missing, or itself inside a checkout), this is an environment
     failure, not a silent fall-back into a checkout — it exits 1.
 
-    `exclude_sandbox_writable=True` additionally refuses every candidate in
-    _sandbox_writable_roots(), even though each already sits outside every
-    git checkout: those paths are exactly what a workspace-write angle's
-    own reproduction is free to write to (see the module's threat-model
-    comments), so anything a caller needs a malicious reproduction to never
-    reach — a throwaway CODEX_HOME holding a copy of auth.json, a run
-    directory holding another angle's already-collected artifacts — must
-    not land under any of them either. In this mode the sole candidate is
-    _cache_root(), a stable directory outside the sandbox's write grant,
-    created here if it doesn't exist yet."""
+    `exclude_sandbox_writable=True` additionally refuses every candidate
+    that IS one of, or sits anywhere BENEATH one of, _sandbox_writable_roots()
+    — even though each candidate already sits outside every git checkout:
+    those paths (and everything under them) are exactly what a
+    workspace-write angle's own reproduction is free to write to (see the
+    module's threat-model comments), so anything a caller needs a
+    malicious reproduction to never reach — a throwaway CODEX_HOME holding
+    a copy of auth.json, a run directory holding another angle's
+    already-collected artifacts — must not land under any of them either.
+    In this mode the sole candidate is _cache_root(), a stable directory
+    outside the sandbox's write grant, created here if it doesn't exist
+    yet — but _cache_root() is only as safe as XDG_CACHE_HOME/HOME make it:
+    an XDG_CACHE_HOME pointed inside $TMPDIR is still rejected here, since
+    ancestry, not just exact equality, is what's checked."""
     if exclude_sandbox_writable:
         candidates = [_cache_root()]
         excluded_roots = _sandbox_writable_roots()
@@ -1172,11 +1187,25 @@ def select_dir_outside_git_checkouts(purpose, exclude_sandbox_writable=False):
             continue
         if excluded_roots:
             try:
-                resolved = str(Path(candidate_dir).resolve())
+                resolved_path = Path(candidate_dir).resolve()
             except OSError:
-                resolved = candidate_dir
-            if resolved in excluded_roots:
-                tried.append(f"{candidate_dir} (a sandbox-writable root)")
+                resolved_path = Path(candidate_dir)
+            # Ancestry, not equality: XDG_CACHE_HOME (or HOME) pointed at a
+            # descendant of a sandbox-writable root — e.g.
+            # XDG_CACHE_HOME=$TMPDIR/xdg-cache — is exactly as reachable by
+            # a workspace-write angle's own sandbox as the root itself, and
+            # a bare `resolved == root` check would let it through.
+            # is_relative_to also matches an exact equal (relative_to a
+            # path against itself is ".", not an exception), so this
+            # subsumes the old equality check too.
+            hit_root = next(
+                (root for root in excluded_roots if resolved_path.is_relative_to(Path(root))),
+                None,
+            )
+            if hit_root is not None:
+                tried.append(
+                    f"{candidate_dir} (under the sandbox-writable root {hit_root})"
+                )
                 continue
         if dir_in_git_repo(candidate_dir):
             tried.append(f"{candidate_dir} (inside a git checkout)")
@@ -1502,7 +1531,12 @@ def _kill_all_and_exit(exit_fn=None):
     # still on disk (each holding a copy of the user's auth.json — see
     # make_throwaway_codex_home) would otherwise survive an interrupted run
     # forever instead of being cleaned up like every other exit path. A
-    # lock-free snapshot, same reasoning as `procs` above.
+    # lock-free snapshot, same reasoning as `procs` above. os._exit also
+    # bypasses _run_angle_isolated's own finally, so a rotation an angle's
+    # codex exec was in the middle of persisting at the moment of this
+    # signal is never propagated back to the real CODEX_HOME (see
+    # _propagate_rotated_auth) — deleted here along with the rest of the
+    # directory it was written into, same as any other interrupted work.
     for home in list(_LIVE_CODEX_HOMES):
         shutil.rmtree(home, ignore_errors=True)
     print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
@@ -1623,6 +1657,14 @@ def _mark_interrupted(aid, run_dir):
     write_artifact_text(run_dir / f"{aid}.skipped.txt", "interrupted\n")
 
 
+def _real_codex_home():
+    """The ambient CODEX_HOME make_throwaway_codex_home copies auth.json
+    from, and _propagate_rotated_auth writes a rotated copy back to:
+    CODEX_HOME if set, else ~/.codex. Factored out so both call sites (and
+    any test monkeypatching os.environ) resolve the identical path."""
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
 def make_throwaway_codex_home():
     """Creates a fresh, empty CODEX_HOME containing only a copy of the real
     one's auth.json, and returns its Path.
@@ -1648,7 +1690,37 @@ def make_throwaway_codex_home():
     needs to survive between runs, so a brand new CODEX_HOME each run costs
     nothing beyond re-fetching the model catalog.
 
-    Never touches the real CODEX_HOME/~/.codex — only reads its auth.json.
+    An alternative that would avoid copying auth.json at all — run every
+    angle against the REAL CODEX_HOME directly and neutralize project trust
+    with a `-c` override on the command line instead, e.g. `-c
+    'projects."<root>".trust_level="untrusted"'` — was tried and rejected.
+    Proven live against codex-cli 0.145.0: a throwaway CODEX_HOME whose own
+    config.toml marked a throwaway repo trusted (`[projects."<repo>"]
+    trust_level = "trusted"`), with that repo's own .codex/config.toml
+    setting `model_reasoning_effort = "minimal"`, still showed `codex
+    exec`'s header reading `reasoning effort: minimal` (the repo-local
+    value, still loaded) whether or not `-c
+    'projects."<repo>".trust_level="untrusted"'` was passed — the override
+    had no effect in either direction (a matching experiment granting
+    trust to a project with no persisted entry via `-c
+    'projects."<path>".trust_level="trusted"'` also had no effect, still
+    reading the ambient default). The CLI's own `-c key=value` dotted-path
+    splitting does not treat a TOML-quoted `"<path>"` segment as one path
+    component the way the config file's own `[projects."<path>"]` table
+    header does, so the override never reaches the actual `projects` map
+    entry for that path — it targets nothing. So this function keeps
+    copying: each angle's own copy is compared against what was copied
+    (not against the real file, which a sibling angle may have already
+    updated — see _propagate_rotated_auth) after that angle's codex exec
+    exits, and any change — a file-backed ChatGPT login refreshing its
+    access token consumes the current refresh token and receives a new
+    one, which codex persists back into CODEX_HOME/auth.json, here the
+    throwaway copy — is written back to the real auth.json under a lock,
+    so a rotated token is never stranded in a directory this function is
+    about to delete. Two angles racing the SAME rotation can still leave
+    one of them holding a refresh token the provider already invalidated
+    — see _propagate_rotated_auth's own docstring.
+
     Best-effort on the copy's permissions (chmod 600); a missing auth.json
     is not fatal here — some setups authenticate purely via an environment
     variable this process's own environ (inherited by every angle's Popen
@@ -1684,7 +1756,7 @@ def make_throwaway_codex_home():
     between mkdtemp and registration would otherwise orphan a partial or
     complete copy of the real auth.json on disk with neither cleanup path
     aware it exists."""
-    real_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    real_home = _real_codex_home()
     candidate_dir = select_dir_outside_git_checkouts(
         "create the throwaway CODEX_HOME in", exclude_sandbox_writable=True,
     )
@@ -1702,6 +1774,101 @@ def make_throwaway_codex_home():
         except OSError:
             pass
     return throwaway
+
+
+def _propagate_rotated_auth(codex_home, real_home, pre_auth_bytes):
+    """Called once an angle's codex exec has exited, before its throwaway
+    CODEX_HOME (codex_home) is deleted: if `codex_home/auth.json` no longer
+    matches `pre_auth_bytes` — the bytes make_throwaway_codex_home copied
+    into it, read back right after that copy, before this angle's codex
+    exec ever ran — this angle's own process rewrote it (a file-backed
+    ChatGPT login rotating its access token consumes the current refresh
+    token and persists a new one back into CODEX_HOME/auth.json, which
+    here is the throwaway copy, never the real file directly), and the new
+    bytes are written back to `real_home/auth.json` so the rotation isn't
+    stranded in a directory about to be rmtree'd — see
+    make_throwaway_codex_home's own docstring for why copying, rather than
+    running every angle against the real CODEX_HOME with a project-trust
+    override, is still how this runner avoids loading the checkout's own
+    config.toml.
+
+    Deliberately compared against `pre_auth_bytes` — what THIS angle's own
+    copy started as — never against real_home's current content: another
+    angle may have already propagated its own rotation there first, and a
+    plain copy-vs-real comparison would then see this angle's own
+    unmodified (older refresh token, but byte-different from what the
+    sibling just wrote) copy as "changed" and clobber that newer, valid
+    token with a stale one.
+
+    Serialized against every other angle's own write-back via an advisory
+    lock file next to auth.json (POSIX flock — lazily imported, so a
+    platform without fcntl still runs every other part of this module) so
+    two angles finishing around the same moment don't interleave writes;
+    still not a full fix for two angles racing the SAME rotation — each
+    starts its own refresh from the same pre-rotation token, so whichever
+    write-back takes the lock second simply overwrites the first, and the
+    provider may already have invalidated the token the first one held.
+    An interrupt (SIGINT/SIGTERM) skips this entirely: _kill_all_and_exit's
+    os._exit bypasses every finally block, including this call, the same
+    way it bypasses atexit — an in-flight rotation at the moment of a
+    signal is lost, same class of gap as the parallel-race case above.
+
+    Best-effort throughout, matching every other cleanup path in this
+    module: a missing real_home, an unwritable one, a lock that can't be
+    acquired or a platform with no fcntl at all, or a mid-write OSError are
+    all silently skipped rather than failing this angle's already-collected
+    result over a housekeeping step. Never invoked with a real_home this
+    module's own tests point at an actual developer's ~/.codex — every
+    caller resolves it via _real_codex_home(), which honors CODEX_HOME the
+    same way make_throwaway_codex_home does, so a test sets CODEX_HOME to a
+    throwaway directory precisely to keep this away from the real one."""
+    src = codex_home / "auth.json"
+    try:
+        new_bytes = src.read_bytes()
+    except OSError:
+        return
+    if new_bytes == pre_auth_bytes:
+        return
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(real_home / ".auth.json.rotate.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        pass
+    try:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (ImportError, OSError, AttributeError):
+                pass
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(real_home), prefix=".auth.json.")
+        except OSError:
+            return
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(new_bytes)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, real_home / "auth.json")
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    finally:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError, AttributeError):
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home, run_meta):
@@ -1909,14 +2076,48 @@ def _run_angle_isolated(aid, angle, plan, base_resolved, template, run_dir, root
     serial loop calls this once per write-capable angle, one at a time, and
     the next angle's own make_throwaway_codex_home call must never be able
     to observe (or be handed) a directory the previous angle's reproduction
-    could still have reached."""
-    codex_home = make_throwaway_codex_home()
+    could still have reached.
+
+    The home is created inside the same _IN_FLIGHT window run_angle's own
+    Popen call uses (see that function and _wait_for_in_flight), not
+    outside it: without this, a worker that reached make_throwaway_codex_home
+    exactly as a signal handler ran its interrupt sweep could register the
+    new directory in _LIVE_CODEX_HOMES a moment after that sweep already
+    took its snapshot, leaking a directory holding a copy of auth.json past
+    os._exit with nothing left to clean it up — the same spawn/track race
+    _IN_FLIGHT was introduced to close for _LIVE_PROCS, here closed for
+    _LIVE_CODEX_HOMES instead. Checking _CANCELLED before creating the home
+    at all (rather than only after, the way run_angle checks again after
+    its own Popen) also skips the mkdtemp/copy entirely once cancellation
+    is already visible, instead of creating a home this call would then
+    immediately tear down.
+
+    auth.json is snapshotted right after creation (pre_auth_bytes) and
+    compared against the same file once run_angle returns: any difference
+    means this angle's own codex exec rotated it, and the new bytes are
+    propagated back to the real CODEX_HOME before the throwaway directory
+    is removed — see _propagate_rotated_auth."""
+    sentinel = object()
+    _IN_FLIGHT.append(sentinel)
+    try:
+        if _CANCELLED:
+            _mark_interrupted(aid, run_dir)
+            return None, False
+        codex_home = make_throwaway_codex_home()
+    finally:
+        _IN_FLIGHT.remove(sentinel)
+    real_home = _real_codex_home()
+    try:
+        pre_auth_bytes = (codex_home / "auth.json").read_bytes()
+    except OSError:
+        pre_auth_bytes = None
     try:
         return run_angle(
             aid, angle, plan, base_resolved, template, run_dir, root,
             schema_path, timeout_sec, codex_home, run_meta,
         )
     finally:
+        _propagate_rotated_auth(codex_home, real_home, pre_auth_bytes)
         shutil.rmtree(codex_home, ignore_errors=True)
         _untrack_codex_home(codex_home)
 
@@ -2348,12 +2549,18 @@ def main(argv=None):
         # today's plan.json, and a later --from-dir would attribute that old
         # verdict to a plan it was never actually produced against
         # (collect_angle_result's own meta check is the backstop for
-        # whatever this misses — see there). Compared via the same "_run"
+        # whatever this misses — see there). Compared field-by-field over
+        # STABLE_RUN_META_FIELDS only — the same fields collect_angle_result
+        # itself checks, not the whole "_run" dict — against the same "_run"
         # record this run is about to stamp into plan.json itself, so a
         # plan whose bytes changed, or a base that resolved to a different
         # ref or has since moved to a different commit, both count as
-        # "changed" — an unparsable or missing existing plan.json is treated
-        # the same way, conservatively, since nothing in it can be trusted.
+        # "changed"; head_sha/head_ref moving alone (e.g. a commit made
+        # between two live runs sharing this --dir, to fix something the
+        # first run found) does not — see STABLE_RUN_META_FIELDS' own
+        # comment for why. An unparsable or missing existing plan.json, or
+        # one with no "_run" record at all, is treated as "changed" the
+        # same way, conservatively, since nothing in it can be trusted.
         old_plan_path = run_dir / "plan.json"
         if old_plan_path.is_file():
             try:
@@ -2367,7 +2574,9 @@ def main(argv=None):
                     if isinstance(a, dict) and isinstance(a.get("id"), str)
                 }
             old_run_meta = old_doc.get("_run") if isinstance(old_doc, dict) else None
-            if old_run_meta != run_meta:
+            if not isinstance(old_run_meta, dict) or any(
+                old_run_meta.get(k) != run_meta.get(k) for k in STABLE_RUN_META_FIELDS
+            ):
                 for stale_aid in old_ids | set(angle_ids_all):
                     clear_stale_artifacts(stale_aid, run_dir)
 

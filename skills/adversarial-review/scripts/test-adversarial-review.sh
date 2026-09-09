@@ -2562,8 +2562,14 @@ rm -rf "$rundir32"
 # make_throwaway_codex_home sources its candidate directory from
 # _cache_root() (select_dir_outside_git_checkouts' exclude_sandbox_writable
 # mode), not tempfile.gettempdir() -- _cache_root itself is monkeypatched
-# to force the same relative-path shape against that new candidate.
-scratch33="$tmpdir/absolute-codex-home-check.$$.${RANDOM:-0}"
+# to force the same relative-path shape against that new candidate. Built
+# under $safe_tmpdir, not $tmpdir: $tmpdir sits under TMPDIR/tmp itself
+# (see this script's own setup), and select_dir_outside_git_checkouts'
+# exclude_sandbox_writable mode now refuses a candidate that resolves to a
+# DESCENDANT of a sandbox-writable root, not just an exact match -- the
+# relative "relhome" target below would otherwise resolve straight back
+# under TMPDIR and be refused for the right reason, but the wrong test.
+scratch33="$safe_tmpdir/absolute-codex-home-check.$$.${RANDOM:-0}"
 mkdir -p "$scratch33"
 absolute_check33=$(cd "$scratch33" && python3 - "$SCRIPT_DIR" <<'PYEOF'
 import os
@@ -3521,6 +3527,204 @@ check "the default run dir sits outside every sandbox-writable root and the chec
   test "$outside47b" = "OK"
 
 rm -rf "$rundir47b"
+
+# --- Case 48: XDG_CACHE_HOME pointed inside a sandbox-writable root is -------
+# refused, not silently accepted as the default run dir
+# Regression: select_dir_outside_git_checkouts' exclude_sandbox_writable
+# mode used to reject a candidate only when it was EXACTLY EQUAL to one of
+# tempfile.gettempdir()/$TMPDIR/tmp//var/tmp -- XDG_CACHE_HOME (or HOME)
+# pointed at a DESCENDANT of one of those (e.g. XDG_CACHE_HOME=$TMPDIR/
+# xdg-cache) yields a _cache_root() just as reachable by a workspace-write
+# angle's own sandbox as the root itself, and the equality check let it
+# straight through. TMPDIR here is pinned to a fresh scratch directory
+# (never the real system temp dir) and XDG_CACHE_HOME to a subdirectory of
+# it, so _cache_root() -- the sole candidate in this mode -- resolves to a
+# descendant of a sandbox-writable root; with the fix, that's refused the
+# same as the root itself would be, so main() exits 1 (environment error)
+# rather than picking a run directory a malicious reproduction could reach.
+repo48=$(make_throwaway_repo cache-root-inside-tmpdir)
+cat > "$repo48/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+faketmp48="$tmpdir/fake-tmpdir-48.$$.${RANDOM:-0}"
+mkdir -p "$faketmp48"
+xdgcache48="$faketmp48/xdg-cache-inside-tmpdir"
+
+err48=$(cd "$repo48" && TMPDIR="$faketmp48" XDG_CACHE_HOME="$xdgcache48" CODEX_BIN=true \
+  bash "$SH" --plan plan.json --base main 2>&1)
+rc48=$?
+echo "--- case 48: XDG_CACHE_HOME inside \$TMPDIR is refused as the default run dir ---"
+printf '%s\n' "$err48"
+
+check "exits 1 (environment error)" test "$rc48" -eq 1
+check "names the problem" grep -qi "sandbox-writable" <<<"$err48"
+
+# --- Case 49: a --dir reused after HEAD alone moved (no plan/base change) ----
+# never wipes an unselected angle's still-valid earlier result
+# Regression: main()'s broad reused-`--dir` clear used to compare the WHOLE
+# "_run" dict (run_meta stamped into plan.json), so a head_sha that moved
+# between two live runs sharing the same --dir -- committing a fix in
+# response to the first run's own findings, say -- alone counted as
+# "changed" and cleared EVERY angle's artifacts, including ones --only left
+# out of this run. STABLE_RUN_META_FIELDS (plan_hash, base_resolved,
+# base_sha, template_hash -- the same fields collect_angle_result's own
+# per-angle backstop already checks) is now what's compared; head_sha rides
+# along for provenance only. First run produces alpha+beta both CLEAN; a
+# commit then moves HEAD (head_sha changes, base_sha/plan_hash/
+# template_hash do not, since only main -- the base -- would move
+# base_sha); a second run reused the same --dir with --only alpha must
+# leave beta's earlier artifacts alone; --from-dir must then merge both.
+repo49=$(make_throwaway_repo reused-dir-head-moved)
+cat > "$repo49/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+rundir49="$tmpdir/reused-dir-head-moved-run.$$.${RANDOM:-0}"
+argvdir49="$tmpdir/reused-dir-head-moved-argv.$$.${RANDOM:-0}"
+
+out49_1=$(cd "$repo49" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir49" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir49" 2>&1); rc49_1=$?
+echo "--- case 49: first run (both angles, before HEAD moves) ---"
+printf '%s\n' "$out49_1"
+check "first run exits 0" test "$rc49_1" -eq 0
+check "first run: alpha CLEAN" grep -qx "alpha: CLEAN" <<<"$out49_1"
+check "first run: beta CLEAN" grep -qx "beta: CLEAN" <<<"$out49_1"
+
+# Moves HEAD alone: a new commit on the same feature branch. base ('main')
+# is never touched, so base_sha stays the same while head_sha changes.
+echo "more" >> "$repo49/f.txt"
+git -C "$repo49" add -A
+git -C "$repo49" commit -q -m "a fix in response to round 1"
+
+out49_2=$(cd "$repo49" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir49" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir49" --only alpha 2>&1); rc49_2=$?
+echo "--- case 49: second run (--only alpha, after HEAD moved) ---"
+printf '%s\n' "$out49_2"
+check "second run exits 0" test "$rc49_2" -eq 0
+check "second run only counts alpha" \
+  grep -qx "ANGLES=1  RAN=1  BLOCKED=0  UNPARSED=0" <<<"$out49_2"
+
+out49_3=$(bash "$SH" --from-dir "$rundir49" 2>&1); rc49_3=$?
+echo "--- case 49: --from-dir merges both after HEAD alone moved ---"
+printf '%s\n' "$out49_3"
+check "--from-dir exits 0 (beta's still-valid CLEAN must survive)" test "$rc49_3" -eq 0
+check "--from-dir verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out49_3"
+check "--from-dir counts both angles ran" \
+  grep -qx "ANGLES=2  RAN=2  BLOCKED=0  UNPARSED=0" <<<"$out49_3"
+check "beta is CLEAN (its earlier artifact was never wiped by HEAD moving alone)" \
+  grep -qx "beta: CLEAN" <<<"$out49_3"
+
+rm -rf "$rundir49"
+
+# --- Case 50: a cancelled worker never creates a throwaway CODEX_HOME at all -
+# Regression: _run_angle_isolated used to call make_throwaway_codex_home()
+# unconditionally, outside the _IN_FLIGHT window run_angle's own Popen call
+# uses to close the spawn/track race with the interrupt handler (see
+# _wait_for_in_flight) -- a signal landing exactly as a worker reached that
+# call could let the handler's _LIVE_CODEX_HOMES snapshot run before the
+# new home was even registered, leaking a directory holding a copy of
+# auth.json past os._exit with nothing left to clean it up. Home creation
+# now happens inside the same kind of _IN_FLIGHT-guarded window, checking
+# _CANCELLED first -- so once cancellation is visible, no home is created
+# at all, closing the race and skipping pointless work. Directly sets the
+# module's own _CANCELLED (never delivers a real signal -- this isolates
+# the guard itself from OS-level timing) and spies on
+# make_throwaway_codex_home to prove it is never called.
+scratch50="$tmpdir/cancelled-no-codex-home.$$.${RANDOM:-0}"
+mkdir -p "$scratch50"
+cancelled_check50=$(python3 - "$SCRIPT_DIR" "$scratch50" <<'PYEOF'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+run_dir = Path(sys.argv[2]) / "rundir"
+run_dir.mkdir(parents=True, exist_ok=True)
+
+calls = []
+def spy():
+    calls.append(True)
+    raise AssertionError("make_throwaway_codex_home must not be called once _CANCELLED")
+ar.make_throwaway_codex_home = spy
+
+ar._CANCELLED = True
+angle = {"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+plan = {"version": 1, "base": "main", "promise": "p", "contracts": [], "invariants": [], "angles": [angle]}
+run_meta = {"plan_hash": "x", "base_resolved": "main", "base_sha": "aaa", "template_hash": "y"}
+
+result = ar._run_angle_isolated(
+    "writer", angle, plan, "main", "template", run_dir, ".",
+    Path("schema.json"), 5, run_meta,
+)
+
+marker = run_dir / "writer.skipped.txt"
+ok = (
+    result == (None, False)
+    and calls == []
+    and marker.is_file()
+    and marker.read_text().strip() == "interrupted"
+    and ar._IN_FLIGHT == []
+)
+print("OK" if ok else
+      f"MISMATCH: result={result!r} calls={calls!r} "
+      f"marker_exists={marker.is_file()!r} IN_FLIGHT={ar._IN_FLIGHT!r}")
+PYEOF
+)
+echo "--- case 50: a cancelled worker never creates a throwaway CODEX_HOME ---"
+printf '%s\n' "$cancelled_check50"
+check "make_throwaway_codex_home is never called once _CANCELLED is set, and the angle is marked interrupted" \
+  test "$cancelled_check50" = "OK"
+
+# --- Case 51: a rotated auth.json is propagated back to the real CODEX_HOME --
+# before this angle's throwaway copy is deleted
+# Regression: each angle's codex exec ran under its own throwaway
+# CODEX_HOME (see make_throwaway_codex_home) holding only a COPY of the
+# real auth.json -- when a file-backed ChatGPT login refreshes mid-run,
+# codex rewrites that copy with a rotated refresh token, the copy is then
+# deleted with the rest of the throwaway directory, and the real
+# auth.json keeps the now-consumed token, so later angles (and any normal
+# `codex` run afterward) can fail to authenticate. An alternative -- run
+# every angle against the real CODEX_HOME directly and neutralize project
+# trust with a `-c projects."<root>".trust_level="untrusted"` override
+# instead of copying at all -- was tried and rejected: proven live against
+# codex-cli 0.145.0 (see make_throwaway_codex_home's own docstring), the
+# override changed nothing in either direction. _propagate_rotated_auth
+# now compares each angle's own copy, snapshotted right after creation,
+# against that same file once the angle's codex exec exits, and writes any
+# change back to the real CODEX_HOME under a lock.
+# fixtures/fake-codex-rotate-auth.sh plays the rotating codex process.
+repo51=$(make_throwaway_repo auth-rotation-propagated)
+plan51="$tmpdir/auth-rotation-plan.$$.${RANDOM:-0}.json"
+cat > "$plan51" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+fakerealhome51="$tmpdir/fake-real-codex-home-51.$$.${RANDOM:-0}"
+mkdir -p "$fakerealhome51"
+echo '{"marker": "pre-rotation-token"}' > "$fakerealhome51/auth.json"
+rundir51="$safe_tmpdir/auth-rotation-run.$$.${RANDOM:-0}"
+
+out51=$(cd "$repo51" && CODEX_HOME="$fakerealhome51" \
+  CODEX_BIN="$FIXTURES/fake-codex-rotate-auth.sh" \
+  ADV_TEST_ROTATED_MARKER='{"marker": "post-rotation-token"}' \
+  bash "$SH" --plan "$plan51" --base main --dir "$rundir51" 2>&1)
+rc51=$?
+echo "--- case 51: a rotated auth.json is propagated back to the real CODEX_HOME ---"
+printf '%s\n' "$out51"
+
+check "exits 0" test "$rc51" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out51"
+check "the real CODEX_HOME's auth.json now carries the rotated token" \
+  grep -q "post-rotation-token" "$fakerealhome51/auth.json"
+check "the real CODEX_HOME's auth.json no longer carries the pre-rotation token" \
+  bash -c '! grep -q "pre-rotation-token" "$1"' _ "$fakerealhome51/auth.json"
+
+rm -rf "$rundir51"
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh

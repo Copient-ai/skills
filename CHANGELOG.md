@@ -56,6 +56,29 @@ into a falsifiable attack angle. It adds:
   same way residue does; and a `--from-dir` merge reads `<angle>.skipped.txt`
   defensively (never following a symlink, never trusting content outside
   its own known cause tokens).
+- **Auth rotation, cache-root ancestry, and two more isolation gaps
+  closed.** A `-c projects."<root>".trust_level="untrusted"` override was
+  tried, live, as a way to run every angle against the real `CODEX_HOME`
+  directly instead of copying `auth.json` per angle — rejected: it left an
+  already-trusted project still loading its own `config.toml`, and
+  separately failed to grant trust to one with no persisted entry, on
+  codex-cli 0.145.0. Copying stays, with a fix: a file-backed ChatGPT
+  login's mid-run token rotation now propagates back to the real
+  `CODEX_HOME` (locked, only when changed) before each angle's throwaway
+  copy is deleted, instead of stranding the rotated token there. The
+  sandbox-writable-root check the default run directory and every
+  throwaway `CODEX_HOME` rely on now rejects a candidate that's a
+  *descendant* of `tempfile.gettempdir()`/`$TMPDIR`/`/tmp`/`/var/tmp`, not
+  only an exact match — an `XDG_CACHE_HOME` pointed inside one of those
+  used to pass through. A reused `--dir`'s broad stale-artifact clear now
+  compares only the same provenance fields the per-angle backstop already
+  does (plan hash, resolved base and its commit, angle-prompt template
+  hash) instead of the whole run record, so HEAD moving alone between two
+  runs sharing a `--dir` — a commit made in response to the first run's own
+  findings, say — no longer wipes an angle `--only` left out of the second
+  run. And throwaway `CODEX_HOME` creation itself now happens inside the
+  same in-flight window Popen already used, so a worker cancelled at
+  exactly the wrong moment never creates one at all.
 
 ## 1.0.0
 
