@@ -78,7 +78,7 @@ the two stay aligned — consult it directly if anything here is unclear.
 - **id:** `{{ANGLE_ID}}` — **title:** {{ANGLE_TITLE}}
 - **mandate:** {{MANDATE}}
 - **evidence required:** {{EVIDENCE}}
-- **execution field (plan-assigned; this pass stays read-only regardless — see
+- **this run's execution mode (this pass stays read-only regardless — see
   above):** {{EXECUTION}}
 - **files to start from (if given, not exhaustive):** {{FILES}}
 

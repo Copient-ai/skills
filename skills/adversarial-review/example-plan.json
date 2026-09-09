@@ -1,0 +1,66 @@
+{
+ "version": 1,
+ "base": "origin/main",
+ "promise": "Callers can replace threading.Thread and concurrent.futures.ThreadPoolExecutor with trainer.db_threading.DbSafeThread and DbSafeThreadPoolExecutor and rely on every Django DB connection that thread's own unit of work opened being closed when that work ends -- on the thread's own exit, on each pool task boundary (including its initializer and its done callbacks), and after the exception hook -- without ever masking the target callable's own exception, and without one alias's close failure skipping the rest. A subclass of either primitive is refused at class-definition time unless it leaves run()/submit() untouched. Alongside this, an AST-based architecture test enforces, across the whole first-party codebase, that nothing outside an exact-count legacy baseline may construct, subclass, or bind to a name a bare threading.Thread/ThreadPoolExecutor -- so any new ad hoc thread that touches the ORM is forced through the safe primitives, and the legacy baseline can only shrink, never silently grow.",
+ "contracts": [
+  "The stdlib threading.Thread construction/run()/_bootstrap_inner()/_invoke_excepthook protocol, which DbSafeThread re-declares and instance-patches.",
+  "The stdlib concurrent.futures.ThreadPoolExecutor.__init__/submit()/map() and concurrent.futures.Future.add_done_callback() contract, which DbSafeThreadPoolExecutor and _DbSafeFuture wrap rather than replace.",
+  "Django's django.db.connections (ConnectionHandler.all(initialized_only=...)) and BaseDatabaseWrapper.close() semantics, which close_thread_connections relies on to actually release a connection.",
+  "Python's own import/assignment/scoping grammar, which test_db_threading_architecture.py's hand-rolled AST name-resolution reimplements to decide what a bare name 'means' at any point in a file."
+ ],
+ "invariants": [
+  "Every DB alias initialized during a DbSafeThread's or a DbSafeThreadPoolExecutor worker's unit of work is closed before that unit of work is considered finished, on both success and exception.",
+  "A close failure on one alias never prevents closing the others, and close_thread_connections itself never raises.",
+  "The original exception raised by a wrapped target/callable is always what the caller or future observes -- never replaced or hidden by a close failure.",
+  "No subclass of DbSafeThread or DbSafeThreadPoolExecutor runs with a run()/submit() other than the base class's, enforced once via __init_subclass__.",
+  "No first-party application file constructs, subclasses, or binds to a name a bare threading.Thread/ThreadPoolExecutor, except the exact legacy sites recorded in the baseline (an exact count, keyed by path+scope) and the two sanctioned subclass declarations inside db_threading.py itself.",
+  "trainer/db_threading.py imports only the standard library and django.db -- no Django app -- per its own module docstring."
+ ],
+ "angles": [
+  {
+   "id": "architecture-guard-scripts-blind-spot",
+   "title": "scripts/ exclusion lets an app-reachable bare construction through the guard undetected",
+   "mandate": "trainer/tests/test_db_threading_architecture.py excludes the entire top-level scripts/ package from every scan (EXCLUDED_TOP_LEVEL_PACKAGES = {\"scripts\", \"tests\"} inside _first_party_scan_roots), while its own module docstring claims a from-import binding is caught 'at the binding site itself... since scanning only the consumer would miss a call routed through it.' scripts/parallel_analysis_rerun.py already constructs a bare ThreadPoolExecutor(max_workers=...) (around line 158) inside a function that touches the Django ORM (imports analysis.models, conversations.models, django.db.close_old_connections), and scanned first-party app files (e.g. admin_tools/views/retry_analysis_views.py, admin_tools/views/export_views/analysis_views.py) already import functions from scripts/ modules today. Construct a concrete pair of files -- one under scripts/ performing a bare ThreadPoolExecutor/threading.Thread construction inside a function, one under a scanned app package importing and calling that function -- and run scan_repository() (or scan_source() over both files) to show it reports zero violations for this construction, despite the construction being reachable from, and effectively originating in, application code the guard exists to police.",
+   "evidence": "the exact scripts/ file+line performing the bare construction (real or your constructed equivalent), the app-package import site that reaches it, and the actual scan_repository()/scan_source() output (violation count/list) proving neither the construction nor its app-side entry point is reported.",
+   "execution": "workspace-write",
+   "files": [
+    "trainer/tests/test_db_threading_architecture.py",
+    "scripts/parallel_analysis_rerun.py",
+    "admin_tools/views/retry_analysis_views.py"
+   ]
+  },
+  {
+   "id": "init-subclass-bypassed-after-class-creation",
+   "title": "The cleanup guarantee under ordinary subclassing and attribute operations",
+   "mandate": "DbSafeThread and DbSafeThreadPoolExecutor document that every DB connection a thread's or task's work opens is closed when that work ends, and that this remains true for any subclass that can be created without error and for any class or instance later changed through ordinary Python attribute operations (assignment, deletion, __dict__ writes, __slots__, metaclass hooks). Determine whether that documented property holds. Exercise such ordinary operations against the real module in a scratch script, run a thread's or task's work that executes a query, and then read connections.all(initialized_only=True) on that thread after the work has ended. Report any sequence for which an initialized connection remains, with the observed state; report the property as holding when every sequence you tried leaves none. A global replacement of threading.Thread.start, type.__setattr__ or object.__setattr__ is a documented accepted limit and is out of scope.",
+   "evidence": "The exact sequence of operations performed, confirmation that none of them raised, and the observed connection state (closed_in_transaction, connection is None or not) after the work completed.",
+   "execution": "workspace-write",
+   "files": [
+    "trainer/db_threading.py",
+    "trainer/tests/test_db_threading.py"
+   ]
+  },
+  {
+   "id": "unenforced-no-django-app-import-claim",
+   "title": "the module docstring's 'no Django app import' boundary has no test behind it",
+   "mandate": "trainer/db_threading.py's module docstring states it 'Must not import from any Django app -- only the standard library and django.db.' Search trainer/tests/test_db_threading.py and trainer/tests/test_db_threading_architecture.py (and any other test touching this module) for a check that inspects db_threading.py's own import statements, and determine whether one exists -- note in particular that test_db_threading_architecture.py's AST scan only ever inspects OTHER files' threading/ThreadPoolExecutor usage, never db_threading.py's own import surface, and SANCTIONED_SUBCLASS_SITES only exempts its two ClassDef bases, saying nothing about its imports. If no test enforces the claim, construct the smallest edit to db_threading.py's own import block that would violate the stated boundary (import a name from any first-party Django app) and show precisely which test file and assertion, if any, would fail because of it.",
+   "evidence": "the grep/read proving no existing test inspects db_threading.py's own imports, the specific hypothetical import, and a statement of exactly which test (if any) it would or would not trip.",
+   "execution": "read-only",
+   "files": [
+    "trainer/db_threading.py",
+    "trainer/tests/test_db_threading.py",
+    "trainer/tests/test_db_threading_architecture.py"
+   ]
+  },
+  {
+   "id": "close-inside-atomic-block-leaves-connection-object-alive",
+   "title": "conn.close() inside an open atomic block leaves a stale connection object behind instead of clearing it",
+   "mandate": "close_thread_connections calls conn.close() directly on every initialized alias. Django's BaseDatabaseWrapper.close() (django/db/backends/base/base.py) only sets self.connection = None when self.in_atomic_block is False; when it's True, close() still runs self._close() (closing the underlying DB-API/socket connection) but leaves self.connection pointing at that now-dead object and sets closed_in_transaction = True -- and a LATER call to close() on that same wrapper (e.g. the entry-close of the next task reusing this worker thread) becomes a complete no-op, since close() early-returns whenever closed_in_transaction is already True, never re-closing or clearing anything. Construct a target callable run through DbSafeThread or DbSafeThreadPoolExecutor that leaves a connection's wrapper with in_atomic_block True (or otherwise reaches closed_in_transaction = True) at the moment close_thread_connections runs for it, and show what state that alias is left in for the rest of that thread's life -- in particular whether connections.all(initialized_only=True) still reports it as 'initialized' afterward, and what happens when a query from a SUBSEQUENT task reusing that same worker thread touches that alias again.",
+   "evidence": "the exact target-callable code that reaches close() while in_atomic_block is True, the resulting values of connection.connection / .closed_in_transaction / .in_atomic_block immediately after close_thread_connections runs, and what happens (exception, silent stale reuse, or clean self-repair) when a later task on the same thread touches that alias again.",
+   "execution": "workspace-write",
+   "files": [
+    "trainer/db_threading.py"
+   ]
+  }
+ ]
+}

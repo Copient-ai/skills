@@ -1,1 +1,0 @@
-{"angle": "a1", "verdict": "FINDINGS", "summary": "bad severity", "findings": [{"severity": "P9", "path": "x.py", "line": 1, "claim": "c", "evidence": "e", "reproduction": "r"}]}

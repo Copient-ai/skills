@@ -73,9 +73,14 @@ For each angle also decide:
   the specific contract/invariant, not a generic "cite the file."
 - **execution** — `read-only` unless demonstrating the counterexample actually
   requires running something (a test, a script, a reproduction harness) — then
-  `workspace-write`. Default to read-only; promote only the angles that need
-  it. Under read-only, reading and `git` work; anything that writes (a test
-  runner writing caches, a script writing output) fails.
+  `workspace-write`. This is advisory: it records the angle's own *intent*, not
+  something the runner reads per-angle. A run is either entirely read-only or
+  entirely `--allow-writes` (see SKILL.md) — an angle marked `workspace-write`
+  here is a signal for a later, separate `--only <id> --allow-writes` re-run of
+  just that angle, not a per-angle runner switch. Default to read-only;
+  promote only the angles that need it. Under read-only, reading and `git`
+  work; anything that writes (a test runner writing caches, a script writing
+  output) fails.
 - **files** — optional hint: paths most relevant to this angle, if the diff
   makes that obvious. Not exhaustive, and the reviewer isn't bound by it.
 
@@ -128,3 +133,10 @@ the diff in front of you.
 Every angle you write must earn its place the same way these do: name the
 specific promise, name the specific way to break it, name what proof would
 look like.
+
+## Example
+
+`example-plan.json` in this skill's directory is a real plan from the pilot
+(copient-trainer#6165) — worth a look for the shape of a good, specific,
+non-generic angle, and for how each mandate is worded as verification of a
+stated guarantee rather than an attack recipe, per "Wording matters" above.

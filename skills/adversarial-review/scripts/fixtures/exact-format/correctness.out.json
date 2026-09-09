@@ -1,1 +1,0 @@
-{"angle": "correctness", "verdict": "FINDINGS", "summary": "Found one blocking issue.", "findings": [{"severity": "P1", "path": "app/main.py", "line": 42, "claim": "Off-by-one drops the last row", "evidence": "loop uses range(0, n-1)", "reproduction": "call main.process(range(3)) and see the last item missing"}]}

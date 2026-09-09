@@ -9,6 +9,36 @@ bash <skill-dir>/scripts/codex-review.sh --version
 bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
 
+## 1.2.0
+
+`adversarial-review`'s runner version bumps to `1.2.0`
+(`adversarial-review.sh --version`). The threat model changes: **the branch
+under review is now trusted** — this skill reviews your own branches before
+you push them, not an adversarial submission — so the machinery that existed
+to defend against a hostile branch is gone:
+
+- **No more per-angle `CODEX_HOME`/`auth.json` copying.** Every angle now runs
+  under the ambient `CODEX_HOME` directly, which incidentally fixes
+  keyring-backed codex logins — they never worked through the old
+  copy-and-rotate-back mechanism.
+- **No more provenance metadata or hashing** (`<angle>.meta.json`, plan/base/
+  template hashes, the `"_run"` stamp in `plan.json`), and no more symlink/
+  hardlink-safe artifact writes, HEAD/ref-drift detection, the residue/
+  compromise cascade, or the sandbox-writable-root containment logic
+  (`_cache_root`, `_sandbox_writable_roots`, and the git-discovery-env-
+  scrubbing probes that backed them).
+- **Execution mode is now run-wide, not per-angle.** A plan's per-angle
+  `execution` field is advisory only from here on; a new `--allow-writes` flag
+  decides the sandbox for the whole invocation instead (default stays
+  `read-only`). Two isolation flags stay regardless — `-c
+  project_doc_max_bytes=0` and `-c skills.include_instructions=false` — but
+  now for independence of judgment, not security.
+- The runner is cut from ~2800 to under 700 lines. The test suite is cut from
+  83 cases and ~130 fixture directories to about a dozen cases, offline-only
+  via `--from-dir` (matching `codex-review-loop`'s `--from-log` pattern), plus
+  two fixture directories kept only as documentation of the run-directory
+  shape.
+
 ## 1.1.0
 
 `codex-review.sh`'s parser is unchanged — it still reports `1.0.0`, and

@@ -1,7 +1,7 @@
 {
   "name": "copient",
   "description": "Local review→fix loops that converge a branch before you push it: an OpenAI Codex reviewer, an isolated-subagent Claude reviewer, and an adversarial planning pass that derives falsifiable attack angles from the diff.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "Copient AI",
     "url": "https://github.com/Copient-ai"

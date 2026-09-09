@@ -140,7 +140,7 @@ Host requirements: bash, git, and `python3` (3.9 or newer, stdlib only) on `PATH
 
 ```bash
 bash ~/.claude/skills/adversarial-review/scripts/adversarial-review.sh --version
-# adversarial-review.sh 1.1.0
+# adversarial-review.sh 1.2.0
 
 bash ~/.claude/skills/adversarial-review/scripts/test-adversarial-review.sh
 # ALL PASS

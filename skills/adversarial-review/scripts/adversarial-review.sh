@@ -3,35 +3,50 @@
 # each returning schema-enforced JSON findings, then merge and print a
 # compact, parseable block. Thin dispatcher: this file only answers
 # --version/--help and checks the environment (python3, and — unless
-# --from-dir is given — the codex CLI) before handing off to
+# --from-dir/--print-base is given — the codex CLI) before handing off to
 # adversarial_review.py, which does the real work (plan validation, prompt
 # rendering, running codex, merging).
+#
+# We review our own branches here, not a hostile submission — the branch
+# under review is trusted. This runner is deliberately thin; almost all the
+# value is in the angle prompts, not runner-side defenses.
 #
 # Usage:
 #   adversarial-review.sh --plan FILE [--base BRANCH] [--jobs N]
 #                          [--timeout SEC] [--dir DIR] [--only ANGLE,...]
-#                          [--angle-prompt FILE]
+#                          [--angle-prompt FILE] [--allow-writes]
 #   adversarial-review.sh --from-dir DIR [--only ANGLE,...]
+#   adversarial-review.sh --print-base --base BRANCH
 #   adversarial-review.sh --version
 #   adversarial-review.sh --help
 #
 #   --plan FILE          plan JSON (version 1: base, promise, contracts,
 #                         invariants, angles[]). Required unless --from-dir.
 #   --base BRANCH         override the plan's base branch.
-#   --jobs N               angles run in parallel (default: min(#angles, 4)).
+#   --jobs N               angles run in parallel (default: min(#angles, 4),
+#                         or 1 under --allow-writes, so write-capable angles
+#                         don't race each other by default).
 #   --timeout SEC           per-angle codex timeout in seconds (default 900).
 #   --dir DIR                run directory (default: a fresh mktemp -d).
 #                           Holds plan.json (copy), <angle>.prompt.txt,
 #                           <angle>.out.json, <angle>.log, <angle>.status
-#                           (exit code), <angle>.meta.json (the plan
-#                           hash, base, and prompt hash the output
-#                           belongs to), and merged.json.
+#                           (exit code), and merged.json.
 #   --only ANGLE,...          restrict the run to these angle ids.
 #   --angle-prompt FILE        prompt template (default:
-#                           <this-skill-dir>/angle-prompt.md, else a minimal
-#                           built-in template).
+#                           <this-skill-dir>/angle-prompt.md; an environment
+#                           error if neither exists).
+#   --allow-writes               run every selected angle with `-s
+#                           workspace-write` instead of the default
+#                           read-only, for this invocation only. Prints a
+#                           warning plus `git status --porcelain` when done.
+#                           Never mix read-only and workspace-write angles in
+#                           one invocation — re-run a single angle with
+#                           `--only <id> --allow-writes` instead.
 #   --from-dir DIR              skip codex entirely; merge from an existing
 #                           run dir. This is what the test suite uses.
+#   --print-base                  resolve --base to the ref this run would
+#                           diff against, print it, and exit (no --plan or
+#                           codex needed).
 #   --version                    print the version and exit.
 #
 #   Env overrides:
@@ -65,15 +80,12 @@
 #   4  unparsed-never-clean — any angle UNPARSED or BLOCKED. A review that did
 #      not fully run is not a clean review, even if every angle that did run
 #      came back CLEAN.
-# 130  interrupted — SIGINT (Ctrl-C) or SIGTERM during a live run. Every
-#      tracked reviewer process group is killed before exiting.
+# 130  interrupted — SIGINT (Ctrl-C) or SIGTERM during a live run.
 set -euo pipefail
 
 # Bump on every change to CLI/output behaviour. Kept equal to VERSION in
 # adversarial_review.py — an installed copy can be checked with --version.
-ADVERSARIAL_REVIEW_VERSION="1.1.0"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ADVERSARIAL_REVIEW_VERSION="1.2.0"
 
 # Single pass over the raw args: answer --version/--help immediately, and
 # note whether --from-dir or --print-base was given (codex is not needed in
@@ -121,6 +133,10 @@ while [ "$i" -lt "$n" ]; do
       ;;
   esac
 done
+
+# Computed only now, after --version/--help have already exited — dirname is
+# an external command, and --version must answer before touching one.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v python3 >/dev/null 2>&1 || {
   echo "adversarial-review: python3 not found on PATH." >&2
