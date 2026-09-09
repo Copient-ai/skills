@@ -24,6 +24,7 @@ Exit codes (same contract as the .sh wrapper):
 import argparse
 import atexit
 import concurrent.futures as cf
+import errno
 import hashlib
 import json
 import os
@@ -136,7 +137,17 @@ def codex_error(msg):
 
 # --- Plan loading + validation ------------------------------------------------
 
-def load_plan(path):
+def load_plan(path, drop_run=False):
+    """Loads and validates the plan JSON at `path`. `drop_run=True` (main()'s
+    live-run branch, never --from-dir) strips a top-level "_run" key before
+    validation and hashing: a saved run's own plan.json (produced by this
+    same live-run branch — see main() — and legitimately reused as a fresh
+    --plan input) carries one, and hashing it in means compute_plan_hash
+    sees a shape --from-dir's own recomputation (which always strips "_run"
+    first) can never reproduce — every angle would then be reported
+    UNPARSED(stale) even though the plan's real content never changed.
+    --from-dir needs "_run" left intact (it reads plan["_run"] back as
+    expected_run_meta), so it never passes drop_run."""
     try:
         text = Path(path).read_text()
     except OSError as e:
@@ -145,6 +156,12 @@ def load_plan(path):
         data = json.loads(text)
     except json.JSONDecodeError as e:
         usage_error(f"invalid JSON in plan file {path}: {e}")
+    if drop_run and isinstance(data, dict) and "_run" in data:
+        print(
+            f"{PROG}: {path} carries a saved run's '_run' record; reusing its plan content only",
+            file=sys.stderr,
+        )
+        data = {k: v for k, v in data.items() if k != "_run"}
     validate_plan(data, path)
     return data
 
@@ -443,7 +460,19 @@ _EXECUTION_INSTRUCTIONS = {
 }
 
 
-def render_prompt(template, plan, angle, base_resolved):
+def render_prompt(template, plan, angle, base_resolved, base_sha=None):
+    """`base_resolved` is the human-readable, fully-qualified ref (e.g.
+    "refs/remotes/origin/main") shown in prose wherever a template renders
+    {{BASE}}. `base_sha` is the commit resolve_base_sha captured for it up
+    front (defaults to `base_resolved` itself only for a caller — tests,
+    mainly — that never resolved one) and is what {{DIFF_COMMAND}} is built
+    from: the ref name can move between when it's resolved and when a
+    spawned angle actually runs this command (a fetch, a concurrent push),
+    so the diff a reviewer is told to run must be pinned to the exact commit
+    this run's provenance record (run_meta) already commits to, not
+    whatever the ref happens to point at by execution time."""
+    if base_sha is None:
+        base_sha = base_resolved
     values = {
         "BASE": base_resolved,
         # A shell-quoted literal of the same value, for templates (like
@@ -463,11 +492,12 @@ def render_prompt(template, plan, angle, base_resolved):
         "EVIDENCE": angle["evidence"],
         "FILES": bulleted(angle.get("files"), "(all changed files)"),
         "EXECUTION": _EXECUTION_INSTRUCTIONS[angle["execution"]],
-        # shlex.quote only the base — the quoted and unquoted pieces
+        # shlex.quote the pinned commit sha, not the mutable base_resolved
+        # ref (see the docstring above) — the quoted and unquoted pieces
         # concatenate to the same single shell token, and a base with shell
         # metacharacters (e.g. from a hand-edited plan) can never break out
         # of the command a reviewer is told to paste and run.
-        "DIFF_COMMAND": f"git diff {shlex.quote(base_resolved)}...HEAD",
+        "DIFF_COMMAND": f"git diff {shlex.quote(base_sha)}...HEAD",
     }
     # A single re.sub pass over the *original* template — never a substituted
     # placeholder over its own prior output — so inserted plan/angle text
@@ -637,8 +667,20 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
     if not out_path.is_file():
         return AngleResult(aid, angle["title"], "UNPARSED", cause="nojson")
     try:
-        data = json.loads(out_path.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = out_path.read_bytes()
+    except OSError:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="nojson")
+    # Decoded explicitly, as its own step — a status-0 angle whose out.json
+    # holds invalid UTF-8 must fold into UNPARSED like any other malformed
+    # output, not raise UnicodeDecodeError out of the merge and crash the
+    # whole run over one angle's output.
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause="undecodable")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
         return AngleResult(aid, angle["title"], "UNPARSED", cause="nojson")
 
     ok, _err = validate_findings_json(data)
@@ -1020,6 +1062,31 @@ def resolve_merged_json_path(run_dir, from_dir_mode):
     return Path(path)
 
 
+# --- Artifact writes (symlink-safe) ------------------------------------------
+
+def write_artifact_text(path, text):
+    """Writes `text` to `path` — used for every one of this run's own
+    artifacts (merged.json, plan.json, and each angle's <aid>.* files),
+    never a plain Path.write_text(). A run directory can be reused across
+    invocations or, via --dir/--from-dir, point anywhere the caller names —
+    so a symlink placed at one of these paths (a reused or attacker-shaped
+    run directory) must never be followed and clobber whatever it points at.
+    Opens with O_NOFOLLOW, which makes the open() itself fail (ELOOP) when
+    the last path component is a symlink, rather than checking and opening
+    as two separate steps a symlink could be swapped in between; that
+    failure is reported as an environment error, refusing the write
+    entirely, never falling back to writing through the link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            env_error(f"refusing to write through a symlink: {path}")
+        raise
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
 def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts):
     doc = {
         "version": 1,
@@ -1037,7 +1104,7 @@ def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, ba
         ],
         "findings": merged_findings,
     }
-    merged_path.write_text(json.dumps(doc, indent=2) + "\n")
+    write_artifact_text(merged_path, json.dumps(doc, indent=2) + "\n")
 
 
 def clear_merged_json(run_dir):
@@ -1319,14 +1386,24 @@ def clear_stale_artifacts(aid, run_dir):
     plan.json can carry an id like "../../project/server", and naively
     unlinking `run_dir / f"{aid}{suffix}"` would then remove a file outside
     run_dir entirely. So this never builds a path from `aid` and unlinks it
-    directly: it lists run_dir's own entries, keeps only regular files whose
-    name is exactly `<aid><suffix>` for `suffix` one of
-    ANGLE_ARTIFACT_SUFFIXES, confirms each survivor's resolved path is still
-    inside run_dir, and unlinks only those. A hostile id fails the
-    ANGLE_ID_RE check before any filename is even considered; the
-    resolve-and-relative_to check below is the backstop in case that ever
-    changes. Best-effort: a file gone by the time it's unlinked, or a
-    directory that can no longer be listed, is not an error."""
+    directly: it lists run_dir's own entries, keeps only ones whose name is
+    exactly `<aid><suffix>` for `suffix` one of ANGLE_ARTIFACT_SUFFIXES, and
+    unlinks each survivor. A hostile id fails the ANGLE_ID_RE check before
+    any filename is even considered.
+
+    A survivor that is itself a symlink (a reused or attacker-shaped run
+    directory placing one at an artifact's name) is unlinked as the link
+    entry itself — entry.unlink(), never entry.resolve().unlink() — so its
+    target, in or out of run_dir, is never touched or followed: resolving
+    it first and checking *that* path's containment, as this used to, skips
+    (leaves in place) exactly the out-of-run_dir symlinks this exists to
+    catch, and would otherwise delete the wrong file — the target, not the
+    stale link — for one pointed back inside run_dir. A non-symlink survivor
+    keeps the resolve-and-relative_to containment check as a backstop in
+    case ANGLE_ID_RE ever changes, and is unlinked only once confirmed both
+    a real file and still inside run_dir. Best-effort throughout: a file
+    gone by the time it's unlinked, or a directory that can no longer be
+    listed, is not an error."""
     if not ANGLE_ID_RE.fullmatch(aid):
         return
     try:
@@ -1337,6 +1414,12 @@ def clear_stale_artifacts(aid, run_dir):
     names = {f"{aid}{suffix}" for suffix in ANGLE_ARTIFACT_SUFFIXES}
     for entry in entries:
         if entry.name not in names:
+            continue
+        if entry.is_symlink():
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
             continue
         try:
             resolved = entry.resolve()
@@ -1357,7 +1440,7 @@ def _mark_interrupted(aid, run_dir):
     collect_angle_result (or a later --from-dir re-merge of the same --dir)
     reports the same outcome, the same way _mark_skipped's dirty-tree/
     compromised markers do for angles that never ran at all."""
-    (run_dir / f"{aid}.skipped.txt").write_text("interrupted\n")
+    write_artifact_text(run_dir / f"{aid}.skipped.txt", "interrupted\n")
 
 
 def make_throwaway_codex_home():
@@ -1403,12 +1486,23 @@ def make_throwaway_codex_home():
     `dir=` it was given, and this path is later placed into angle_env
     (CODEX_HOME) for a child process Popen'd with cwd=root, not this
     process's own cwd — a relative CODEX_HOME there would resolve against
-    the wrong directory."""
+    the wrong directory.
+
+    Registers this directory for cleanup — both the atexit handler (every
+    ordinary exit) and the global _kill_all_and_exit also removes on an
+    interrupt (os._exit bypasses atexit) — immediately after mkdtemp, before
+    the auth.json copy below even starts: a signal or a copy failure
+    (shutil.copyfile raising) between mkdtemp and registration would
+    otherwise orphan a partial or complete copy of the real auth.json on
+    disk with neither cleanup path aware it exists."""
+    global _THROWAWAY_CODEX_HOME
     real_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
     candidate_dir = select_dir_outside_git_checkouts("create the throwaway CODEX_HOME in")
     throwaway = Path(
         tempfile.mkdtemp(prefix="adversarial-review-codex-home.", dir=candidate_dir)
     ).resolve()
+    _THROWAWAY_CODEX_HOME = throwaway
+    atexit.register(shutil.rmtree, throwaway, ignore_errors=True)
     real_auth = real_home / "auth.json"
     if real_auth.is_file():
         dest_auth = throwaway / "auth.json"
@@ -1443,11 +1537,14 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     # either phase (parallel or serial) schedules any angle — not here, so a
     # queued angle whose run_angle body never gets to run before an
     # interrupt still has its old outputs gone.
-    prompt_text = render_prompt(template, plan, angle, base_resolved)
-    (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
+    # base_sha, not just base_resolved, so the rendered DIFF_COMMAND is
+    # pinned to the exact commit run_meta already committed to — see
+    # render_prompt's own docstring for why the ref name alone isn't enough.
+    prompt_text = render_prompt(template, plan, angle, base_resolved, run_meta["base_sha"])
+    write_artifact_text(run_dir / f"{aid}.prompt.txt", prompt_text)
     meta = dict(run_meta)
     meta["prompt_sha256"] = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-    (run_dir / f"{aid}.meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    write_artifact_text(run_dir / f"{aid}.meta.json", json.dumps(meta, indent=2) + "\n")
     out_path = run_dir / f"{aid}.out.json"
     log_path = run_dir / f"{aid}.log"
     # Every other environment variable passes through unchanged (an
@@ -1494,27 +1591,28 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             # signal landing between Popen() returning and _track_proc()
             # registering it would let the handler's lock-free sweep of
             # _LIVE_PROCS miss this process entirely, leaking it (and
-            # anything it backgrounds) past this run's exit. The _IN_FLIGHT
-            # sentinel (held open only across Popen+_track_proc) makes the
-            # handler itself wait out that exact window before it ever
-            # snapshots _LIVE_PROCS — see _wait_for_in_flight — so by the
-            # time a kill sweep runs, this proc is guaranteed either fully
-            # registered or never started. Checking _CANCELLED immediately
-            # before Popen, and once more right after registering, is a
-            # second, independent line of defense: if cancellation is seen
-            # at either point, this angle kills its own new group itself
-            # rather than trust a sweep, and reports the same outcome the
-            # handler's own exit would have implied.
-            if _CANCELLED:
-                _mark_interrupted(aid, run_dir)
-                return None, spawned
-            # start_new_session makes this process its own process-group
-            # leader, so a timeout can reap everything it spawned via
-            # killpg — not just its own pid, which is all subprocess.run's
-            # built-in timeout kill would reach.
+            # anything it backgrounds) past this run's exit. The sentinel is
+            # registered in _IN_FLIGHT *before* the _CANCELLED check below,
+            # not after — checking first and registering second would leave
+            # a gap of its own: a signal landing between that check and the
+            # registration finds neither _IN_FLIGHT nor _LIVE_PROCS aware of
+            # this angle yet, so the handler's sweep (see _wait_for_in_flight)
+            # can run and return before this call ever reaches Popen,
+            # letting the spawn proceed after the handler already declared
+            # every tracked process killed. Registering first means the
+            # handler instead waits out this entire window — from here
+            # through Popen+_track_proc — no matter which side of the
+            # _CANCELLED check below it lands on.
             sentinel = object()
             _IN_FLIGHT.append(sentinel)
             try:
+                if _CANCELLED:
+                    _mark_interrupted(aid, run_dir)
+                    return None, spawned
+                # start_new_session makes this process its own process-group
+                # leader, so a timeout can reap everything it spawned via
+                # killpg — not just its own pid, which is all subprocess.run's
+                # built-in timeout kill would reach.
                 proc = subprocess.Popen(
                     cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
                     cwd=root, start_new_session=True, env=angle_env,
@@ -1527,6 +1625,10 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                 # otherwise wedge every future _wait_for_in_flight for the
                 # rest of the run, not just this angle's own window.
                 _IN_FLIGHT.remove(sentinel)
+            # A second, independent check: cancellation observed after
+            # _track_proc but before this line still leaves a freshly
+            # spawned process behind that the sweep above (already run and
+            # returned by the time this angle got here) will never kill.
             if _CANCELLED:
                 kill_process_group(proc)
                 _untrack_proc(proc)
@@ -1535,7 +1637,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
             try:
                 try:
                     proc.communicate(timeout=timeout_sec)
-                    (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n")
+                    write_artifact_text(run_dir / f"{aid}.status", f"{proc.returncode}\n")
                     # A normal exit only proves the reviewer process itself is
                     # gone, not anything it backgrounded (a detached
                     # reproduction, a leftover server) — that survives in the
@@ -1554,7 +1656,7 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
                         print(note, end="", file=sys.stderr)
                 except subprocess.TimeoutExpired:
                     kill_process_group(proc)
-                    (run_dir / f"{aid}.status").write_text("124\n")
+                    write_artifact_text(run_dir / f"{aid}.status", "124\n")
                 except BaseException:
                     # Belt-and-suspenders: SIGINT/SIGTERM during the serial
                     # (workspace-write) phase are normally handled by
@@ -1585,7 +1687,7 @@ def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
     UNPARSED(<cause>) this run does; and records the in-memory AngleResult
     for this run's own report."""
     clear_stale_artifacts(aid, run_dir)
-    (run_dir / f"{aid}.skipped.txt").write_text(f"{cause}\n")
+    write_artifact_text(run_dir / f"{aid}.skipped.txt", f"{cause}\n")
     synthetic_results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
 
 
@@ -1655,7 +1757,7 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
                 continue
         status = git_status_porcelain(root)
         if status.strip():
-            (run_dir / f"{aid}.residue.txt").write_text(status)
+            write_artifact_text(run_dir / f"{aid}.residue.txt", status)
             print(f"{PROG}: angle '{aid}' left the working tree dirty — not reverting:", file=sys.stderr)
             for line in status.splitlines():
                 print(f"  {line}", file=sys.stderr)
@@ -1759,7 +1861,7 @@ def main(argv=None):
         plan_path = Path(args.plan).resolve()
         if not plan_path.is_file():
             env_error(f"no such plan file: {plan_path}")
-        plan = load_plan(plan_path)
+        plan = load_plan(plan_path, drop_run=True)
         angle_ids_all = [a["id"] for a in plan["angles"]]
         angles_by_id = {a["id"]: a for a in plan["angles"]}
         angle_ids = parse_only(args.only, angle_ids_all) or angle_ids_all
@@ -1781,15 +1883,11 @@ def main(argv=None):
 
         # One throwaway CODEX_HOME for the whole run (every angle, parallel
         # and serial alike, shares it) — see make_throwaway_codex_home for
-        # why. Registered for cleanup immediately, before any angle can
-        # spawn: atexit covers every ordinary sys.exit path below (a usage
-        # or environment error, a spawn-failure abort, the normal return),
-        # and the global lets _kill_all_and_exit clean it up on an interrupt
-        # too, since os._exit bypasses atexit.
-        global _THROWAWAY_CODEX_HOME
+        # why. That function registers its own cleanup (both the atexit
+        # handler and the _THROWAWAY_CODEX_HOME global _kill_all_and_exit
+        # uses on an interrupt) immediately after creating the directory,
+        # before any angle can spawn and before its own auth.json copy.
         codex_home = make_throwaway_codex_home()
-        _THROWAWAY_CODEX_HOME = codex_home
-        atexit.register(shutil.rmtree, codex_home, ignore_errors=True)
 
         root = repo_root()
         base = args.base or plan.get("base")
@@ -1807,17 +1905,24 @@ def main(argv=None):
         # all. template_hash is filled in below, once the template itself is
         # loaded — every comparison against this dict (the reused-`--dir`
         # broad clear, collect_angle_result's meta check) happens after that.
+        base_sha = resolve_base_sha(base_resolved, root)
         run_meta = {
             "plan_hash": compute_plan_hash(plan),
             "base_resolved": base_resolved,
-            "base_sha": resolve_base_sha(base_resolved, root),
+            "base_sha": base_sha,
         }
 
-        diff_check = git(["diff", f"{base_resolved}...HEAD", "--name-only"], root)
+        # Diffed against the pinned commit, not base_resolved's ref name —
+        # a ref can move between this resolution and whenever a spawned
+        # angle's own rendered DIFF_COMMAND (see render_prompt) actually
+        # runs, and this run's own empty-diff gate must see the same commit
+        # every angle is told to diff against, not a name that could by now
+        # point somewhere else.
+        diff_check = git(["diff", f"{base_sha}...HEAD", "--name-only"], root)
         if diff_check.returncode != 0:
-            env_error(f"git diff {base_resolved}...HEAD failed: {diff_check.stderr.strip()}")
+            env_error(f"git diff {base_sha}...HEAD failed: {diff_check.stderr.strip()}")
         if not diff_check.stdout.strip():
-            env_error(f"empty diff between {base_resolved} and HEAD — nothing to review")
+            env_error(f"empty diff between {base_resolved} ({base_sha}) and HEAD — nothing to review")
 
         if args.jobs is not None and args.jobs < 1:
             usage_error("--jobs must be >= 1")
@@ -1913,7 +2018,7 @@ def main(argv=None):
         clear_merged_json(run_dir)
         plan_doc = dict(plan)
         plan_doc["_run"] = run_meta
-        (run_dir / "plan.json").write_text(json.dumps(plan_doc, indent=2) + "\n")
+        write_artifact_text(run_dir / "plan.json", json.dumps(plan_doc, indent=2) + "\n")
 
         # Read-only angles don't write to the checkout, so they're safe to
         # race in the shared thread pool. workspace-write angles run against

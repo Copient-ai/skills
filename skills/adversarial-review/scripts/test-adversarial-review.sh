@@ -1480,8 +1480,15 @@ for f in "$argvdir25d"/[0-9]*; do
 done
 last25d=$((argv_n25d - 1))
 check "argv has at least one element logged" test "$argv_n25d" -ge 1
-check "the rendered prompt's diff command names the fully-qualified ref" \
-  grep -qF "git diff refs/remotes/origin/main...HEAD" "$argvdir25d/$last25d"
+# DIFF_COMMAND is now pinned to the resolved commit itself (see case 40 --
+# base_sha, not the mutable base_resolved ref name), not a bare ref a
+# downstream `git diff` would re-resolve fresh -- so this checks against
+# origin_sha25d (the commit refs/remotes/origin/main actually resolved to
+# above), not the ref name. Re-resolving the ref name at this point would
+# hit the decoy (identical to HEAD) instead, exactly the bug this case
+# exists to catch.
+check "the rendered prompt's diff command is pinned to the resolved commit, not the decoy" \
+  grep -qF "git diff $origin_sha25d...HEAD" "$argvdir25d/$last25d"
 
 rm -rf "$rundir25d"
 
@@ -2702,6 +2709,399 @@ check "exits 1 (environment error), never falls back to the decoy" test "$rc38" 
 check "names the expected qualified ref refs/remotes/origin/main" \
   grep -qF "refs/remotes/origin/main" <<<"$err38"
 
+
+# --- Case 39: write_artifact_text refuses to write through a symlinked --------
+# merged.json, never following it into a sentinel elsewhere
+# Regression: every artifact write used a plain Path.write_text(), which
+# transparently follows a symlink at the destination path. A run directory
+# can be reused across invocations, or (via --from-dir) point anywhere the
+# caller names -- so a symlink planted at merged.json's path let a crafted
+# or reused run directory clobber an arbitrary writable file. write_text is
+# now write_artifact_text, which opens with O_NOFOLLOW: the open() itself
+# fails (ELOOP) when the last path component is a symlink, refused as an
+# environment error, never written through.
+dir39="$tmpdir/symlink-merged-json.$$.${RANDOM:-0}"
+mkdir -p "$dir39"
+cat > "$dir39/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+printf '0\n' > "$dir39/solo.status"
+cat > "$dir39/solo.out.json" <<'EOF'
+{"angle": "solo", "verdict": "CLEAN", "summary": "fine", "findings": []}
+EOF
+sentinel39="$tmpdir/sentinel-merged.$$.${RANDOM:-0}.txt"
+echo "do not touch me" > "$sentinel39"
+ln -s "$sentinel39" "$dir39/merged.json"
+
+out39=$(bash "$SH" --from-dir "$dir39" 2>&1); rc39=$?
+echo "--- case 39: --from-dir refuses to write through a symlinked merged.json ---"
+printf '%s\n' "$out39"
+
+check "exits 1 (environment error), never following the symlink" test "$rc39" -eq 1
+# The exact env_error message, not a loose "symlink" substring match --
+# this run directory's own name ("symlink-merged-json") also contains
+# "symlink" and appears in the report's own DIR= line, which would
+# otherwise make this check pass for the wrong reason.
+check "stderr names the refusal to write through a symlink" \
+  grep -qi "refusing to write through a symlink" <<<"$out39"
+check "the sentinel elsewhere is untouched" grep -qx "do not touch me" "$sentinel39"
+check "merged.json is still the symlink, never replaced by a real file" test -L "$dir39/merged.json"
+
+rm -rf "$dir39"
+
+# --- Case 39b: a reused live --dir with a symlinked plan.json is refused, ------
+# never written through
+# Same fix, exercised on the live-run path's own plan.json write (main()'s
+# `write_artifact_text(run_dir / "plan.json", ...)`), which runs before any
+# angle is ever spawned.
+repo39b=$(make_throwaway_repo symlink-plan-live)
+plan39b="$tmpdir/symlink-plan-live-plan.$$.${RANDOM:-0}.json"
+cat > "$plan39b" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+rundir39b="$tmpdir/symlink-plan-live-run.$$.${RANDOM:-0}"
+mkdir -p "$rundir39b"
+sentinel39b="$tmpdir/sentinel-plan.$$.${RANDOM:-0}.json"
+echo '{"marker": "do-not-touch"}' > "$sentinel39b"
+ln -s "$sentinel39b" "$rundir39b/plan.json"
+
+out39b=$(cd "$repo39b" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" \
+  ADV_TEST_ARGV_DIR="$tmpdir/symlink-plan-live-argv.$$.${RANDOM:-0}" \
+  bash "$SH" --plan "$plan39b" --base main --dir "$rundir39b" 2>&1); rc39b=$?
+echo "--- case 39b: a reused live --dir refuses to write through a symlinked plan.json ---"
+printf '%s\n' "$out39b"
+
+check "exits 1 (environment error), never following the symlink" test "$rc39b" -eq 1
+# Same reasoning as case 39's own tightened check: this run directory's own
+# name ("symlink-plan-live") also contains "symlink".
+check "stderr names the refusal to write through a symlink" \
+  grep -qi "refusing to write through a symlink" <<<"$out39b"
+check "the sentinel elsewhere is untouched" grep -q "do-not-touch" "$sentinel39b"
+check "plan.json is still the symlink, never replaced by a real file" test -L "$rundir39b/plan.json"
+
+rm -rf "$rundir39b"
+
+# --- Case 39c: clear_stale_artifacts unlinks a stale symlink entry itself, ----
+# never its target
+# Regression: clear_stale_artifacts used to resolve() each survivor before
+# checking containment, which follows a symlink to its target first -- an
+# out-of-run_dir symlink then failed that containment check and was left in
+# place untouched (never cleared), and one pointed back inside run_dir would
+# have deleted the wrong file (the target, not the stale link). It now
+# unlinks a symlink survivor as the link entry itself, unconditionally,
+# without ever resolving or following it.
+base39c="$tmpdir/stale-symlink-artifact.$$.${RANDOM:-0}"
+rundir39c="$base39c/rundir"
+mkdir -p "$rundir39c"
+sentinel39c="$base39c/outside-target.json"
+echo '{"marker": "do-not-touch"}' > "$sentinel39c"
+ln -s "$sentinel39c" "$rundir39c/beta.out.json"
+printf '0\n' > "$rundir39c/beta.status"
+cat > "$rundir39c/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Old plan.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+
+repo39c=$(make_throwaway_repo stale-symlink-artifact)
+plan39c="$repo39c/plan.json"
+cat > "$plan39c" <<'EOF'
+{"version": 1, "base": "main", "promise": "New plan -- materially different.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+argvdir39c="$tmpdir/stale-symlink-artifact-argv.$$.${RANDOM:-0}"
+
+out39c=$(cd "$repo39c" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir39c" \
+  bash "$SH" --plan "$plan39c" --base main --dir "$rundir39c" 2>&1); rc39c=$?
+echo "--- case 39c: a stale symlinked <angle>.out.json is removed, its target survives ---"
+printf '%s\n' "$out39c"
+
+check "run exits 0" test "$rc39c" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out39c"
+check "the stale beta.out.json symlink entry is gone" test ! -L "$rundir39c/beta.out.json"
+check "no file remains at that path at all" test ! -e "$rundir39c/beta.out.json"
+check "its target outside run_dir survives" test -f "$sentinel39c"
+check "the target's content is untouched" grep -q "do-not-touch" "$sentinel39c"
+
+rm -rf "$rundir39c" "$base39c"
+
+# --- Case 40: base drift -- the rendered DIFF_COMMAND and the recorded --------
+# _run.base_sha both stay pinned to the commit resolved at the start of the
+# run, even if the base branch moves again before every angle finishes
+# Regression: base_sha was captured once into run_meta, but render_prompt's
+# DIFF_COMMAND and the empty-diff gate both dereferenced the mutable
+# base_resolved ref name instead -- a base that advances (another push
+# landing mid-review) between resolution and whenever a spawned angle
+# actually runs its own rendered `git diff` command would silently diff
+# against a different commit than the one this run's own provenance
+# actually committed to. fixtures/fake-codex-advance-base.sh simulates
+# exactly that: it force-moves `main` to a different commit from inside the
+# angle's own process, strictly after main() already resolved base_sha and
+# rendered the prompt.
+repo40=$(make_throwaway_repo base-drift)
+orig_sha40=$(git -C "$repo40" rev-parse refs/heads/main)
+feature_sha40=$(git -C "$repo40" rev-parse refs/heads/feature)
+cat > "$repo40/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+argvdir40="$tmpdir/base-drift-argv.$$.${RANDOM:-0}"
+rundir40="$tmpdir/base-drift-run.$$.${RANDOM:-0}"
+
+out40=$(cd "$repo40" && CODEX_BIN="$FIXTURES/fake-codex-advance-base.sh" \
+  ADV_TEST_ARGV_DIR="$argvdir40" ADV_TEST_ADVANCE_BASE_TO="$feature_sha40" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir40" 2>&1); rc40=$?
+echo "--- case 40: base drift -- DIFF_COMMAND and recorded base_sha stay pinned ---"
+printf '%s\n' "$out40"
+
+check "run exits 0" test "$rc40" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out40"
+check "setup: the base branch really did move during the run" \
+  bash -c 'test "$(git -C "$1" rev-parse refs/heads/main)" = "$2"' _ "$repo40" "$feature_sha40"
+
+argv_n40=0
+for f in "$argvdir40"/[0-9]*; do
+  [ -e "$f" ] && argv_n40=$((argv_n40 + 1))
+done
+last40=$((argv_n40 - 1))
+check "the rendered prompt's diff command names the original base commit" \
+  grep -qF "git diff $orig_sha40...HEAD" "$argvdir40/$last40"
+check "the rendered prompt never names the drifted commit instead" \
+  bash -c '! grep -qF "git diff $2...HEAD" "$1"' _ "$argvdir40/$last40" "$feature_sha40"
+check "run_dir/plan.json's recorded _run.base_sha is the original commit, not the drifted one" \
+  python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+sys.exit(0 if doc["_run"]["base_sha"] == sys.argv[2] else 1)
+' "$rundir40/plan.json" "$orig_sha40"
+
+rm -rf "$rundir40"
+
+# --- Case 41: run_angle registers the in-flight sentinel before checking ------
+# _CANCELLED, not after
+# Regression: run_angle used to check _CANCELLED, then append the in-flight
+# sentinel to _IN_FLIGHT. A signal landing in exactly that gap finds neither
+# _IN_FLIGHT nor _LIVE_PROCS aware of this angle yet, so the interrupt
+# handler's sweep (_wait_for_in_flight) can run to completion -- and declare
+# every tracked process killed -- before this call ever reaches Popen,
+# letting a spawn proceed after the handler already exited. The earlier
+# "run_angle honors _CANCELLED before ever spawning a reviewer" case (above)
+# presets _CANCELLED before calling run_angle at all, which both orderings
+# pass identically -- it cannot distinguish them. This test instead makes
+# _IN_FLIGHT.append itself the trigger that flips _CANCELLED (simulating a
+# signal landing at the exact instant of registration): the OLD ordering
+# already passed its (still-False) _CANCELLED check by that point and would
+# go on to call Popen anyway; the FIXED ordering checks _CANCELLED again only
+# after append, sees it now True, and never calls Popen at all.
+cancel_order_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+class TriggeringList(list):
+    def append(self, item):
+        ar._CANCELLED = True
+        super().append(item)
+
+ar._IN_FLIGHT = TriggeringList()
+ar._CANCELLED = False
+
+def fail_popen(*a, **kw):
+    raise AssertionError("Popen must not be called once _CANCELLED went True at registration")
+ar.subprocess.Popen = fail_popen
+
+angle = {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}
+plan = {"promise": "Ships a thing.", "contracts": [], "invariants": []}
+
+with tempfile.TemporaryDirectory() as d:
+    run_dir = Path(d)
+    run_meta = {"plan_hash": "deadbeef", "base_resolved": "main", "base_sha": "cafef00d"}
+    err, spawned = ar.run_angle(
+        "alpha", angle, plan, "main", "template {{ANGLE_ID}}",
+        run_dir, "/tmp", "schema.json", 5, Path("/tmp/unused-codex-home"), run_meta,
+    )
+    result = ar.collect_angle_result(angle, run_dir)
+    ok = (
+        err is None and spawned is False
+        and result.kind == "UNPARSED" and result.cause == "interrupted"
+    )
+    print("OK" if ok else f"MISMATCH: err={err!r} spawned={spawned!r} kind={result.kind!r} cause={result.cause!r}")
+PYEOF
+)
+echo "--- run_angle: the sentinel is registered before _CANCELLED is checked ---"
+printf '%s\n' "$cancel_order_check"
+check "cancellation observed exactly at sentinel-registration time still skips Popen" \
+  test "$cancel_order_check" = "OK"
+
+# --- Case 42: a saved run's own plan.json, reused as --plan, is not stale -----
+# under a later --from-dir
+# Regression: run_dir/plan.json (written at the end of a live run) carries a
+# top-level "_run" bookkeeping key. Reusing that file directly as a fresh
+# --plan input (a natural thing to do -- it's a valid, complete plan) used to
+# hash it -- "_run" included -- into this new run's own recorded plan_hash.
+# --from-dir always strips "_run" before recomputing that same hash (it has
+# to, to compare against a plan that may have been hand-edited since), so the
+# two shapes could never match and every angle came back UNPARSED(stale)
+# despite the plan's real content never changing. load_plan(path,
+# drop_run=True) (main()'s live-run branch only) now strips "_run" up front,
+# before validation and hashing, so a reused saved plan.json hashes the same
+# way whether it's read as a fresh --plan or recomputed later by --from-dir.
+repo42=$(make_throwaway_repo reuse-saved-run-plan)
+cat > "$repo42/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+argvdir42="$tmpdir/reuse-saved-run-plan-argv.$$.${RANDOM:-0}"
+rundir42a="$tmpdir/reuse-saved-run-plan-run-a.$$.${RANDOM:-0}"
+
+out42_1=$(cd "$repo42" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir42" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir42a" 2>&1); rc42_1=$?
+echo "--- case 42: first (original) run ---"
+printf '%s\n' "$out42_1"
+check "first run exits 0" test "$rc42_1" -eq 0
+check "first run verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out42_1"
+check "the saved plan.json carries a _run record" \
+  python3 -c 'import json,sys; sys.exit(0 if "_run" in json.load(open(sys.argv[1])) else 1)' "$rundir42a/plan.json"
+
+rundir42b="$tmpdir/reuse-saved-run-plan-run-b.$$.${RANDOM:-0}"
+out42_2=$(cd "$repo42" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir42" \
+  bash "$SH" --plan "$rundir42a/plan.json" --base main --dir "$rundir42b" 2>&1); rc42_2=$?
+echo "--- case 42: rerun using the saved run's own plan.json as --plan, into a fresh dir ---"
+printf '%s\n' "$out42_2"
+check "rerun exits 0" test "$rc42_2" -eq 0
+check "rerun verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out42_2"
+check "stderr notes the reused plan's own _run record was set aside" \
+  grep -qi "_run" <<<"$out42_2"
+
+out42_3=$(bash "$SH" --from-dir "$rundir42b" 2>&1); rc42_3=$?
+echo "--- case 42: --from-dir merges the rerun's own dir normally, never stale ---"
+printf '%s\n' "$out42_3"
+check "--from-dir exits 0" test "$rc42_3" -eq 0
+check "--from-dir verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out42_3"
+check "alpha is CLEAN, not spuriously UNPARSED(stale)" grep -qx "alpha: CLEAN" <<<"$out42_3"
+
+rm -rf "$rundir42a" "$rundir42b"
+
+# --- Case 43: an out.json with invalid UTF-8 bytes folds into UNPARSED, -------
+# never crashes the merge with an uncaught UnicodeDecodeError
+# Regression: collect_angle_result read out.json via Path.read_text(), which
+# decodes with the platform's default encoding and raises UnicodeDecodeError
+# uncaught for a status-0 angle whose out.json holds invalid bytes (a
+# truncated write, a reviewer emitting a stray non-UTF-8 byte) -- crashing
+# the whole run's merge over one angle's output, instead of folding that
+# angle into UNPARSED like any other malformed-output case (nojson, schema,
+# ...) already handled.
+dir43="$tmpdir/invalid-utf8-out.$$.${RANDOM:-0}"
+mkdir -p "$dir43"
+cat > "$dir43/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+printf '0\n' > "$dir43/solo.status"
+# 0xff can never begin a valid UTF-8 sequence -- invalid from the first byte.
+printf '\xff\xfe{"angle": "solo"' > "$dir43/solo.out.json"
+
+out43=$(bash "$SH" --from-dir "$dir43" 2>&1); rc43=$?
+echo "--- case 43: invalid UTF-8 in out.json folds into UNPARSED, never crashes ---"
+printf '%s\n' "$out43"
+
+check "exits 4 (UNPARSED), not an uncaught exception" test "$rc43" -eq 4
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out43"
+check "the angle is reported UNPARSED(undecodable)" grep -qx "solo: UNPARSED(undecodable)" <<<"$out43"
+check "no Python traceback reached stdout+stderr" \
+  bash -c '! grep -q "Traceback (most recent call last)" <<<"$1"' _ "$out43"
+
+rm -rf "$dir43"
+
+# --- Case 44: make_throwaway_codex_home registers cleanup before copying ------
+# auth.json, not after -- a failed copy can never orphan a partial CODEX_HOME
+# Regression: the throwaway directory's cleanup (atexit.register, and the
+# _THROWAWAY_CODEX_HOME global _kill_all_and_exit also removes on an
+# interrupt) used to be registered by main(), only after
+# make_throwaway_codex_home() had already returned -- so a signal, or the
+# auth.json copy itself failing, anywhere inside the function left a
+# freshly-created directory (holding a partial or complete copy of the real
+# auth.json) that neither cleanup path knew existed. Both are now registered
+# immediately after mkdtemp, before the copy is even attempted.
+#
+# shutil.copyfile is monkeypatched to fail, and _IN_FLIGHT-style bookkeeping
+# (a plain ordered log of mkdtemp/register/copyfile calls) proves the
+# directory was created and cleanup was registered for it strictly BEFORE
+# the (failing) copy ever ran -- then invokes the registered cleanup exactly
+# as atexit would at real interpreter exit, and confirms it actually removes
+# the directory the failed call left behind.
+throwaway_cleanup_check=$(python3 - "$SCRIPT_DIR" <<'PYEOF'
+import sys, os
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+fake_real_home = Path(ar.tempfile.mkdtemp())
+(fake_real_home / "auth.json").write_text('{"marker": "real-auth"}')
+os.environ["CODEX_HOME"] = str(fake_real_home)
+
+order = []
+orig_mkdtemp = ar.tempfile.mkdtemp
+
+def spy_mkdtemp(*a, **kw):
+    d = orig_mkdtemp(*a, **kw)
+    order.append(("mkdtemp", d))
+    return d
+ar.tempfile.mkdtemp = spy_mkdtemp
+
+def spy_register(func, *args, **kwargs):
+    order.append(("register", (func, args, kwargs)))
+ar.atexit.register = spy_register
+
+def fail_copy(src, dst):
+    order.append(("copyfile", None))
+    raise OSError("simulated copy failure")
+ar.shutil.copyfile = fail_copy
+
+raised = None
+try:
+    ar.make_throwaway_codex_home()
+except OSError:
+    raised = "OSError"
+except Exception as e:
+    raised = f"other:{e!r}"
+
+mkdtemp_idxs = [i for i, (kind, _) in enumerate(order) if kind == "mkdtemp"]
+register_idxs = [i for i, (kind, _) in enumerate(order) if kind == "register"]
+copyfile_idxs = [i for i, (kind, _) in enumerate(order) if kind == "copyfile"]
+created_dir = order[mkdtemp_idxs[0]][1] if mkdtemp_idxs else None
+
+ok = (
+    raised == "OSError"
+    and created_dir is not None
+    and len(register_idxs) == 1
+    and len(copyfile_idxs) == 1
+    and mkdtemp_idxs and mkdtemp_idxs[0] < register_idxs[0] < copyfile_idxs[0]
+    # make_throwaway_codex_home() .resolve()s the mkdtemp'd path before
+    # assigning the global (a macOS /tmp -> /private/tmp symlink, e.g.) --
+    # compare resolved forms so that's not mistaken for a real mismatch.
+    and ar._THROWAWAY_CODEX_HOME == Path(created_dir).resolve()
+)
+
+if register_idxs:
+    func, args, kwargs = order[register_idxs[0]][1]
+    func(*args, **kwargs)
+cleaned = created_dir is not None and not os.path.exists(created_dir)
+
+print("OK" if ok and cleaned else
+      f"MISMATCH: raised={raised!r} order={order!r} "
+      f"THROWAWAY={ar._THROWAWAY_CODEX_HOME!r} cleaned={cleaned!r}")
+PYEOF
+)
+echo "--- case 44: cleanup is registered before auth.json is copied ---"
+printf '%s\n' "$throwaway_cleanup_check"
+check "a failed copy still leaves cleanup registered, and that cleanup removes the directory" \
+  test "$throwaway_cleanup_check" = "OK"
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh
