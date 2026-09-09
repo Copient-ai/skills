@@ -247,7 +247,29 @@ EOF
 out=$(bash "$REVIEW" --from-dir "$dir" 2>/dev/null); rc=$?
 check "a duplicate angle id in the plan is a usage error, exit 2" test "$rc" -eq 2
 
-# --- Case 13: --version answers before touching python3/codex ------------
+# --- Case 13: --from-dir into a git checkout diverts merged.json ----------
+# tmpdir itself is not a repo; make this one case's own dir a throwaway repo
+# so it reproduces what a committed fixtures directory (a real git checkout)
+# would trigger, without touching one.
+dir="$tmpdir/ingit"
+mkdir -p "$dir"
+git -C "$dir" init --quiet
+cat > "$dir/plan.json" <<'EOF'
+{
+  "version": 1, "promise": "Ships a thing without breaking anything else.",
+  "angles": [{"id": "solo", "title": "Solo", "mandate": "Look for bugs.", "evidence": "A failing input.", "execution": "read-only"}]
+}
+EOF
+printf '0\n' > "$dir/solo.status"
+printf '{"angle": "solo", "verdict": "CLEAN", "summary": "Nothing found.", "findings": []}\n' > "$dir/solo.out.json"
+
+out=$(bash "$REVIEW" --from-dir "$dir" 2>&1 >/dev/null); rc=$?
+check "--from-dir into a git checkout never writes merged.json there" \
+  bash -c '[ ! -e "$1/merged.json" ]' _ "$dir"
+check "--from-dir into a git checkout warns and diverts merged.json" \
+  grep -qF "is inside a git checkout; merged.json written to" <<<"$out"
+
+# --- Case 14: --version answers before touching python3/codex ------------
 # PATH is emptied, not just scrubbed of codex/python3, so this also proves
 # --version returns before the .sh wrapper's own environment checks run.
 ver_out=$(PATH='' "$BASH" "$REVIEW" --version 2>&1)

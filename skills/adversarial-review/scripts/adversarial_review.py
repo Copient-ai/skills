@@ -19,9 +19,11 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -467,6 +469,29 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir):
     return "\n".join(lines), rc, banner, counts
 
 
+def merged_json_path(run_dir, from_dir_mode):
+    """Where merged.json for this run belongs. A live run already refuses a
+    run_dir inside the repo under review, so it always belongs at
+    run_dir/merged.json — but --from-dir can point at any directory the
+    caller names, including one of this skill's own committed fixture
+    directories, which isn't ours to dirty (or, for a read-only install,
+    can't be written at all). Divert to a tempfile in that case."""
+    if from_dir_mode:
+        r = subprocess.run(
+            ["git", "-C", str(run_dir), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip() == "true":
+            fd, path = tempfile.mkstemp(prefix="adversarial-review-merged.", suffix=".json")
+            os.close(fd)
+            print(
+                f"{PROG}: {run_dir} is inside a git checkout; merged.json written to {path} instead",
+                file=sys.stderr,
+            )
+            return Path(path)
+    return run_dir / "merged.json"
+
+
 def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts):
     doc = {
         "version": 1,
@@ -505,6 +530,43 @@ def build_arg_parser():
     return p
 
 
+# Every codex process currently running, so a signal can terminate them
+# before exiting — Popen, not subprocess.run, so there's a handle to kill.
+_LIVE_PROCS_LOCK = threading.Lock()
+_LIVE_PROCS = []
+
+
+def _track(proc):
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.append(proc)
+
+
+def _untrack(proc):
+    with _LIVE_PROCS_LOCK:
+        try:
+            _LIVE_PROCS.remove(proc)
+        except ValueError:
+            pass
+
+
+def _interrupt_and_exit(signum=None, frame=None):
+    """Installed for both SIGINT and SIGTERM: a plain `except KeyboardInterrupt`
+    around the executor wait isn't enough on its own — a signal merely
+    flagged pending doesn't reliably interrupt cf.as_completed()'s blocking
+    wait, and SIGTERM has no Python default handler at all. os._exit, not
+    sys.exit, so an already-running angle's worker thread (blocked in
+    proc.wait()) is never joined first — ThreadPoolExecutor otherwise waits
+    for it at interpreter shutdown, which could take the full --timeout."""
+    for proc in list(_LIVE_PROCS):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    print(f"{PROG}: interrupted — terminating in-flight reviewer processes", file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(130)
+
+
 def run_angle(aid, angle, plan, base_resolved, template, execution_mode, run_dir, root, schema_path, timeout_sec):
     """Runs one ephemeral `codex exec`. Returns an error string only on a
     spawn failure (exit 3); a nonzero exit or timeout instead lands in
@@ -530,14 +592,20 @@ def run_angle(aid, angle, plan, base_resolved, template, execution_mode, run_dir
     ]
     try:
         with open(log_path, "wb") as logfh:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                cwd=root, env=os.environ, timeout=timeout_sec,
+                cwd=root, env=os.environ,
             )
-        (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n", encoding="utf-8")
-        return None
-    except subprocess.TimeoutExpired:
-        (run_dir / f"{aid}.status").write_text("124\n", encoding="utf-8")
+            _track(proc)
+            try:
+                proc.wait(timeout=timeout_sec)
+                (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n", encoding="utf-8")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                (run_dir / f"{aid}.status").write_text("124\n", encoding="utf-8")
+            finally:
+                _untrack(proc)
         return None
     except OSError as e:
         return str(e)
@@ -553,6 +621,11 @@ def _load_selected_plan(plan_path, only_arg):
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+
+    # Harmless when nothing is ever spawned (--version/--print-base/--from-dir):
+    # _LIVE_PROCS just stays empty. See _interrupt_and_exit.
+    signal.signal(signal.SIGINT, _interrupt_and_exit)
+    signal.signal(signal.SIGTERM, _interrupt_and_exit)
 
     if args.version:
         print(f"adversarial_review.py {VERSION}")
@@ -643,9 +716,6 @@ def main(argv=None):
         # --jobs still overrides, on the operator's own head.
         default_jobs = 1 if args.allow_writes else min(len(angle_ids), 4)
         jobs = args.jobs or default_jobs
-        # No `with`: on KeyboardInterrupt we shut down without waiting so an
-        # already-queued (not yet started) angle never launches a codex
-        # process after the operator has asked to stop.
         ex = cf.ThreadPoolExecutor(max_workers=jobs)
         try:
             future_to_id = {
@@ -664,9 +734,13 @@ def main(argv=None):
                     results_by_id[aid] = collect_angle_result(angles_by_id[aid], run_dir)
             ex.shutdown(wait=True)
         except KeyboardInterrupt:
-            ex.shutdown(wait=False, cancel_futures=True)
-            print(f"{PROG}: interrupted", file=sys.stderr)
-            sys.exit(130)
+            # Belt-and-suspenders: the real interrupt path is the signal
+            # handler installed above, which os._exit's before this could
+            # ever run. Route through it anyway for the same correct
+            # behavior (terminate in-flight procs, exit without waiting on
+            # ThreadPoolExecutor's own atexit join) if a KeyboardInterrupt
+            # ever reaches here some other way.
+            _interrupt_and_exit()
 
         if spawn_failures:
             for aid, err in spawn_failures:
@@ -679,7 +753,7 @@ def main(argv=None):
             print(status if status else "(clean)", file=sys.stderr)
 
     merged_findings = merge_findings([results_by_id[aid] for aid in angle_ids])
-    merged_path = run_dir / "merged.json"
+    merged_path = merged_json_path(run_dir, from_dir_mode=bool(args.from_dir))
     report, rc, banner, counts = build_report(angle_ids, results_by_id, merged_findings, run_dir)
     write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts)
     print(report)
