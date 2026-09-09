@@ -339,7 +339,13 @@ def resolve_base(base, cwd):
     loop's own), which never verifies, and control would fall through to
     refs/heads/origin/main — a wrong answer whenever a local branch happens
     to be named literally "origin/main", the exact decoy this function's
-    own fully-qualified-remote design otherwise exists to defeat."""
+    own fully-qualified-remote design otherwise exists to defeat. If that
+    prefix names a remote that really is configured but the qualified ref
+    still doesn't verify, this fails immediately, naming the missing ref —
+    it never falls through to the generic searches below, which could
+    otherwise resolve to something unrelated (that same "origin/main" local
+    branch, a different remote's ref, ...) standing in for a remote ref that
+    was actually expected to exist."""
     remotes_r = git(["remote"], cwd=cwd)
     remotes = [l for l in remotes_r.stdout.splitlines() if l.strip()] if remotes_r.returncode == 0 else []
     # origin tried first when present, matching the previous candidate order.
@@ -351,6 +357,19 @@ def resolve_base(base, cwd):
             qualified = f"refs/remotes/{remote_prefix}/{rest}"
             if git_verify(qualified, cwd):
                 return qualified
+            # remote_prefix names a remote that is actually configured, so
+            # this is never "maybe base is a local branch/tag instead" —
+            # it's a remote ref that was expected to exist (fetched wrong, a
+            # --base copied from a different checkout, ...) and doesn't.
+            # Falling through to the generic searches below would risk
+            # resolving to something else entirely — e.g. a local branch
+            # literally named "origin/main" via the refs/heads/<base>
+            # fallback further down — silently standing in for the missing
+            # remote ref instead of failing loudly.
+            env_error(
+                f"cannot resolve base ref '{base}': '{remote_prefix}' is a configured "
+                f"remote but {qualified} does not exist"
+            )
 
     for remote in ordered_remotes:
         qualified = f"refs/remotes/{remote}/{base}"
@@ -563,16 +582,17 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
     # nothing to compare against, so the check is skipped rather than
     # treating every angle as stale). When present, every angle's own
     # .meta.json (written by run_angle alongside its other artifacts — see
-    # run_meta) must match it exactly: a reused `--dir` whose plan or base
-    # changed between two live runs, combined with `--only` selecting just
-    # some angles, leaves an unselected angle's older .status/.out.json
-    # sitting next to the *new* plan.json (main()'s own broad clear on a
-    # detected change is the primary defense — see main() — this is the
-    # backstop for whatever it misses: a hand-edited run dir, a partial
-    # failure between the clear and the rewrite, ...). A missing or
+    # run_meta) must match it exactly: a reused `--dir` whose plan, base, or
+    # angle-prompt template changed between two live runs, combined with
+    # `--only` selecting just some angles, leaves an unselected angle's older
+    # .status/.out.json sitting next to the *new* plan.json (main()'s own
+    # broad clear on a detected change is the primary defense — see main() —
+    # this is the backstop for whatever it misses: a hand-edited run dir, a
+    # partial failure between the clear and the rewrite, ...). A missing or
     # mismatched meta is never trusted as any verdict, however well-formed
     # its .status/.out.json otherwise look — it is attributed to nothing,
-    # not misattributed to the plan/base sitting in run_dir right now.
+    # not misattributed to the plan/base/template sitting in run_dir right
+    # now.
     if expected_run_meta is not None:
         if not meta_path.is_file():
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
@@ -582,7 +602,7 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
         if not isinstance(meta, dict) or any(
             meta.get(k) != expected_run_meta.get(k)
-            for k in ("plan_hash", "base_resolved", "base_sha")
+            for k in ("plan_hash", "base_resolved", "base_sha", "template_hash")
         ):
             return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
 
@@ -1291,12 +1311,42 @@ ANGLE_ARTIFACT_SUFFIXES = (
 
 
 def clear_stale_artifacts(aid, run_dir):
-    """Delete any leftover files for angle `aid` in `run_dir` before it's
-    launched again. Best-effort: a file that's already gone is not an
-    error."""
-    for suffix in ANGLE_ARTIFACT_SUFFIXES:
+    """Delete any leftover artifact files for angle `aid` in `run_dir` before
+    it's launched again. `aid` is not always trustworthy: main()'s reused-
+    `--dir` handling calls this for every id found in the run directory's
+    OWN existing plan.json, read straight off disk without going through
+    validate_plan's ANGLE_ID_RE check — a hand-edited or otherwise malformed
+    plan.json can carry an id like "../../project/server", and naively
+    unlinking `run_dir / f"{aid}{suffix}"` would then remove a file outside
+    run_dir entirely. So this never builds a path from `aid` and unlinks it
+    directly: it lists run_dir's own entries, keeps only regular files whose
+    name is exactly `<aid><suffix>` for `suffix` one of
+    ANGLE_ARTIFACT_SUFFIXES, confirms each survivor's resolved path is still
+    inside run_dir, and unlinks only those. A hostile id fails the
+    ANGLE_ID_RE check before any filename is even considered; the
+    resolve-and-relative_to check below is the backstop in case that ever
+    changes. Best-effort: a file gone by the time it's unlinked, or a
+    directory that can no longer be listed, is not an error."""
+    if not ANGLE_ID_RE.fullmatch(aid):
+        return
+    try:
+        run_dir_resolved = run_dir.resolve()
+        entries = list(run_dir_resolved.iterdir())
+    except OSError:
+        return
+    names = {f"{aid}{suffix}" for suffix in ANGLE_ARTIFACT_SUFFIXES}
+    for entry in entries:
+        if entry.name not in names:
+            continue
         try:
-            (run_dir / f"{aid}{suffix}").unlink()
+            resolved = entry.resolve()
+            resolved.relative_to(run_dir_resolved)
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            resolved.unlink()
         except FileNotFoundError:
             pass
 
@@ -1671,10 +1721,38 @@ def main(argv=None):
         # has nothing to compare an angle's .meta.json against, so it is
         # merged exactly as before this check existed.
         expected_run_meta = plan.get("_run") if isinstance(plan.get("_run"), dict) else None
-        results_by_id = {
-            aid: collect_angle_result(angles_by_id[aid], run_dir, expected_run_meta)
-            for aid in angle_ids
-        }
+        # A per-angle .meta.json can only ever be compared field-for-field
+        # against "_run" (see collect_angle_result) — it says nothing about
+        # whether plan.json ITSELF was hand-edited after the run that
+        # produced those .meta.json files, since editing the file in place
+        # leaves "_run" (and so every angle's still-matching meta) untouched.
+        # Recomputing plan.json's own canonical hash — with "_run" stripped
+        # back out, the same shape compute_plan_hash saw before "_run" was
+        # ever stamped in (see main()'s live-run branch) — and requiring it
+        # to equal the recorded plan_hash catches exactly that: a plan
+        # edited after the fact must never merge under its original,
+        # no-longer-accurate verdict.
+        plan_edited_since_run = (
+            expected_run_meta is not None
+            and compute_plan_hash({k: v for k, v in plan.items() if k != "_run"})
+            != expected_run_meta.get("plan_hash")
+        )
+        if plan_edited_since_run:
+            print(
+                f"{PROG}: plan.json in {run_dir} has changed since this run directory "
+                "was produced (recomputed hash does not match the recorded plan_hash) "
+                "— every angle is reported UNPARSED(stale), not its earlier verdict",
+                file=sys.stderr,
+            )
+            results_by_id = {
+                aid: AngleResult(aid, angles_by_id[aid]["title"], "UNPARSED", cause="stale")
+                for aid in angle_ids
+            }
+        else:
+            results_by_id = {
+                aid: collect_angle_result(angles_by_id[aid], run_dir, expected_run_meta)
+                for aid in angle_ids
+            }
     else:
         if not args.plan:
             usage_error("--plan FILE is required unless --from-dir is given")
@@ -1721,11 +1799,14 @@ def main(argv=None):
         # This run's provenance record — stamped into run_dir/plan.json's
         # "_run" key and into every angle's own <aid>.meta.json (see
         # run_angle) — so a `--dir` reused later, whether by a second live
-        # run or a separate `--from-dir` merge, can tell whether the plan or
-        # the base has moved since an artifact sitting in run_dir was
-        # produced. base_sha (not just base_resolved's name) matters on its
-        # own: the same branch name can advance between two runs that never
-        # touched --plan or --base at all.
+        # run or a separate `--from-dir` merge, can tell whether the plan,
+        # the base, or the angle-prompt template has moved since an artifact
+        # sitting in run_dir was produced. base_sha (not just
+        # base_resolved's name) matters on its own: the same branch name can
+        # advance between two runs that never touched --plan or --base at
+        # all. template_hash is filled in below, once the template itself is
+        # loaded — every comparison against this dict (the reused-`--dir`
+        # broad clear, collect_angle_result's meta check) happens after that.
         run_meta = {
             "plan_hash": compute_plan_hash(plan),
             "base_resolved": base_resolved,
@@ -1753,6 +1834,14 @@ def main(argv=None):
         # mismatched pair and could report a false verdict for a run that
         # never actually happened.
         template = load_angle_prompt_template(args.angle_prompt, script_dir)
+        # A different --angle-prompt template gives every angle materially
+        # different instructions even when the plan and base are byte-for-
+        # byte unchanged — an angle's artifacts must count as stale exactly
+        # as they would after a plan/base change (same run_meta-equality
+        # check, both in the reused-`--dir` broad clear below and in
+        # collect_angle_result's per-angle meta backstop), not survive under
+        # a template that never actually produced them.
+        run_meta["template_hash"] = hashlib.sha256(template.encode("utf-8")).hexdigest()
         schema_path = script_dir / "findings.schema.json"
 
         if args.dir:

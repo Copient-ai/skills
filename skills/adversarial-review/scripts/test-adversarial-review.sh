@@ -2190,20 +2190,32 @@ rm -rf "$rundir30"
 # entirely, however well-formed the angle's own .status/.out.json otherwise
 # look. Hand-crafted directly (no live run needed) to unit-test the
 # collect_angle_result check in isolation from main()'s own broad-clear
-# defense (case 30 exercises that one together with this backstop).
+# defense (case 30 exercises that one together with this backstop) --
+# "_run".plan_hash below must be the REAL compute_plan_hash of the plan
+# object minus "_run" (see case 36), or --from-dir's own top-level
+# plan-edited-since-run check would report UNPARSED(stale) for an unrelated
+# reason and this case would no longer isolate the per-field backstop it
+# exists to test.
 dir30b="$tmpdir/meta-mismatch.$$.${RANDOM:-0}"
 mkdir -p "$dir30b"
-cat > "$dir30b/plan.json" <<'EOF'
+plan_hash30b=$(python3 -c '
+import hashlib, json
+plan = {"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+')
+cat > "$dir30b/plan.json" <<EOF
 {"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
  "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}],
- "_run": {"plan_hash": "h1", "base_resolved": "refs/heads/main", "base_sha": "aaaa000"}}
+ "_run": {"plan_hash": "$plan_hash30b", "base_resolved": "refs/heads/main", "base_sha": "aaaa000"}}
 EOF
 printf '0\n' > "$dir30b/solo.status"
 cat > "$dir30b/solo.out.json" <<'EOF'
 {"angle": "solo", "verdict": "CLEAN", "summary": "looks fine", "findings": []}
 EOF
-cat > "$dir30b/solo.meta.json" <<'EOF'
-{"plan_hash": "h1", "base_resolved": "refs/heads/main", "base_sha": "different-sha"}
+cat > "$dir30b/solo.meta.json" <<EOF
+{"plan_hash": "$plan_hash30b", "base_resolved": "refs/heads/main", "base_sha": "different-sha"}
 EOF
 
 out30b=$(bash "$SH" --from-dir "$dir30b" 2>&1); rc30b=$?
@@ -2475,6 +2487,220 @@ check "U+2028/U+2029 are escaped, not left as real line boundaries for str.split
   test "$splitlines_check" = "OK"
 
 rm -rf "$dir34"
+
+# --- Case 35: a hostile id in a reused --dir's old plan.json can never make ----
+# clear_stale_artifacts unlink outside the run directory
+# Regression: clear_stale_artifacts used to build `run_dir / f"{aid}{suffix}"`
+# and unlink it directly. For ids collected from the CURRENT --plan
+# (already checked against ANGLE_ID_RE by validate_plan) that's safe, but
+# main()'s reused-`--dir` stale-clear also calls it for every id found in
+# the run directory's OWN existing plan.json, read straight off disk
+# without any revalidation -- a hand-edited or otherwise malformed one can
+# carry an id like "../../escape", and `run_dir / "../../escape.log"`
+# resolves outside run_dir entirely. rundir35 is nested two levels under
+# base35 (base35/nested/rundir) so that traversal lands at a sentinel this
+# test controls (base35/escape.log), not somewhere in shared /tmp.
+base35="$tmpdir/hostile-old-plan-id.$$.${RANDOM:-0}"
+rundir35="$base35/nested/rundir"
+mkdir -p "$rundir35"
+sentinel35="$base35/escape.log"
+echo "SENTINEL-DO-NOT-DELETE" > "$sentinel35"
+
+# "beta" appears only in the OLD plan.json below, never the new one -- proof
+# that clear_stale_artifacts still does its ordinary job for a legitimate
+# id: nothing in this run recreates beta's files, so they must be gone by
+# the time the run finishes precisely because they were cleared.
+printf '1\n' > "$rundir35/beta.status"
+echo "stale-beta-log" > "$rundir35/beta.log"
+
+cat > "$rundir35/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Old plan.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "../../escape", "title": "Escape", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+
+repo35=$(make_throwaway_repo hostile-old-plan-id)
+plan35="$repo35/plan.json"
+cat > "$plan35" <<'EOF'
+{"version": 1, "base": "main", "promise": "New plan -- materially different.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+argvdir35="$tmpdir/hostile-old-plan-id-argv.$$.${RANDOM:-0}"
+
+out35=$(cd "$repo35" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir35" \
+  bash "$SH" --plan "$plan35" --base main --dir "$rundir35" 2>&1); rc35=$?
+echo "--- case 35: a hostile old-plan id cannot escape the run directory ---"
+printf '%s\n' "$out35"
+
+check "run exits 0" test "$rc35" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out35"
+check "the sentinel outside the run directory survives" test -f "$sentinel35"
+check "the sentinel's content is untouched" \
+  grep -qx "SENTINEL-DO-NOT-DELETE" "$sentinel35"
+check "the run still clears its own stale artifacts for a legitimate id (beta.status)" \
+  test ! -f "$rundir35/beta.status"
+check "the run still clears its own stale artifacts for a legitimate id (beta.log)" \
+  test ! -f "$rundir35/beta.log"
+
+rm -rf "$rundir35" "$base35"
+
+# --- Case 36: --from-dir recomputes plan.json's canonical hash, so a hand- ----
+# edited plan can never merge as CLEAN under the run's original verdict
+# Regression: --from-dir trusted `_run.plan_hash` at face value. If
+# plan.json is hand-edited after a live run (its "_run" bookkeeping key left
+# untouched), every angle's own .meta.json still matches "_run" field for
+# field, so the stale artifacts would merge as though the ORIGINAL,
+# unedited plan had produced them -- collect_angle_result's per-field check
+# (case 30b) cannot see this, since no individual angle's recorded
+# plan_hash/base_resolved/base_sha/template_hash actually changed.
+# --from-dir now recomputes plan.json's own canonical hash (with "_run"
+# stripped first, the same shape compute_plan_hash saw during the live run)
+# and compares it to the recorded plan_hash; a mismatch reports every angle
+# UNPARSED(stale) rather than trusting any of their otherwise-well-formed
+# .meta.json/.status/.out.json.
+repo36=$(make_throwaway_repo edited-plan-after-run)
+plan36="$repo36/plan.json"
+cat > "$plan36" <<'EOF'
+{"version": 1, "base": "main", "promise": "Original promise.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+rundir36="$tmpdir/edited-plan-after-run.$$.${RANDOM:-0}"
+argvdir36="$tmpdir/edited-plan-after-run-argv.$$.${RANDOM:-0}"
+
+out36_1=$(cd "$repo36" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir36" \
+  bash "$SH" --plan "$plan36" --base main --dir "$rundir36" 2>&1); rc36_1=$?
+echo "--- case 36: original run ---"
+printf '%s\n' "$out36_1"
+check "original run exits 0" test "$rc36_1" -eq 0
+check "original run verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out36_1"
+
+# Hand-edit plan.json's promise in place, leaving "_run" (and every
+# .meta.json) untouched.
+python3 -c '
+import json, sys
+path = sys.argv[1]
+doc = json.load(open(path))
+doc["promise"] = "Edited after the run -- a materially different promise."
+json.dump(doc, open(path, "w"), indent=2)
+' "$rundir36/plan.json"
+
+out36_2=$(bash "$SH" --from-dir "$rundir36" 2>&1); rc36_2=$?
+echo "--- case 36: --from-dir after the promise was hand-edited ---"
+printf '%s\n' "$out36_2"
+
+check "exits 4" test "$rc36_2" -eq 4
+check "verdict is UNPARSED, never CLEAN" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out36_2"
+check "alpha is reported UNPARSED(stale), not its recorded CLEAN" \
+  grep -qx "alpha: UNPARSED(stale)" <<<"$out36_2"
+check "stderr names the plan as having changed since the run" \
+  grep -qi "plan.json.*changed since" <<<"$out36_2"
+
+rm -rf "$rundir36"
+
+# --- Case 37: a live run whose --angle-prompt template changed clears every ---
+# angle's artifacts, so --from-dir under a reused --dir + --only never
+# surfaces an unselected angle's old, differently-instructed CLEAN
+# Regression: a different --angle-prompt template with the same plan/base
+# and --only left an unselected angle's artifacts -- produced under
+# different reviewer instructions -- sitting untouched in the run dir.
+# run_meta now carries a template_hash (the loaded template's own sha256),
+# stamped into "_run" and into every angle's .meta.json exactly like
+# plan_hash/base_resolved/base_sha -- so a live run whose template_hash
+# differs from the dir's existing "_run" clears every angle's artifacts
+# before writing the new plan (the same broad-clear path a plan/base change
+# already takes -- see case 30), and collect_angle_result's meta backstop
+# rejects a meta whose template_hash differs from "_run"'s.
+repo37=$(make_throwaway_repo template-hash-isolation)
+plan37="$repo37/plan.json"
+cat > "$plan37" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+rundir37="$tmpdir/template-hash-isolation-run.$$.${RANDOM:-0}"
+argvdir37="$tmpdir/template-hash-isolation-argv.$$.${RANDOM:-0}"
+
+out37_1=$(cd "$repo37" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir37" \
+  bash "$SH" --plan "$plan37" --base main --dir "$rundir37" 2>&1); rc37_1=$?
+echo "--- case 37: first run (default template, both angles) ---"
+printf '%s\n' "$out37_1"
+check "first run exits 0" test "$rc37_1" -eq 0
+check "first run: alpha CLEAN" grep -qx "alpha: CLEAN" <<<"$out37_1"
+check "first run: beta CLEAN" grep -qx "beta: CLEAN" <<<"$out37_1"
+
+template37="$tmpdir/template-hash-isolation-template.$$.${RANDOM:-0}.md"
+echo "A materially different angle prompt template." > "$template37"
+
+out37_2=$(cd "$repo37" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir37" \
+  bash "$SH" --plan "$plan37" --base main --dir "$rundir37" --only alpha --angle-prompt "$template37" 2>&1); rc37_2=$?
+echo "--- case 37: second run (different template, --only alpha) ---"
+printf '%s\n' "$out37_2"
+check "second run exits 0" test "$rc37_2" -eq 0
+check "second run only counts alpha" \
+  grep -qx "ANGLES=1  RAN=1  BLOCKED=0  UNPARSED=0" <<<"$out37_2"
+
+out37_3=$(bash "$SH" --from-dir "$rundir37" 2>&1); rc37_3=$?
+echo "--- case 37: --from-dir after a template change under --only ---"
+printf '%s\n' "$out37_3"
+check "--from-dir exits 4 (beta must never resurface as clean under a differently-instructed run)" \
+  test "$rc37_3" -eq 4
+check "--from-dir verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out37_3"
+check "alpha (rerun under the new template) is CLEAN" grep -qx "alpha: CLEAN" <<<"$out37_3"
+check "beta is never reported CLEAN (its old-template artifact must not leak in)" \
+  bash -c '! grep -q "^beta: CLEAN" <<<"$1"' _ "$out37_3"
+
+rm -rf "$rundir37"
+
+# --- Case 38: a remote-qualified --base whose ref doesn't exist is an ---------
+# environment error, never a fallback to a same-named local branch
+# Regression: resolve_base checked the base's own "<remote>/<rest>" prefix
+# against refs/remotes/<remote>/<rest> first (case 31's fix), but if that
+# didn't verify it fell through to the same generic remote loop and local-
+# branch/bare-revision fallbacks used for an unprefixed base -- letting a
+# local branch literally named "origin/main" (this test's decoy) silently
+# stand in for a remote ref that was expected to exist but doesn't (fetched
+# wrong, a stale --base copied from another checkout, ...). Once the prefix
+# names an actually-configured remote, a missing qualified ref is now a hard
+# environment error naming exactly the ref that was expected, rather than a
+# fallback to something else entirely.
+repo38="$tmpdir/missing-qualified-remote-ref.$$.${RANDOM:-0}"
+mkdir -p "$repo38"
+git init -q -b main "$repo38"
+git -C "$repo38" config user.email "test@example.com"
+git -C "$repo38" config user.name "Test"
+echo base > "$repo38/f.txt"
+git -C "$repo38" add -A
+git -C "$repo38" commit -q -m base
+
+remote38="$tmpdir/missing-qualified-remote-ref-remote.$$.${RANDOM:-0}.git"
+git init -q --bare "$remote38"
+git -C "$repo38" remote add origin "$remote38"
+# origin is a real, configured remote -- but nothing has ever been pushed or
+# fetched, so refs/remotes/origin/main genuinely does not exist.
+
+# The decoy: a LOCAL branch literally named "origin/main" -- exactly the
+# refs/heads/origin/main path the old fallback chain would have hit.
+git -C "$repo38" branch "origin/main"
+
+check "setup: origin is a configured remote" \
+  bash -c 'git -C "$1" remote | grep -qx origin' _ "$repo38"
+check "setup: refs/remotes/origin/main really does not exist" \
+  bash -c '! git -C "$1" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null' _ "$repo38"
+check "setup: the decoy local branch origin/main really does exist" \
+  bash -c 'git -C "$1" rev-parse --verify --quiet refs/heads/origin/main >/dev/null' _ "$repo38"
+
+err38=$(cd "$repo38" && CODEX_BIN=true bash "$SH" --print-base --base origin/main 2>&1); rc38=$?
+echo "--- case 38: --base origin/main with a configured remote but no such ref ---"
+printf '%s\n' "$err38"
+
+check "exits 1 (environment error), never falls back to the decoy" test "$rc38" -eq 1
+check "names the expected qualified ref refs/remotes/origin/main" \
+  grep -qF "refs/remotes/origin/main" <<<"$err38"
 
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------

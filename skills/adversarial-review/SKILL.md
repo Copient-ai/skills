@@ -180,9 +180,10 @@ provider's content filter refused the prompt rather than the angle failing
 to run cleanly — the runner prints one stderr line naming the angle when
 this happens. The run directory keeps `plan.json`, `<angle>.prompt.txt`,
 `<angle>.out.json`, `<angle>.log`, `<angle>.status`, `<angle>.meta.json`
-(the plan hash, resolved base and its commit, and prompt hash the output
-belongs to — a `--from-dir` merge reports an angle whose metadata no longer
-matches `plan.json` as `UNPARSED(stale)`), `<angle>.residue.txt`
+(the plan hash, resolved base and its commit, angle-prompt template hash,
+and prompt hash the output belongs to — a `--from-dir` merge reports an
+angle whose metadata no longer matches `plan.json`'s own provenance record
+as `UNPARSED(stale)`), `<angle>.residue.txt`
 (write-capable angles only, when the tree came back dirty), `<angle>.skipped.txt`
 (write-capable angles the dirty-tree gate or the compromised cascade skipped
 entirely, naming the cause), and normally `merged.json` — except under
@@ -194,9 +195,14 @@ Re-running an angle into a reused `--dir` (a fresh invocation, or `--only`
 narrowing a re-run) first deletes that angle's own prior
 `.prompt.txt`/`.out.json`/`.log`/`.status`/`.meta.json`/`.residue.txt`/`.skipped.txt`,
 so a stale file from an earlier run in the same directory is never mistaken
-for this run's result; when the incoming plan or base differs from the
-`plan.json` already in the directory, every angle's artifacts are cleared,
-not only the selected ones.
+for this run's result; when the incoming plan, base, or angle-prompt
+template differs from the `plan.json` already in the directory, every
+angle's artifacts are cleared, not only the selected ones. `--from-dir`
+also recomputes `plan.json`'s own canonical hash before trusting any
+angle's result at all: if the file was hand-edited after the run that
+produced it (its bookkeeping left otherwise intact), every angle is
+reported `UNPARSED(stale)` rather than merged under a verdict the edited
+plan never actually earned.
 
 Output:
 
