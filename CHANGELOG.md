@@ -33,12 +33,29 @@ into a falsifiable attack angle. It adds:
   `CLEAN`.
 - A new host requirement: `python3` (stdlib only) on `PATH`, for the runner.
 - **Branch-owned instructions and configuration are never loaded.** Each
-  Codex pass runs with `project_doc_max_bytes=0` and under a throwaway
+  Codex pass runs with `project_doc_max_bytes=0` and `-c skills.include_
+  instructions=false`, and under its own fresh, this-angle-only throwaway
   `CODEX_HOME` holding only a copy of `auth.json`, so the reviewed branch's
-  own `AGENTS.md` and `.codex/config.toml` (hooks, MCP servers, exec policy)
-  cannot steer the reviewer even on a checkout the user has marked trusted;
-  the Claude pass is told to read such files as part of the diff, never as
-  instructions.
+  own `AGENTS.md`, `.agents/skills/`, and `.codex/config.toml` (hooks, MCP
+  servers, exec policy) cannot steer the reviewer even on a checkout the
+  user has marked trusted; the Claude pass is told to read such files and
+  skills as part of the diff, never as instructions.
+- **Write-capable isolation model.** A workspace-write angle's own
+  reproduction is already free to write anywhere its sandbox allows — the
+  checkout, `tempfile.gettempdir()`/`$TMPDIR`/`/tmp`/`/var/tmp` — so nothing
+  the runner needs safe from it is placed anywhere within reach: each
+  angle's own throwaway `CODEX_HOME` is created and torn down around that
+  one angle, not shared for the whole run; the run directory itself is
+  refused (or, by default, relocated to a stable cache directory) under any
+  of those roots whenever the plan has a write-capable angle; every result
+  is collected into memory the instant its own angle finishes, never
+  re-read from the run directory afterward; the post-angle compromise check
+  now also compares HEAD's own commit and branch, not just `git status`, so
+  a reproduction that commits, checks out, or hard-resets — each of which
+  can leave the tree looking clean again — is still caught and cascades the
+  same way residue does; and a `--from-dir` merge reads `<angle>.skipped.txt`
+  defensively (never following a symlink, never trusting content outside
+  its own known cause tokens).
 
 ## 1.0.0
 

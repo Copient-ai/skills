@@ -24,7 +24,28 @@ if [ -z "$tmpdir" ]; then
   echo "test-adversarial-review: mktemp -d returned an empty path" >&2
   exit 1
 fi
-trap 'rm -rf "$tmpdir"' EXIT
+
+# A second scratch root OUTSIDE every sandbox-writable root (tempfile.
+# gettempdir()/$TMPDIR/tmp/var-tmp) -- main() now refuses an explicit --dir
+# under any of them for a plan carrying a workspace-write angle (see item
+# 2's --dir hardening; its own default, unaffected here, picks a directory
+# under XDG_CACHE_HOME/~/.cache the same way). Every case below that passes
+# an explicit --dir for such a plan builds it under $safe_tmpdir instead of
+# $tmpdir. XDG_CACHE_HOME is pinned to a subdirectory of it, namespaced
+# apart from "adversarial-review" itself (where a real run's own default
+# selection -- see the "default run dir" case -- would land) and always a
+# fresh, empty directory, so this suite never depends on, or leaves
+# anything behind in, whatever XDG_CACHE_HOME/~/.cache already holds on the
+# machine running it.
+mkdir -p "$HOME/.cache"
+safe_tmpdir=$(mktemp -d "$HOME/.cache/adversarial-review-test-safe.XXXXXX") || {
+  echo "test-adversarial-review: mktemp -d (safe) failed" >&2
+  exit 1
+}
+export XDG_CACHE_HOME="$safe_tmpdir/xdg-cache"
+mkdir -p "$XDG_CACHE_HOME"
+
+trap 'rm -rf "$tmpdir" "$safe_tmpdir"' EXIT
 
 check() { # check <description> <condition-cmd...>
   local desc="$1"; shift
@@ -628,7 +649,7 @@ cat > "$repo19b/plan.json" <<'EOF'
 {"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
  "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
 EOF
-rundir19b="$tmpdir/dirty-tree-stale-run.$$.${RANDOM:-0}"
+rundir19b="$safe_tmpdir/dirty-tree-stale-run.$$.${RANDOM:-0}"
 mkdir -p "$rundir19b"
 cat > "$rundir19b/writer.out.json" <<'EOF'
 {"angle": "writer", "verdict": "CLEAN", "summary": "stale run from an earlier invocation", "findings": []}
@@ -983,7 +1004,7 @@ else
 {"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
  "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
 EOF
-  rundir22c="$tmpdir/sigint-killpg-serial-run.$$.${RANDOM:-0}"
+  rundir22c="$safe_tmpdir/sigint-killpg-serial-run.$$.${RANDOM:-0}"
   linkdir22c="$tmpdir/sigint-killpg-serial-links.$$.${RANDOM:-0}"
   mkdir -p "$linkdir22c"
   marker22c="sigintserialtest$$_${RANDOM:-0}"
@@ -1480,15 +1501,16 @@ for f in "$argvdir25d"/[0-9]*; do
 done
 last25d=$((argv_n25d - 1))
 check "argv has at least one element logged" test "$argv_n25d" -ge 1
-# DIFF_COMMAND is now pinned to the resolved commit itself (see case 40 --
-# base_sha, not the mutable base_resolved ref name), not a bare ref a
-# downstream `git diff` would re-resolve fresh -- so this checks against
-# origin_sha25d (the commit refs/remotes/origin/main actually resolved to
-# above), not the ref name. Re-resolving the ref name at this point would
-# hit the decoy (identical to HEAD) instead, exactly the bug this case
-# exists to catch.
-check "the rendered prompt's diff command is pinned to the resolved commit, not the decoy" \
-  grep -qF "git diff $origin_sha25d...HEAD" "$argvdir25d/$last25d"
+# DIFF_COMMAND is now pinned to the resolved commits themselves (see case 40
+# for base_sha and case 4/HEAD-pinning for head_sha — neither the mutable
+# base_resolved ref name nor a bare "HEAD" a downstream `git diff` would
+# re-resolve fresh) -- so this checks against origin_sha25d (the commit
+# refs/remotes/origin/main actually resolved to above) and head_sha25d
+# (HEAD itself, unaffected by any of this), not the ref name. Re-resolving
+# the base ref name at this point would hit the decoy (identical to HEAD)
+# instead, exactly the bug this case exists to catch.
+check "the rendered prompt's diff command is pinned to the resolved commits, not the decoy" \
+  grep -qF "git diff $origin_sha25d...$head_sha25d" "$argvdir25d/$last25d"
 
 rm -rf "$rundir25d"
 
@@ -1617,7 +1639,7 @@ cat > "$plan28" <<'EOF'
    {"id": "writer2", "title": "Writer2", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
  ]}
 EOF
-rundir28="$tmpdir/post-spawn-residue-run.$$.${RANDOM:-0}"
+rundir28="$safe_tmpdir/post-spawn-residue-run.$$.${RANDOM:-0}"
 
 out28=$(cd "$repo28" && CODEX_BIN="$FIXTURES/fake-codex-dirty-tree.sh" ADV_TEST_DIRTY_FILE="f.txt" \
   bash "$SH" --plan "$plan28" --base main --dir "$rundir28" 2>&1); rc28=$?
@@ -2026,7 +2048,7 @@ EOF
 
 for aid29 in alpha beta; do
   argvdir29="$tmpdir/argv-log-doc-knob-$aid29.$$.${RANDOM:-0}"
-  rundir29="$tmpdir/project-doc-knob-$aid29-run.$$.${RANDOM:-0}"
+  rundir29="$safe_tmpdir/project-doc-knob-$aid29-run.$$.${RANDOM:-0}"
   out29=$(cd "$repo29" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29" \
     bash "$SH" --plan "$plan29" --base main --dir "$rundir29" --only "$aid29" 2>&1); rc29=$?
   echo "--- case 29: project_doc_max_bytes=0 is present for angle '$aid29' (execution=$([ "$aid29" = alpha ] && echo read-only || echo workspace-write)) ---"
@@ -2055,6 +2077,60 @@ for aid29 in alpha beta; do
     test "$found29" = true
 
   rm -rf "$rundir29"
+done
+
+# --- Case 29a: -c skills.include_instructions=false is passed for every angle -
+# Security regression: `codex exec -C <root>` also auto-discovers a matching
+# `.agents/skills/**/SKILL.md` from the checkout under review and injects it
+# into the model-visible prompt -- branch-controlled, same hazard class as
+# the AGENTS.md guard case 29 covers, and neither project_doc_max_bytes=0 nor
+# the throwaway CODEX_HOME stops it (verified live against codex-cli 0.145.0
+# with `codex debug prompt-input`: a throwaway repo's own
+# .agents/skills/review-helper/SKILL.md still appeared with both of those in
+# place; `-c skills.include_instructions=false` is what actually removed it).
+# run_angle now always includes that override too. Same per-angle, per-
+# execution-mode shape as case 29.
+repo29a=$(make_throwaway_repo skills-knob)
+plan29a="$tmpdir/skills-knob-plan.$$.${RANDOM:-0}.json"
+cat > "$plan29a" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+
+for aid29a in alpha beta; do
+  argvdir29a="$tmpdir/argv-log-skills-knob-$aid29a.$$.${RANDOM:-0}"
+  rundir29a="$safe_tmpdir/skills-knob-$aid29a-run.$$.${RANDOM:-0}"
+  out29a=$(cd "$repo29a" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29a" \
+    bash "$SH" --plan "$plan29a" --base main --dir "$rundir29a" --only "$aid29a" 2>&1); rc29a=$?
+  echo "--- case 29a: skills.include_instructions=false is present for angle '$aid29a' (execution=$([ "$aid29a" = alpha ] && echo read-only || echo workspace-write)) ---"
+  printf '%s\n' "$out29a"
+
+  check "angle '$aid29a' run exits 0" test "$rc29a" -eq 0
+  check "angle '$aid29a' verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out29a"
+
+  n29a=0
+  for f in "$argvdir29a"/[0-9]*; do
+    [ -e "$f" ] || continue
+    n29a=$((n29a + 1))
+  done
+  found29a=false
+  if [ "$n29a" -ge 2 ]; then
+    last_idx29a=$((n29a - 1))
+    for idx in $(seq 0 $((last_idx29a - 1))); do
+      if [ "$(cat "$argvdir29a/$idx")" = "-c" ] \
+         && [ "$(cat "$argvdir29a/$((idx + 1))")" = "skills.include_instructions=false" ]; then
+        found29a=true
+        break
+      fi
+    done
+  fi
+  check "angle '$aid29a''s codex exec argv includes -c skills.include_instructions=false" \
+    test "$found29a" = true
+
+  rm -rf "$rundir29a"
 done
 
 # --- Case 29b: each angle's codex exec gets an isolated, throwaway CODEX_HOME --
@@ -2104,7 +2180,7 @@ cp "$fakerealhome29b/auth.json" "$expected_auth29b"
 
 for aid29b in alpha beta; do
   argvdir29b="$tmpdir/argv-log-codex-home-$aid29b.$$.${RANDOM:-0}"
-  rundir29b="$tmpdir/codex-home-isolation-$aid29b-run.$$.${RANDOM:-0}"
+  rundir29b="$safe_tmpdir/codex-home-isolation-$aid29b-run.$$.${RANDOM:-0}"
   out29b=$(cd "$repo29b" && CODEX_HOME="$fakerealhome29b" \
     CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir29b" \
     bash "$SH" --plan "$plan29b" --base main --dir "$rundir29b" --only "$aid29b" 2>&1)
@@ -2131,6 +2207,83 @@ for aid29b in alpha beta; do
 
   rm -rf "$rundir29b"
 done
+
+# --- Case 29c: each write-capable angle gets its OWN throwaway CODEX_HOME, ----
+# not one shared for the whole run
+# Security regression (item 3): main() used to create a single throwaway
+# CODEX_HOME and pass it to every angle, live or serial — so a
+# workspace-write angle's own reproduction (already free to write the
+# shared checkout, per this runner's own threat model) could delete that
+# CODEX_HOME's auth.json or plant a config.toml for whichever angle runs
+# next, before that angle's own codex exec even started. Every angle now
+# gets a fresh, this-angle-only CODEX_HOME (see make_throwaway_codex_home /
+# _run_angle_isolated), removed immediately once that angle finishes — not
+# just at the end of the whole run. fixtures/fake-codex-env-log.sh records
+# each angle's own CODEX_HOME (to a per-angle file, never cleared between
+# invocations, unlike fake-codex-argv-log.sh's ADV_TEST_ARGV_DIR) and, at
+# its own start, which earlier angles' logged CODEX_HOME paths still exist
+# on disk — proving removal happens between angles, not only at run end.
+repo29c=$(make_throwaway_repo per-angle-codex-home)
+# The plan lives outside repo29c, not inside it (see case 28): the first
+# write-capable angle's dirty-tree gate requires a genuinely clean tree
+# before it runs, and an untracked plan.json sitting in the checkout would
+# itself trip that gate.
+plan29c="$tmpdir/per-angle-codex-home-plan.$$.${RANDOM:-0}.json"
+cat > "$plan29c" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "writer1", "title": "Writer 1", "mandate": "m", "evidence": "e", "execution": "workspace-write"},
+   {"id": "writer2", "title": "Writer 2", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+envlogdir29c="$safe_tmpdir/per-angle-codex-home-envlog.$$.${RANDOM:-0}"
+rundir29c="$safe_tmpdir/per-angle-codex-home-run.$$.${RANDOM:-0}"
+mkdir -p "$envlogdir29c"
+
+out29c=$(cd "$repo29c" && CODEX_BIN="$FIXTURES/fake-codex-env-log.sh" \
+  ADV_TEST_ENV_LOG_DIR="$envlogdir29c" \
+  bash "$SH" --plan "$plan29c" --base main --dir "$rundir29c" 2>&1); rc29c=$?
+echo "--- case 29c: per-angle throwaway CODEX_HOME isolation ---"
+printf '%s\n' "$out29c"
+
+check "exits 0" test "$rc29c" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out29c"
+
+home1_29c=""
+home2_29c=""
+[ -f "$envlogdir29c/writer1.codex_home" ] && home1_29c=$(cat "$envlogdir29c/writer1.codex_home")
+[ -f "$envlogdir29c/writer2.codex_home" ] && home2_29c=$(cat "$envlogdir29c/writer2.codex_home")
+
+check "writer1 saw a non-empty CODEX_HOME" test -n "$home1_29c"
+check "writer2 saw a non-empty CODEX_HOME" test -n "$home2_29c"
+check "writer1 and writer2 saw DIFFERENT CODEX_HOME values" \
+  test "$home1_29c" != "$home2_29c"
+
+outside29c=$(HOME1="$home1_29c" HOME2="$home2_29c" python3 -c '
+import os, tempfile
+from pathlib import Path
+roots = set()
+for p in (tempfile.gettempdir(), os.environ.get("TMPDIR"), "/tmp", "/var/tmp"):
+    if p:
+        try:
+            roots.add(str(Path(p).resolve()))
+        except OSError:
+            pass
+def outside(p):
+    pr = Path(p).resolve()
+    return not any(pr == r or str(pr).startswith(r + os.sep) for r in roots)
+h1, h2 = os.environ["HOME1"], os.environ["HOME2"]
+print("OK" if outside(h1) and outside(h2) else f"MISMATCH: h1={h1!r} h2={h2!r} roots={roots!r}")
+')
+check "neither CODEX_HOME sits under a sandbox-writable root (/tmp, /var/tmp, \$TMPDIR)" \
+  test "$outside29c" = "OK"
+
+check "writer2's still_exist marker was written (the check ran)" \
+  test -f "$envlogdir29c/writer2.still_exist"
+check "writer1's throwaway CODEX_HOME was already removed before writer2's codex exec started" \
+  bash -c 'test ! -s "$1"' _ "$envlogdir29c/writer2.still_exist"
+
+rm -rf "$rundir29c"
 
 # --- Case 30: a reused --dir with a changed plan + --only never leaks an -------
 # unselected angle's stale verdict into a later --from-dir merge
@@ -2393,10 +2546,10 @@ rm -rf "$rundir32"
 # `dir=` it was given -- true of the stdlib's own mkdtemp on Python 3.9-3.11
 # for an explicit relative `dir=`, though not reproducible against whatever
 # python3 happens to be installed here (newer stdlib versions absolutize it
-# internally regardless of what this fix does). tempfile.mkdtemp and
-# tempfile.gettempdir are monkeypatched to force that exact 3.9-3.11 shape,
-# isolating make_throwaway_codex_home()'s own contract -- always hand back
-# an absolute path -- from whatever the installed Python's tempfile already
+# internally regardless of what this fix does). tempfile.mkdtemp is
+# monkeypatched to force that exact 3.9-3.11 shape, isolating
+# make_throwaway_codex_home()'s own contract -- always hand back an
+# absolute path -- from whatever the installed Python's tempfile already
 # does on its own. This matters because codex_home is placed into
 # CODEX_HOME for a child Popen'd with cwd=root, which differs from wherever
 # this command was invoked whenever the caller runs from a subdirectory --
@@ -2406,6 +2559,10 @@ rm -rf "$rundir32"
 # wherever it happens to be checked out) so the relative "relhome" target
 # passes select_dir_outside_git_checkouts' own dir_in_git_repo check
 # instead of being rejected as "inside a checkout" for an unrelated reason.
+# make_throwaway_codex_home sources its candidate directory from
+# _cache_root() (select_dir_outside_git_checkouts' exclude_sandbox_writable
+# mode), not tempfile.gettempdir() -- _cache_root itself is monkeypatched
+# to force the same relative-path shape against that new candidate.
 scratch33="$tmpdir/absolute-codex-home-check.$$.${RANDOM:-0}"
 mkdir -p "$scratch33"
 absolute_check33=$(cd "$scratch33" && python3 - "$SCRIPT_DIR" <<'PYEOF'
@@ -2429,7 +2586,7 @@ def fake_mkdtemp(suffix=None, prefix=None, dir=None):
 
 
 ar.tempfile.mkdtemp = fake_mkdtemp
-ar.tempfile.gettempdir = lambda: "relhome"
+ar._cache_root = lambda: "relhome"
 
 home = ar.make_throwaway_codex_home()
 print("OK" if home.is_absolute() else f"MISMATCH: {home!r} is not absolute")
@@ -2845,6 +3002,7 @@ rm -rf "$rundir39c" "$base39c"
 repo40=$(make_throwaway_repo base-drift)
 orig_sha40=$(git -C "$repo40" rev-parse refs/heads/main)
 feature_sha40=$(git -C "$repo40" rev-parse refs/heads/feature)
+head_sha40=$(git -C "$repo40" rev-parse HEAD)
 cat > "$repo40/plan.json" <<'EOF'
 {"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
  "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
@@ -2868,10 +3026,10 @@ for f in "$argvdir40"/[0-9]*; do
   [ -e "$f" ] && argv_n40=$((argv_n40 + 1))
 done
 last40=$((argv_n40 - 1))
-check "the rendered prompt's diff command names the original base commit" \
-  grep -qF "git diff $orig_sha40...HEAD" "$argvdir40/$last40"
+check "the rendered prompt's diff command names the original base commit, pinned to HEAD's own commit" \
+  grep -qF "git diff $orig_sha40...$head_sha40" "$argvdir40/$last40"
 check "the rendered prompt never names the drifted commit instead" \
-  bash -c '! grep -qF "git diff $2...HEAD" "$1"' _ "$argvdir40/$last40" "$feature_sha40"
+  bash -c '! grep -qF "git diff $2...$3" "$1"' _ "$argvdir40/$last40" "$feature_sha40" "$head_sha40"
 check "run_dir/plan.json's recorded _run.base_sha is the original commit, not the drifted one" \
   python3 -c '
 import json, sys
@@ -2880,6 +3038,69 @@ sys.exit(0 if doc["_run"]["base_sha"] == sys.argv[2] else 1)
 ' "$rundir40/plan.json" "$orig_sha40"
 
 rm -rf "$rundir40"
+
+# --- Case 40b: a write-capable angle that commits (leaving the tree clean) ----
+# is still caught as compromise, cascades to the next write-capable angle,
+# and its own rendered prompt was pinned to HEAD before it moved
+# Security regression (item 4): `git status --porcelain` alone goes back to
+# clean the moment a reproduction commits whatever it changed — `git
+# commit`, `git checkout <ref>`, and `git reset --hard` can each do this —
+# so the ordinary dirty-tree residue check would see nothing wrong and let
+# the next write-capable angle run against a tree whose HISTORY an earlier
+# angle already rewrote. run_write_capable_angles now also compares HEAD's
+# own commit and symbolic ref (see _head_drift_note) after every
+# write-capable angle, independent of the dirty-tree check, and folds a
+# mismatch into the same UNPARSED(residue)/compromised-cascade machinery.
+# fixtures/fake-codex-head-drift.sh plays the committing angle; its own
+# rendered DIFF_COMMAND (logged like fake-codex-argv-log.sh) must still
+# name the commit HEAD pointed to before it ran — captured once into
+# run_meta at the very start of the run (resolve_head_sha), never
+# re-resolved — not wherever its own commit left HEAD afterward.
+repo40b=$(make_throwaway_repo head-drift-commit)
+head_sha40b=$(git -C "$repo40b" rev-parse HEAD)
+# The plan lives outside repo40b, not inside it (see case 28): the first
+# write-capable angle's dirty-tree gate requires a genuinely clean tree
+# before it runs, and an untracked plan.json sitting in the checkout would
+# itself trip that gate.
+plan40b="$tmpdir/head-drift-commit-plan.$$.${RANDOM:-0}.json"
+cat > "$plan40b" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "reader", "title": "Reader", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"},
+   {"id": "writer2", "title": "Writer2", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+argvdir40b="$safe_tmpdir/head-drift-argv.$$.${RANDOM:-0}"
+rundir40b="$safe_tmpdir/head-drift-run.$$.${RANDOM:-0}"
+
+out40b=$(cd "$repo40b" && CODEX_BIN="$FIXTURES/fake-codex-head-drift.sh" \
+  ADV_TEST_ARGV_DIR="$argvdir40b" ADV_TEST_COMMIT_ANGLE_ID="writer" \
+  bash "$SH" --plan "$plan40b" --base main --dir "$rundir40b" 2>&1); rc40b=$?
+echo "--- case 40b: a write-capable angle moving HEAD via commit is caught as compromise ---"
+printf '%s\n' "$out40b"
+
+check "exits 4" test "$rc40b" -eq 4
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out40b"
+check "reader still ran clean" grep -qx "reader: CLEAN" <<<"$out40b"
+check "writer is labeled UNPARSED(residue) despite a clean working tree afterward" \
+  grep -qx "writer: UNPARSED(residue)" <<<"$out40b"
+check "writer2 never ran: skipped as compromised" \
+  grep -qx "writer2: UNPARSED(compromised)" <<<"$out40b"
+check "setup: the working tree really is clean after writer's own commit" \
+  test -z "$(git -C "$repo40b" status --porcelain)"
+check "writer's own residue.txt names the HEAD commit change, not a dirty-tree line" \
+  grep -q "HEAD commit changed" "$rundir40b/writer.residue.txt"
+
+argv_n40b=0
+for f in "$argvdir40b"/[0-9]*; do
+  [ -e "$f" ] && argv_n40b=$((argv_n40b + 1))
+done
+last40b=$((argv_n40b - 1))
+check "writer's own rendered prompt's DIFF_COMMAND names the ORIGINAL head sha" \
+  grep -qF "...$head_sha40b" "$argvdir40b/$last40b"
+
+rm -rf "$rundir40b"
 
 # --- Case 41: run_angle registers the in-flight sentinel before checking ------
 # _CANCELLED, not after
@@ -3021,7 +3242,7 @@ rm -rf "$dir43"
 # --- Case 44: make_throwaway_codex_home registers cleanup before copying ------
 # auth.json, not after -- a failed copy can never orphan a partial CODEX_HOME
 # Regression: the throwaway directory's cleanup (atexit.register, and the
-# _THROWAWAY_CODEX_HOME global _kill_all_and_exit also removes on an
+# _LIVE_CODEX_HOMES set _kill_all_and_exit also sweeps on an
 # interrupt) used to be registered by main(), only after
 # make_throwaway_codex_home() had already returned -- so a signal, or the
 # auth.json copy itself failing, anywhere inside the function left a
@@ -3083,9 +3304,9 @@ ok = (
     and len(copyfile_idxs) == 1
     and mkdtemp_idxs and mkdtemp_idxs[0] < register_idxs[0] < copyfile_idxs[0]
     # make_throwaway_codex_home() .resolve()s the mkdtemp'd path before
-    # assigning the global (a macOS /tmp -> /private/tmp symlink, e.g.) --
-    # compare resolved forms so that's not mistaken for a real mismatch.
-    and ar._THROWAWAY_CODEX_HOME == Path(created_dir).resolve()
+    # tracking it (a macOS /tmp -> /private/tmp symlink, e.g.) -- compare
+    # resolved forms so that's not mistaken for a real mismatch.
+    and Path(created_dir).resolve() in ar._LIVE_CODEX_HOMES
 )
 
 if register_idxs:
@@ -3095,13 +3316,211 @@ cleaned = created_dir is not None and not os.path.exists(created_dir)
 
 print("OK" if ok and cleaned else
       f"MISMATCH: raised={raised!r} order={order!r} "
-      f"THROWAWAY={ar._THROWAWAY_CODEX_HOME!r} cleaned={cleaned!r}")
+      f"LIVE_CODEX_HOMES={ar._LIVE_CODEX_HOMES!r} cleaned={cleaned!r}")
 PYEOF
 )
 echo "--- case 44: cleanup is registered before auth.json is copied ---"
 printf '%s\n' "$throwaway_cleanup_check"
 check "a failed copy still leaves cleanup registered, and that cleanup removes the directory" \
   test "$throwaway_cleanup_check" = "OK"
+
+# --- Case 45: a symlinked <angle>.skipped.txt is never followed, and its ------
+# content never leaks into the report
+# Security regression (item 5): --from-dir (and this runner's own live
+# in-process collection — see collect_angle_result) used to read
+# <angle>.skipped.txt through a plain Path.is_file()/read_text() —
+# following a symlink placed there and echoing whatever it points at
+# straight into the rendered UNPARSED(<cause>) line. --from-dir can point
+# run_dir anywhere the caller names (a reused --dir, a fixtures tree under
+# someone else's control), so a symlinked marker there could disclose a
+# sentinel file's content, or inject confusing text, into the report.
+# collect_angle_result now lstats the marker (never follows a symlink) via
+# _read_skip_marker, and accepts only its own known skip-cause tokens
+# (dirty-tree/compromised/interrupted) — anything else, symlink included,
+# folds into a fixed UNPARSED(badmarker), never echoing the target's
+# content.
+base45="$tmpdir/symlinked-skip-marker.$$.${RANDOM:-0}"
+rundir45="$base45/rundir"
+mkdir -p "$rundir45"
+sentinel45="$base45/sentinel.txt"
+echo "top secret sentinel content -- must never leak" > "$sentinel45"
+ln -s "$sentinel45" "$rundir45/writer.skipped.txt"
+cat > "$rundir45/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+
+out45=$(bash "$SH" --from-dir "$rundir45" 2>&1); rc45=$?
+echo "--- case 45: a symlinked skipped marker is never followed ---"
+printf '%s\n' "$out45"
+
+check "exits 4" test "$rc45" -eq 4
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out45"
+check "the angle is reported UNPARSED(badmarker), not the symlink target's content" \
+  grep -qx "writer: UNPARSED(badmarker)" <<<"$out45"
+check "the sentinel's content never appears anywhere in the report" \
+  bash -c '! grep -qF "top secret sentinel content" <<<"$1"' _ "$out45"
+check "the symlink itself is untouched (never followed, never deleted)" \
+  test -L "$rundir45/writer.skipped.txt"
+check "the sentinel file itself is untouched" \
+  grep -qF "top secret sentinel content" "$sentinel45"
+
+rm -rf "$base45"
+
+# --- Case 45b: a non-symlink <angle>.skipped.txt with unrecognized content ----
+# also folds into UNPARSED(badmarker), never echoed verbatim
+# The non-symlink half of _read_skip_marker's hardening: a hand-edited or
+# otherwise malformed marker whose content isn't one of the runner's own
+# known cause tokens must not be trusted (or echoed) either, symlink or not.
+rundir45b="$tmpdir/bogus-skip-marker.$$.${RANDOM:-0}"
+mkdir -p "$rundir45b"
+printf 'rm -rf /\n' > "$rundir45b/writer.skipped.txt"
+cat > "$rundir45b/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+
+out45b=$(bash "$SH" --from-dir "$rundir45b" 2>&1); rc45b=$?
+echo "--- case 45b: a non-symlink skipped marker with unrecognized content ---"
+printf '%s\n' "$out45b"
+
+check "exits 4" test "$rc45b" -eq 4
+check "the angle is reported UNPARSED(badmarker)" \
+  grep -qx "writer: UNPARSED(badmarker)" <<<"$out45b"
+check "the marker's own bogus content never appears in the report" \
+  bash -c '! grep -qF "rm -rf /" <<<"$1"' _ "$out45b"
+
+rm -rf "$rundir45b"
+
+# --- Case 46: each angle's result is collected into memory as it finishes, ---
+# never re-read from run_dir only after the whole run completes
+# Security regression (item 2): results used to be collected only after
+# BOTH the parallel and serial phases finished, by re-reading run_dir —
+# which sits outside the checkout under review and so is never protected
+# by the dirty-tree/residue check (that only watches the checkout's own
+# `git status`, never run_dir). A later write-capable angle's own
+# reproduction, already free to write anywhere its sandbox allows, could
+# therefore replace an EARLIER (even a read-only, parallel-phase) angle's
+# already-written <aid>.out.json with a schema-valid CLEAN before that
+# final read ever happened. fixtures/fake-codex-corrupt-earlier.sh plays
+# exactly that: alpha (read-only) reports one real P1 finding and finishes
+# — the parallel phase always completes in full before the serial phase
+# even starts — then beta (workspace-write) overwrites alpha's own
+# alpha.out.json on disk before reporting CLEAN for itself. Each angle's
+# result is now collected the moment it finishes (in main()'s own
+# as_completed loop for the parallel phase, and inside
+# run_write_capable_angles' serial loop), so the merged report must still
+# carry alpha's original finding, not the corrupted CLEAN sitting on disk
+# afterward.
+repo46=$(make_throwaway_repo in-memory-collection)
+# The plan lives outside repo46, not inside it (see case 28): beta's
+# dirty-tree gate requires a genuinely clean tree before it runs, and an
+# untracked plan.json sitting in the checkout would itself trip that gate.
+plan46="$tmpdir/in-memory-collection-plan.$$.${RANDOM:-0}.json"
+cat > "$plan46" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "workspace-write"}
+ ]}
+EOF
+rundir46="$safe_tmpdir/in-memory-collection-run.$$.${RANDOM:-0}"
+
+out46=$(cd "$repo46" && CODEX_BIN="$FIXTURES/fake-codex-corrupt-earlier.sh" \
+  ADV_TEST_EARLIER_ANGLE_ID="alpha" bash "$SH" --plan "$plan46" --base main --dir "$rundir46" 2>&1)
+rc46=$?
+echo "--- case 46: a later write-capable angle overwrites an earlier angle's out.json on disk ---"
+printf '%s\n' "$out46"
+
+check "exits 0 (findings, not an error)" test "$rc46" -eq 0
+check "verdict is FINDINGS" grep -qx "ADVERSARIAL_REVIEW: FINDINGS" <<<"$out46"
+check "alpha's original FINDINGS(1) survives in the report, not CLEAN" \
+  grep -qx "alpha: FINDINGS(1)" <<<"$out46"
+check "beta ran clean" grep -qx "beta: CLEAN" <<<"$out46"
+check "alpha's original finding is in the report" \
+  grep -qF -- "- [P1] a.py:1 — original finding" <<<"$out46"
+check "setup: the on-disk alpha.out.json really was overwritten (confirms the attack happened)" \
+  grep -q "rewritten by a later angle" "$rundir46/alpha.out.json"
+
+rm -rf "$rundir46"
+
+# --- Case 47: an explicit --dir under a sandbox-writable root is refused ------
+# when the plan has any write-capable angle
+# Security regression (item 2): a workspace-write angle's own reproduction
+# is already free to write anywhere its sandbox allows — tempfile.
+# gettempdir()/$TMPDIR/tmp/var-tmp — and run_dir holds every angle's own
+# artifacts, including another angle's already-collected <aid>.out.json a
+# later one could otherwise overwrite (see case 46). main() now refuses an
+# explicit --dir under any of those roots whenever the plan has a
+# write-capable angle, rather than creating (or reusing) it.
+repo47=$(make_throwaway_repo unsafe-dir-refused)
+cat > "$repo47/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+unsafedir47="${TMPDIR:-/tmp}/adversarial-review-unsafe-dir-test.$$.${RANDOM:-0}"
+
+err47=$(cd "$repo47" && CODEX_BIN=true bash "$SH" --plan plan.json --base main --dir "$unsafedir47" 2>&1)
+rc47=$?
+echo "--- case 47: --dir under a sandbox-writable root is refused for a write-capable plan ---"
+printf '%s\n' "$err47"
+
+check "exits 2 (usage error)" test "$rc47" -eq 2
+check "names the problem" grep -qi "sandbox-writable" <<<"$err47"
+check "the unsafe dir was never created" test ! -d "$unsafedir47"
+
+rm -rf "$unsafedir47" 2>/dev/null
+
+# --- Case 47b: the default run dir for a write-capable plan lands outside -----
+# every sandbox-writable root and outside the checkout
+# The complement of case 47: with no --dir given at all, main() now picks
+# the default run directory via select_dir_outside_git_checkouts'
+# exclude_sandbox_writable mode (a stable cache directory) instead of the
+# ordinary TMPDIR-based default, whenever the plan has a write-capable
+# angle.
+repo47b=$(make_throwaway_repo unsafe-dir-default)
+# The plan lives outside repo47b, not inside it (see case 28): writer's
+# dirty-tree gate requires a genuinely clean tree before it runs, and an
+# untracked plan.json sitting in the checkout would itself trip that gate.
+plan47b="$tmpdir/unsafe-dir-default-plan.$$.${RANDOM:-0}.json"
+cat > "$plan47b" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "writer", "title": "Writer", "mandate": "m", "evidence": "e", "execution": "workspace-write"}]}
+EOF
+argvdir47b="$safe_tmpdir/unsafe-dir-default-argv.$$.${RANDOM:-0}"
+
+out47b=$(cd "$repo47b" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir47b" \
+  bash "$SH" --plan "$plan47b" --base main 2>&1)
+rc47b=$?
+echo "--- case 47b: default run dir for a write-capable plan ---"
+printf '%s\n' "$out47b"
+
+check "exits 0" test "$rc47b" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out47b"
+
+rundir47b=$(grep '^DIR=' <<<"$out47b" | cut -d= -f2-)
+check "a run dir was reported" test -n "$rundir47b"
+outside47b=$(REPO="$repo47b" RUNDIR="$rundir47b" python3 -c '
+import os, tempfile
+from pathlib import Path
+roots = set()
+for p in (tempfile.gettempdir(), os.environ.get("TMPDIR"), "/tmp", "/var/tmp"):
+    if p:
+        try:
+            roots.add(str(Path(p).resolve()))
+        except OSError:
+            pass
+rundir = Path(os.environ["RUNDIR"]).resolve()
+repo = Path(os.environ["REPO"]).resolve()
+bad = [r for r in roots if rundir == Path(r) or str(rundir).startswith(r + os.sep)]
+if rundir == repo or str(rundir).startswith(str(repo) + os.sep):
+    bad.append(str(repo))
+print("OK" if not bad else f"MISMATCH: rundir={rundir!r} bad={bad!r}")
+')
+check "the default run dir sits outside every sandbox-writable root and the checkout" \
+  test "$outside47b" = "OK"
+
+rm -rf "$rundir47b"
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh

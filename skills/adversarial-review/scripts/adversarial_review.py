@@ -32,6 +32,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -416,6 +417,37 @@ def resolve_base_sha(base_resolved, cwd):
     return r.stdout.strip()
 
 
+def resolve_head_sha(cwd):
+    """The commit HEAD points at, captured once at the start of a live run —
+    stamped into run_meta (see main()) and used to pin every angle's
+    rendered {{DIFF_COMMAND}} and the run's own empty-diff gate to the exact
+    commit under review, and to detect a write-capable angle moving HEAD
+    during its own reproduction (see run_write_capable_angles's post-angle
+    check). `git commit`, `git checkout <ref>`, and `git reset --hard` can
+    each leave `git status --porcelain` clean afterward — the tree looks
+    fine, only history moved — so a bare "HEAD" in the diff command or the
+    gate would silently follow it instead of diffing the commit this run's
+    own provenance record actually committed to."""
+    r = git(["rev-parse", "HEAD"], cwd)
+    if r.returncode != 0:
+        env_error(f"cannot resolve HEAD: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def resolve_head_symbolic_ref(cwd):
+    """The branch name HEAD currently resolves through (e.g.
+    "refs/heads/feature"), or None for a detached HEAD (an ordinary case —
+    a PR checked out by commit — not itself suspicious). Captured alongside
+    resolve_head_sha so a write-capable angle's reproduction that points
+    HEAD at a different branch sharing the same commit (no commit-sha
+    change at all) is still caught by the post-angle check that compares
+    both."""
+    r = git(["symbolic-ref", "--quiet", "HEAD"], cwd)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
 # --- Prompt rendering ---------------------------------------------------------
 
 def bulleted(items, empty):
@@ -460,7 +492,7 @@ _EXECUTION_INSTRUCTIONS = {
 }
 
 
-def render_prompt(template, plan, angle, base_resolved, base_sha=None):
+def render_prompt(template, plan, angle, base_resolved, base_sha=None, head_sha=None):
     """`base_resolved` is the human-readable, fully-qualified ref (e.g.
     "refs/remotes/origin/main") shown in prose wherever a template renders
     {{BASE}}. `base_sha` is the commit resolve_base_sha captured for it up
@@ -470,9 +502,19 @@ def render_prompt(template, plan, angle, base_resolved, base_sha=None):
     spawned angle actually runs this command (a fetch, a concurrent push),
     so the diff a reviewer is told to run must be pinned to the exact commit
     this run's provenance record (run_meta) already commits to, not
-    whatever the ref happens to point at by execution time."""
+    whatever the ref happens to point at by execution time. `head_sha` is
+    resolve_head_sha's own equivalent capture of HEAD (defaults to the bare
+    literal "HEAD" for a caller that never resolved one): a write-capable
+    angle's own reproduction can move HEAD (`git commit`, `git checkout
+    <ref>`, `git reset --hard` — none of which the dirty-tree residue check
+    alone would catch, since each can leave the tree clean afterward), so a
+    later angle told to `git diff <base>...HEAD` would silently diff
+    against wherever HEAD ended up instead of the commit actually under
+    review."""
     if base_sha is None:
         base_sha = base_resolved
+    if head_sha is None:
+        head_sha = "HEAD"
     values = {
         "BASE": base_resolved,
         # A shell-quoted literal of the same value, for templates (like
@@ -492,12 +534,15 @@ def render_prompt(template, plan, angle, base_resolved, base_sha=None):
         "EVIDENCE": angle["evidence"],
         "FILES": bulleted(angle.get("files"), "(all changed files)"),
         "EXECUTION": _EXECUTION_INSTRUCTIONS[angle["execution"]],
-        # shlex.quote the pinned commit sha, not the mutable base_resolved
-        # ref (see the docstring above) — the quoted and unquoted pieces
-        # concatenate to the same single shell token, and a base with shell
-        # metacharacters (e.g. from a hand-edited plan) can never break out
-        # of the command a reviewer is told to paste and run.
-        "DIFF_COMMAND": f"git diff {shlex.quote(base_sha)}...HEAD",
+        # shlex.quote both the pinned base commit and the pinned head commit
+        # (see the docstring above), not the mutable base_resolved ref name
+        # or a bare "HEAD" — the quoted and unquoted pieces concatenate to
+        # the same single shell token, and neither a base nor (in principle)
+        # a head sha containing shell metacharacters can break out of the
+        # command a reviewer is told to paste and run. shlex.quote("HEAD")
+        # is a no-op (no metacharacters), so a caller that never resolved a
+        # head_sha still renders the familiar "...HEAD".
+        "DIFF_COMMAND": f"git diff {shlex.quote(base_sha)}...{shlex.quote(head_sha)}",
     }
     # A single re.sub pass over the *original* template — never a substituted
     # placeholder over its own prior output — so inserted plan/angle text
@@ -586,6 +631,43 @@ def log_refused(log_path):
     return any(marker in text for marker in REFUSAL_MARKERS)
 
 
+# The only cause strings this runner itself ever writes into a
+# '<aid>.skipped.txt' marker (see _mark_skipped and _mark_interrupted).
+# _read_skip_marker never trusts anything outside this set.
+_KNOWN_SKIP_CAUSES = frozenset({"dirty-tree", "compromised", "interrupted"})
+
+
+def _read_skip_marker(skipped_path):
+    """Reads a write-capable angle's own '<aid>.skipped.txt' marker without
+    ever following a symlink and without ever echoing arbitrary file
+    content into the report. --from-dir can point run_dir anywhere the
+    caller names (a reused --dir, a fixtures tree, someone else's run
+    directory) — this runner never places a symlink at this path itself, so
+    one found here can only have been placed by something else, and could
+    point at a file elsewhere on disk (a secret, another user's file) whose
+    content would otherwise be echoed straight into the rendered
+    UNPARSED(<cause>) line, or simply carry confusing/injected text. Uses
+    os.lstat, not Path.is_file() (which stats through a symlink), so a
+    symlink here is detected without ever being opened or followed; and
+    accepts only the runner's own known tokens (_KNOWN_SKIP_CAUSES) as a
+    cause — anything else, symlink included, folds into a fixed
+    "badmarker" cause, never the marker's own content.
+
+    Returns None when nothing exists at this path at all (the ordinary
+    case — this angle was not skipped), else a cause string."""
+    try:
+        st = os.lstat(skipped_path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return "badmarker"
+    try:
+        text = skipped_path.read_text().strip()
+    except OSError:
+        return "badmarker"
+    return text if text in _KNOWN_SKIP_CAUSES else "badmarker"
+
+
 def collect_angle_result(angle, run_dir, expected_run_meta=None):
     aid = angle["id"]
     status_path = run_dir / f"{aid}.status"
@@ -597,13 +679,17 @@ def collect_angle_result(angle, run_dir, expected_run_meta=None):
 
     # An angle that run_write_capable_angles decided never to run at all —
     # the dirty-tree gate, or a later angle skipped after an earlier one's
-    # residue compromised the shared tree — leaves this marker instead of a
-    # .status/.out.json (see run_write_capable_angles). Checked first, ahead
-    # of every other file, so a later --from-dir re-merge reports the same
-    # UNPARSED(<cause>) rather than misreading stale or absent files.
-    if skipped_path.is_file():
-        cause = skipped_path.read_text().strip() or "skipped"
-        return AngleResult(aid, angle["title"], "UNPARSED", cause=cause)
+    # residue/HEAD-drift compromised the shared tree — leaves this marker
+    # instead of a .status/.out.json (see run_write_capable_angles). Checked
+    # first, ahead of every other file, so a later --from-dir re-merge
+    # reports the same UNPARSED(<cause>) rather than misreading stale or
+    # absent files. Read via _read_skip_marker — never a plain
+    # Path.is_file()/read_text() — since --from-dir can point run_dir
+    # anywhere the caller names, and this runner never places a symlink at
+    # this path itself.
+    skip_cause = _read_skip_marker(skipped_path)
+    if skip_cause is not None:
+        return AngleResult(aid, angle["title"], "UNPARSED", cause=skip_cause)
 
     # `expected_run_meta` is the run dir's own current provenance record —
     # `run_meta` itself for a live run's own collection, or run_dir/plan.json's
@@ -1007,7 +1093,41 @@ def dir_in_git_repo(path):
     )
 
 
-def select_dir_outside_git_checkouts(purpose):
+def _cache_root():
+    """A stable, non-temp directory for this runner's own on-disk state —
+    unlike tempfile.gettempdir()/$TMPDIR/tmp/var-tmp, a workspace-write
+    angle's own sandbox is never granted write access to it (see
+    _sandbox_writable_roots and this module's threat-model comments on
+    make_throwaway_codex_home and main()'s --dir handling). XDG_CACHE_HOME
+    if set, else ~/.cache, joined with "adversarial-review". Read fresh on
+    each call, not cached at import time, so a test's env monkeypatch is
+    always honored."""
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return str(Path(base) / "adversarial-review")
+
+
+def _sandbox_writable_roots():
+    """The paths a workspace-write angle's own codex sandbox is granted
+    write access to: the checkout itself (handled separately — every
+    caller of select_dir_outside_git_checkouts already excludes anything
+    inside a git working tree) plus the process's temp directories. Each is
+    resolved (so a symlink, e.g. macOS's /tmp -> /private/tmp, compares
+    equal to whichever form a caller actually sees) — best-effort: an
+    unresolvable candidate is kept as given rather than dropped. Recomputed
+    on every call, never cached, so a test's TMPDIR/XDG env monkeypatch is
+    always honored."""
+    roots = set()
+    for p in (tempfile.gettempdir(), os.environ.get("TMPDIR"), "/tmp", "/var/tmp"):
+        if not p:
+            continue
+        try:
+            roots.add(str(Path(p).resolve()))
+        except OSError:
+            roots.add(p)
+    return roots
+
+
+def select_dir_outside_git_checkouts(purpose, exclude_sandbox_writable=False):
     """Picks the first of `tempfile.gettempdir()`, `/tmp`, `/var/tmp` that
     both exists and sits outside every git working tree (see
     dir_in_git_repo), for a caller that needs somewhere to write that must
@@ -1017,21 +1137,57 @@ def select_dir_outside_git_checkouts(purpose):
     dir_in_git_repo rather than trusted outright. `purpose` names, in the
     error message, what the directory was needed for. If every candidate is
     unusable (missing, or itself inside a checkout), this is an environment
-    failure, not a silent fall-back into a checkout — it exits 1."""
+    failure, not a silent fall-back into a checkout — it exits 1.
+
+    `exclude_sandbox_writable=True` additionally refuses every candidate in
+    _sandbox_writable_roots(), even though each already sits outside every
+    git checkout: those paths are exactly what a workspace-write angle's
+    own reproduction is free to write to (see the module's threat-model
+    comments), so anything a caller needs a malicious reproduction to never
+    reach — a throwaway CODEX_HOME holding a copy of auth.json, a run
+    directory holding another angle's already-collected artifacts — must
+    not land under any of them either. In this mode the sole candidate is
+    _cache_root(), a stable directory outside the sandbox's write grant,
+    created here if it doesn't exist yet."""
+    if exclude_sandbox_writable:
+        candidates = [_cache_root()]
+        excluded_roots = _sandbox_writable_roots()
+    else:
+        candidates = [tempfile.gettempdir(), "/tmp", "/var/tmp"]
+        excluded_roots = set()
+
     tried = []
     seen = set()
-    for candidate_dir in (tempfile.gettempdir(), "/tmp", "/var/tmp"):
+    for candidate_dir in candidates:
         if candidate_dir in seen:
             continue
         seen.add(candidate_dir)
+        if exclude_sandbox_writable:
+            try:
+                os.makedirs(candidate_dir, exist_ok=True)
+            except OSError:
+                pass
         if not os.path.isdir(candidate_dir):
             tried.append(f"{candidate_dir} (missing)")
             continue
+        if excluded_roots:
+            try:
+                resolved = str(Path(candidate_dir).resolve())
+            except OSError:
+                resolved = candidate_dir
+            if resolved in excluded_roots:
+                tried.append(f"{candidate_dir} (a sandbox-writable root)")
+                continue
         if dir_in_git_repo(candidate_dir):
             tried.append(f"{candidate_dir} (inside a git checkout)")
             continue
         return candidate_dir
 
+    if exclude_sandbox_writable:
+        env_error(
+            f"cannot find a directory outside every git checkout and every "
+            f"sandbox-writable root to {purpose} — tried {', '.join(tried)}"
+        )
     env_error(
         f"cannot find a temp directory outside every git checkout to {purpose} — "
         f"tried {', '.join(tried)} (TMPDIR may be pointing inside a repository)"
@@ -1251,13 +1407,26 @@ def kill_process_group(proc, grace_sec=2):
 _LIVE_PROCS_LOCK = threading.Lock()
 _LIVE_PROCS = []
 
-# Set once by main() (live-run mode only) right after make_throwaway_codex_home
-# creates the run's throwaway CODEX_HOME — the directory _kill_all_and_exit
-# below must also remove on an interrupt, since os._exit bypasses atexit
-# handlers entirely (main() additionally registers an atexit cleanup for the
-# ordinary sys.exit paths). Read-only outside of that one assignment; never
-# locked, same as _LIVE_PROCS's own handler-side reads.
-_THROWAWAY_CODEX_HOME = None
+# Every throwaway CODEX_HOME currently on disk for this run — one per angle
+# (see make_throwaway_codex_home / _run_angle_isolated), not one shared for
+# the whole run, so a write-capable angle's reproduction can never delete
+# another angle's auth.json or plant a config.toml for whichever angle runs
+# next. _kill_all_and_exit below must remove every entry still present on
+# an interrupt, since os._exit bypasses atexit handlers entirely (each
+# make_throwaway_codex_home call additionally registers its own atexit
+# cleanup for the ordinary sys.exit paths, and _run_angle_isolated's own
+# finally removes its entry — and the directory — the moment that angle
+# finishes, well before the whole run exits). Worker paths
+# (_track_codex_home/_untrack_codex_home) serialize their own add/discard
+# through _LIVE_CODEX_HOMES_LOCK, same discipline as _LIVE_PROCS; the
+# handler reads it directly, lock-free, for the same reason _LIVE_PROCS is
+# read lock-free (see the comment above) — a set's add/discard are each
+# atomic enough under the GIL that a lock-free snapshot read is safe (worst
+# case it misses an entry added a moment after the signal, or races a
+# same-moment removal; either way shutil.rmtree on an already-gone
+# directory is a no-op).
+_LIVE_CODEX_HOMES_LOCK = threading.Lock()
+_LIVE_CODEX_HOMES = set()
 
 # One sentinel per Popen call currently between "returned" and "registered in
 # _LIVE_PROCS" — appended immediately before Popen, removed immediately after
@@ -1292,6 +1461,16 @@ def _untrack_proc(proc):
             pass
 
 
+def _track_codex_home(path):
+    with _LIVE_CODEX_HOMES_LOCK:
+        _LIVE_CODEX_HOMES.add(path)
+
+
+def _untrack_codex_home(path):
+    with _LIVE_CODEX_HOMES_LOCK:
+        _LIVE_CODEX_HOMES.discard(path)
+
+
 def _wait_for_in_flight(timeout_sec=2.0, poll_sec=0.01):
     """Busy-waits (no locks — see _IN_FLIGHT's own comment) until every
     in-flight Popen/_track_proc window has closed, or `timeout_sec` has
@@ -1319,12 +1498,13 @@ def _kill_all_and_exit(exit_fn=None):
     procs = list(_LIVE_PROCS)
     for proc in procs:
         kill_process_group(proc)
-    # os._exit below bypasses atexit entirely, so the run's throwaway
-    # CODEX_HOME (holding a copy of the user's auth.json — see
+    # os._exit below bypasses atexit entirely, so every throwaway CODEX_HOME
+    # still on disk (each holding a copy of the user's auth.json — see
     # make_throwaway_codex_home) would otherwise survive an interrupted run
-    # forever instead of being cleaned up like every other exit path.
-    if _THROWAWAY_CODEX_HOME is not None:
-        shutil.rmtree(_THROWAWAY_CODEX_HOME, ignore_errors=True)
+    # forever instead of being cleaned up like every other exit path. A
+    # lock-free snapshot, same reasoning as `procs` above.
+    for home in list(_LIVE_CODEX_HOMES):
+        shutil.rmtree(home, ignore_errors=True)
     print(f"{PROG}: interrupted — terminated all reviewer process groups", file=sys.stderr)
     sys.stderr.flush()
     (exit_fn or os._exit)(130)
@@ -1475,13 +1655,20 @@ def make_throwaway_codex_home():
     call) already carries, so the throwaway, otherwise-empty CODEX_HOME
     still closes off project-local config for them too.
 
-    Created outside every git working tree, via the same
-    select_dir_outside_git_checkouts used to divert merged.json — a TMPDIR
-    pointed inside a checkout would otherwise put a copy of the real
-    auth.json inside that checkout's working tree, where a careless
-    workspace-write angle (or just `git status`) could see it; failing with
-    an environment error is preferable to silently landing it in one. The
-    resulting path is also always made absolute: Python's own
+    Created outside every git working tree AND outside every root a
+    workspace-write angle's own sandbox can write to (tempfile.gettempdir(),
+    $TMPDIR, /tmp, /var/tmp — see select_dir_outside_git_checkouts's
+    exclude_sandbox_writable mode and this module's threat-model comments):
+    this directory is created fresh per angle (see _run_angle_isolated) and
+    removed the moment that angle finishes, but for the time it exists it
+    holds a copy of the real auth.json, which an *earlier* angle's own
+    reproduction — already free to write anywhere the sandbox allows — must
+    never be able to reach and delete, nor plant a config.toml into for a
+    *later* angle's codex exec to load. A TMPDIR pointed inside a checkout
+    would separately put that copy inside the checkout's working tree, where
+    a careless workspace-write angle (or just `git status`) could see it;
+    failing with an environment error is preferable to silently landing it
+    in either. The resulting path is also always made absolute: Python's own
     tempfile.mkdtemp (3.9-3.11) can return a path exactly as relative as the
     `dir=` it was given, and this path is later placed into angle_env
     (CODEX_HOME) for a child process Popen'd with cwd=root, not this
@@ -1489,19 +1676,22 @@ def make_throwaway_codex_home():
     the wrong directory.
 
     Registers this directory for cleanup — both the atexit handler (every
-    ordinary exit) and the global _kill_all_and_exit also removes on an
-    interrupt (os._exit bypasses atexit) — immediately after mkdtemp, before
-    the auth.json copy below even starts: a signal or a copy failure
-    (shutil.copyfile raising) between mkdtemp and registration would
-    otherwise orphan a partial or complete copy of the real auth.json on
-    disk with neither cleanup path aware it exists."""
-    global _THROWAWAY_CODEX_HOME
+    ordinary exit; a backstop here, since _run_angle_isolated's own finally
+    already removes it the moment its one angle finishes) and the
+    _LIVE_CODEX_HOMES set _kill_all_and_exit sweeps on an interrupt (os._exit
+    bypasses atexit) — immediately after mkdtemp, before the auth.json copy
+    below even starts: a signal or a copy failure (shutil.copyfile raising)
+    between mkdtemp and registration would otherwise orphan a partial or
+    complete copy of the real auth.json on disk with neither cleanup path
+    aware it exists."""
     real_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    candidate_dir = select_dir_outside_git_checkouts("create the throwaway CODEX_HOME in")
+    candidate_dir = select_dir_outside_git_checkouts(
+        "create the throwaway CODEX_HOME in", exclude_sandbox_writable=True,
+    )
     throwaway = Path(
         tempfile.mkdtemp(prefix="adversarial-review-codex-home.", dir=candidate_dir)
     ).resolve()
-    _THROWAWAY_CODEX_HOME = throwaway
+    _track_codex_home(throwaway)
     atexit.register(shutil.rmtree, throwaway, ignore_errors=True)
     real_auth = real_home / "auth.json"
     if real_auth.is_file():
@@ -1537,10 +1727,15 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     # either phase (parallel or serial) schedules any angle — not here, so a
     # queued angle whose run_angle body never gets to run before an
     # interrupt still has its old outputs gone.
-    # base_sha, not just base_resolved, so the rendered DIFF_COMMAND is
-    # pinned to the exact commit run_meta already committed to — see
-    # render_prompt's own docstring for why the ref name alone isn't enough.
-    prompt_text = render_prompt(template, plan, angle, base_resolved, run_meta["base_sha"])
+    # base_sha and head_sha, not just base_resolved and a bare "HEAD" — see
+    # render_prompt's own docstring for why the ref name/literal alone isn't
+    # enough. run_meta.get("head_sha") (not run_meta["head_sha"]) — a
+    # hand-built run_meta lacking the key (some direct-call tests construct
+    # one with only the older fields) still renders the familiar "...HEAD"
+    # rather than raising KeyError.
+    prompt_text = render_prompt(
+        template, plan, angle, base_resolved, run_meta["base_sha"], run_meta.get("head_sha"),
+    )
     write_artifact_text(run_dir / f"{aid}.prompt.txt", prompt_text)
     meta = dict(run_meta)
     meta["prompt_sha256"] = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
@@ -1577,6 +1772,31 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         # checkout's own .codex/config.toml (hooks, MCP servers, exec-policy
         # rules, model overrides).
         "-c", "project_doc_max_bytes=0",
+        # `codex exec -C <root>` also auto-discovers a matching
+        # `.agents/skills/**/SKILL.md` from the checkout under review and
+        # injects its description (and, once triggered, its body) into the
+        # model-visible prompt — branch-controlled, same hazard class as
+        # AGENTS.md above, and neither project_doc_max_bytes=0 nor the
+        # throwaway CODEX_HOME (no config.toml at all, so no
+        # `[projects.<root>] trust_level` entry exists to gate it) stops it:
+        # discovery here does not depend on project trust. Verified against
+        # codex-cli 0.145.0: a throwaway repo's
+        # .agents/skills/review-helper/SKILL.md, describing itself as
+        # matching an adversarial/security review, appeared by name and
+        # description in `codex debug prompt-input`'s model-visible prompt
+        # list even under project_doc_max_bytes=0 and a bare-auth.json
+        # CODEX_HOME; `--disable skill_search` (the only skills-adjacent
+        # feature flag `codex features list` exposes) left it unchanged.
+        # `-c skills.include_instructions=false` is the knob that actually
+        # works — with it, `codex debug prompt-input`'s output no longer
+        # contains a "## Skills" section or the repo's skill at all (checked
+        # under `--strict-config`, which also confirms `skills.include_
+        # instructions` — unlike guesses such as `skills.enabled` — is a
+        # real `SkillsConfig` field, not silently ignored). It disables
+        # every skill, global and project alike, not just the repo-local
+        # one — acceptable here since a reviewer angle has no legitimate use
+        # for any skill at all.
+        "-c", "skills.include_instructions=false",
         # The option terminator: a rendered prompt is arbitrary text a plan
         # or a custom --angle-prompt template controls, not this runner —
         # one that happens to start with "-" (a mandate quoting a CLI flag,
@@ -1676,22 +1896,76 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
         return str(e), spawned
 
 
-def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
+def _run_angle_isolated(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, run_meta):
+    """Wraps run_angle with a fresh, this-angle-only throwaway CODEX_HOME —
+    created immediately before this call and removed immediately after,
+    rather than one CODEX_HOME shared by every angle in the run (the
+    runner's old behavior). Every call site (the parallel phase's per-angle
+    submission and run_write_capable_angles' serial loop) goes through this,
+    never run_angle directly, so no path can accidentally share a home
+    across angles again. The directory is removed here — not left for
+    make_throwaway_codex_home's atexit registration alone — specifically so
+    it is gone by the time this call returns: run_write_capable_angles'
+    serial loop calls this once per write-capable angle, one at a time, and
+    the next angle's own make_throwaway_codex_home call must never be able
+    to observe (or be handed) a directory the previous angle's reproduction
+    could still have reached."""
+    codex_home = make_throwaway_codex_home()
+    try:
+        return run_angle(
+            aid, angle, plan, base_resolved, template, run_dir, root,
+            schema_path, timeout_sec, codex_home, run_meta,
+        )
+    finally:
+        shutil.rmtree(codex_home, ignore_errors=True)
+        _untrack_codex_home(codex_home)
+
+
+def _mark_skipped(aid, title, cause, run_dir, results):
     """Records that write-capable angle `aid` never ran at all (the
     dirty-tree gate, or the compromised cascade after an earlier angle's
-    residue — see run_write_capable_angles). Clears any stale artifacts
-    first, so a later --from-dir re-merge of a reused --dir can never read
-    an old .out.json/.status left from a prior invocation and misreport
-    this angle CLEAN; writes the '<aid>.skipped.txt' marker
+    residue or HEAD drift — see run_write_capable_angles). Clears any stale
+    artifacts first, so a later --from-dir re-merge of a reused --dir can
+    never read an old .out.json/.status left from a prior invocation and
+    misreport this angle CLEAN; writes the '<aid>.skipped.txt' marker
     collect_angle_result checks for, so that re-merge reports the same
     UNPARSED(<cause>) this run does; and records the in-memory AngleResult
     for this run's own report."""
     clear_stale_artifacts(aid, run_dir)
     write_artifact_text(run_dir / f"{aid}.skipped.txt", f"{cause}\n")
-    synthetic_results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
+    results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
 
 
-def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home, run_meta):
+def _head_drift_note(root, run_meta):
+    """Compares the checkout's current HEAD against what run_meta recorded
+    when this run started (resolve_head_sha / resolve_head_symbolic_ref).
+    Returns a human-readable description of what moved, or None if neither
+    the commit nor the symbolic ref changed. Checked independently of, and
+    in addition to, the ordinary dirty-tree check after every write-capable
+    angle: `git commit`, `git checkout <ref>`, and `git reset --hard` can
+    each leave `git status --porcelain` clean afterward — the tree looks
+    fine, only history moved — so the dirty-tree check alone would miss
+    exactly this class of reproduction. A `run_meta` with no recorded
+    head_sha (a hand-built one — no caller in this codebase omits it) skips
+    the comparison entirely rather than reporting drift against nothing."""
+    expected_sha = run_meta.get("head_sha")
+    if expected_sha is None:
+        return None
+    current_sha = git(["rev-parse", "HEAD"], root).stdout.strip()
+    ref_r = git(["symbolic-ref", "--quiet", "HEAD"], root)
+    current_ref = ref_r.stdout.strip() if ref_r.returncode == 0 else None
+    expected_ref = run_meta.get("head_ref")
+    lines = []
+    if current_sha != expected_sha:
+        lines.append(f"HEAD commit changed: {expected_sha} -> {current_sha or '(unresolvable)'}")
+    if current_ref != expected_ref:
+        lines.append(
+            f"HEAD branch changed: {expected_ref or '(detached)'} -> {current_ref or '(detached)'}"
+        )
+    return "\n".join(lines) if lines else None
+
+
+def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, run_meta):
     """Runs workspace-write angles one at a time against the shared checkout
     (never concurrently with each other or with a read-only angle — see
     partition_angles: isolating them in a git worktree was rejected because
@@ -1704,27 +1978,38 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
     attribute any residue that follows to a specific angle. After each angle
     whose codex process actually spawned (run_angle's `spawned` flag — a true
     spawn failure is the only case with nothing to check, since the tree was
-    never touched), the tree is checked again: a non-empty `git status
-    --porcelain` is recorded to <angle>.residue.txt and printed to stderr,
-    that angle is marked UNPARSED(residue), and every write-capable angle
-    still to come is skipped as UNPARSED(compromised) rather than run
-    against a tree an earlier angle already modified — nothing is reverted
+    never touched), the tree is checked again — a non-empty `git status
+    --porcelain` is recorded — and, independently, so is HEAD itself (see
+    _head_drift_note: a commit/checkout/reset can leave the tree clean while
+    still moving history). Either one writes <angle>.residue.txt (combining
+    both when both fired), prints to stderr, marks that angle
+    UNPARSED(residue), and skips every write-capable angle still to come as
+    UNPARSED(compromised) rather than running it against a tree — or a
+    history — an earlier angle already modified. Nothing is reverted
     automatically here; that is the SKILL's job (inspect, restore).
 
-    Returns (synthetic_results, spawn_failures). synthetic_results holds
-    AngleResult objects for angles that never ran at all (the dirty-tree
-    gate, or the compromised cascade) — there is no status/out file for
-    those, only the '<aid>.skipped.txt' marker (see _mark_skipped), so they
-    bypass collect_angle_result's normal read entirely in this run, though a
-    later --from-dir re-merge reads that same marker back through
-    collect_angle_result. Angles that did run are left for the caller's
-    normal collect_angle_result pass, which also checks for a residue
-    marker."""
-    synthetic_results = {}
+    Each angle that actually ran has its result collected via
+    collect_angle_result immediately after that angle's own residue/drift
+    check, synchronously, before the next serial angle (if any) starts —
+    not left for a later pass over the whole run directory once every angle
+    (parallel and serial alike) has finished. run_dir sits outside the
+    checkout under review, so a workspace-write angle's own reproduction —
+    already free to write anywhere its sandbox allows — could otherwise
+    replace an earlier angle's already-written <aid>.out.json with a
+    schema-valid CLEAN before anything ever reads it back.
+
+    Returns (results, spawn_failures): `results` maps every serial angle id
+    to its AngleResult — whether it never ran at all (the dirty-tree gate or
+    the compromised cascade, via _mark_skipped) or it ran and was collected
+    immediately as above — so the caller never needs to re-read run_dir for
+    a serial angle's outcome. Angles skipped entirely leave only the
+    '<aid>.skipped.txt' marker (no status/out file), which --from-dir
+    re-merges read back through collect_angle_result the same way."""
+    results = {}
     spawn_failures = []
 
     if not serial_ids:
-        return synthetic_results, spawn_failures
+        return results, spawn_failures
 
     if git_status_porcelain(root).strip():
         print(
@@ -1733,37 +2018,49 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
             file=sys.stderr,
         )
         for aid in serial_ids:
-            _mark_skipped(aid, angles_by_id[aid]["title"], "dirty-tree", run_dir, synthetic_results)
-        return synthetic_results, spawn_failures
+            _mark_skipped(aid, angles_by_id[aid]["title"], "dirty-tree", run_dir, results)
+        return results, spawn_failures
 
     compromised = False
     for aid in serial_ids:
         if compromised:
-            _mark_skipped(aid, angles_by_id[aid]["title"], "compromised", run_dir, synthetic_results)
+            _mark_skipped(aid, angles_by_id[aid]["title"], "compromised", run_dir, results)
             continue
-        err, spawned = run_angle(
+        err, spawned = _run_angle_isolated(
             aid, angles_by_id[aid], plan, base_resolved, template,
-            run_dir, root, schema_path, timeout_sec, codex_home, run_meta,
+            run_dir, root, schema_path, timeout_sec, run_meta,
         )
         if err is not None:
             spawn_failures.append((aid, err))
             # A true spawn failure (Popen itself never started the process)
-            # never touched the tree, so there's nothing to check. Any error
+            # never touched the tree, so there's nothing to check, and
+            # nothing to collect — main() aborts the whole run over any
+            # spawn_failures entry before ever building a report. Any error
             # after that — the .status write, the background-leak note —
             # leaves a codex process that may already have run against the
-            # shared checkout, so the residue check below must still run,
-            # exactly as it does after a normal finish.
+            # shared checkout, so the residue/drift check below must still
+            # run, exactly as it does after a normal finish.
             if not spawned:
                 continue
         status = git_status_porcelain(root)
-        if status.strip():
-            write_artifact_text(run_dir / f"{aid}.residue.txt", status)
-            print(f"{PROG}: angle '{aid}' left the working tree dirty — not reverting:", file=sys.stderr)
-            for line in status.splitlines():
+        drift = _head_drift_note(root, run_meta)
+        if status.strip() or drift:
+            parts = []
+            if status.strip():
+                parts.append(status if status.endswith("\n") else status + "\n")
+            if drift:
+                parts.append(drift + "\n")
+            residue_text = "".join(parts)
+            write_artifact_text(run_dir / f"{aid}.residue.txt", residue_text)
+            print(f"{PROG}: angle '{aid}' left the working tree dirty or moved HEAD — not reverting:", file=sys.stderr)
+            for line in residue_text.splitlines():
                 print(f"  {line}", file=sys.stderr)
             compromised = True
+        # Collected now, synchronously, while nothing else can have touched
+        # this angle's own artifacts yet — see the docstring above.
+        results[aid] = collect_angle_result(angles_by_id[aid], run_dir, run_meta)
 
-    return synthetic_results, spawn_failures
+    return results, spawn_failures
 
 
 def main(argv=None):
@@ -1865,6 +2162,14 @@ def main(argv=None):
         angle_ids_all = [a["id"] for a in plan["angles"]]
         angles_by_id = {a["id"]: a for a in plan["angles"]}
         angle_ids = parse_only(args.only, angle_ids_all) or angle_ids_all
+        # Computed up front (before run_dir is even chosen) because it
+        # gates run_dir's own default/refusal logic below: a workspace-
+        # write angle's own reproduction is already free to write anywhere
+        # its sandbox allows, so the run directory holding every angle's
+        # artifacts must not land somewhere that reproduction can reach.
+        has_write_capable = any(
+            angles_by_id[aid]["execution"] == "workspace-write" for aid in angle_ids
+        )
 
         global CODEX_BIN
         resolved_codex_bin = shutil.which(CODEX_BIN)
@@ -1881,15 +2186,24 @@ def main(argv=None):
         # cwd is still the invocation directory, makes it unambiguous.
         CODEX_BIN = os.path.abspath(resolved_codex_bin)
 
-        # One throwaway CODEX_HOME for the whole run (every angle, parallel
-        # and serial alike, shares it) — see make_throwaway_codex_home for
-        # why. That function registers its own cleanup (both the atexit
-        # handler and the _THROWAWAY_CODEX_HOME global _kill_all_and_exit
-        # uses on an interrupt) immediately after creating the directory,
-        # before any angle can spawn and before its own auth.json copy.
-        codex_home = make_throwaway_codex_home()
+        # No single shared CODEX_HOME is created here any more — each angle
+        # gets its own, made and torn down around that one angle's own
+        # codex exec (see _run_angle_isolated / make_throwaway_codex_home),
+        # so a write-capable angle's reproduction can never delete another
+        # angle's auth.json or plant a config.toml for whichever angle runs
+        # next.
 
         root = repo_root()
+        # Captured once, up front, alongside base_sha below — every
+        # angle's rendered {{DIFF_COMMAND}} and this run's own empty-diff
+        # gate are pinned to this exact commit, and run_write_capable_angles
+        # compares it again after each write-capable angle (see
+        # _head_drift_note) to catch a reproduction that moves HEAD via
+        # `git commit`/`git checkout <ref>`/`git reset --hard` — each of
+        # which can leave the tree clean afterward, so the ordinary
+        # dirty-tree check alone would miss it.
+        head_sha = resolve_head_sha(root)
+        head_ref = resolve_head_symbolic_ref(root)
         base = args.base or plan.get("base")
         if not base:
             usage_error("plan has no 'base' and --base was not given")
@@ -1905,24 +2219,35 @@ def main(argv=None):
         # all. template_hash is filled in below, once the template itself is
         # loaded — every comparison against this dict (the reused-`--dir`
         # broad clear, collect_angle_result's meta check) happens after that.
+        # head_sha/head_ref ride along for provenance and for
+        # run_write_capable_angles's own drift check, but deliberately do
+        # NOT participate in that reused-`--dir`/collect_angle_result
+        # equality check — that check is about whether this run's INPUTS
+        # (plan/base/template) changed since an artifact was produced, not
+        # about in-run compromise, which the drift check handles on its own.
         base_sha = resolve_base_sha(base_resolved, root)
         run_meta = {
             "plan_hash": compute_plan_hash(plan),
             "base_resolved": base_resolved,
             "base_sha": base_sha,
+            "head_sha": head_sha,
+            "head_ref": head_ref,
         }
 
-        # Diffed against the pinned commit, not base_resolved's ref name —
-        # a ref can move between this resolution and whenever a spawned
-        # angle's own rendered DIFF_COMMAND (see render_prompt) actually
-        # runs, and this run's own empty-diff gate must see the same commit
-        # every angle is told to diff against, not a name that could by now
-        # point somewhere else.
-        diff_check = git(["diff", f"{base_sha}...HEAD", "--name-only"], root)
+        # Diffed against the pinned commits, not base_resolved's ref name or
+        # a bare "HEAD" — a ref can move between this resolution and
+        # whenever a spawned angle's own rendered DIFF_COMMAND (see
+        # render_prompt) actually runs, and this run's own empty-diff gate
+        # must see the same commits every angle is told to diff against, not
+        # names that could by now point somewhere else.
+        diff_check = git(["diff", f"{base_sha}...{head_sha}", "--name-only"], root)
         if diff_check.returncode != 0:
-            env_error(f"git diff {base_sha}...HEAD failed: {diff_check.stderr.strip()}")
+            env_error(f"git diff {base_sha}...{head_sha} failed: {diff_check.stderr.strip()}")
         if not diff_check.stdout.strip():
-            env_error(f"empty diff between {base_resolved} ({base_sha}) and HEAD — nothing to review")
+            env_error(
+                f"empty diff between {base_resolved} ({base_sha}) and HEAD ({head_sha}) "
+                "— nothing to review"
+            )
 
         if args.jobs is not None and args.jobs < 1:
             usage_error("--jobs must be >= 1")
@@ -1955,6 +2280,23 @@ def main(argv=None):
             # otherwise land codex's output under root instead of where the
             # caller meant.
             run_dir = Path(args.dir).resolve()
+        elif has_write_capable:
+            # A workspace-write angle's own reproduction is already free to
+            # write anywhere its own sandbox allows — tempfile.gettempdir(),
+            # $TMPDIR, /tmp, /var/tmp (see _sandbox_writable_roots and this
+            # module's threat-model comments) — and run_dir holds every
+            # angle's own artifacts, including an EARLIER angle's already-
+            # collected <aid>.out.json a LATER one could otherwise overwrite
+            # before anything reads it back. The default therefore comes
+            # from select_dir_outside_git_checkouts' exclude_sandbox_writable
+            # mode (a stable cache directory) instead of the ordinary temp
+            # root below, whenever the plan actually has such an angle.
+            candidate_dir = select_dir_outside_git_checkouts(
+                "create the default run directory in", exclude_sandbox_writable=True,
+            )
+            run_dir = Path(
+                tempfile.mkdtemp(prefix="adversarial-review.", dir=candidate_dir)
+            ).resolve()
         else:
             # .resolve() here too — mkdtemp's dir= can itself be a symlink
             # (e.g. macOS's /tmp -> /private/tmp), and the containment check
@@ -1976,6 +2318,24 @@ def main(argv=None):
                 f"run directory {run_dir} is inside the repository root {root} — "
                 "the run directory must live outside the repository so it cannot dirty the tree"
             )
+
+        # An explicit --dir sitting under a sandbox-writable root gets the
+        # same refusal the default above avoids automatically — but only
+        # when the plan actually has a write-capable angle: a read-only-only
+        # plan never spawns anything free to write outside the checkout at
+        # all, so --dir under /tmp stays exactly as permissive as it always
+        # was for that case.
+        if args.dir and has_write_capable:
+            for sandbox_root in _sandbox_writable_roots():
+                if run_dir.is_relative_to(Path(sandbox_root)):
+                    usage_error(
+                        f"run directory {run_dir} sits under a sandbox-writable root "
+                        f"({sandbox_root}) while this plan has a workspace-write angle — "
+                        "a reproduction could tamper with another angle's already-collected "
+                        "artifacts before this run ever reads them back; choose a --dir "
+                        "outside tempfile.gettempdir()/$TMPDIR/tmp/var-tmp and outside the "
+                        "checkout"
+                    )
 
         if args.dir:
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -2039,6 +2399,18 @@ def main(argv=None):
             clear_stale_artifacts(aid, run_dir)
 
         spawn_failures = []
+        # Collected into memory as each angle finishes — in the parallel
+        # phase's own as_completed loop below, and inside
+        # run_write_capable_angles' serial loop — rather than re-read from
+        # run_dir only after every angle (parallel and serial alike) has
+        # already run. run_dir sits outside the checkout under review, so a
+        # workspace-write angle's own reproduction — already free to write
+        # anywhere its sandbox allows — could otherwise replace an earlier
+        # angle's already-written <aid>.out.json with a schema-valid CLEAN
+        # before anything ever reads it back; the on-disk files remain for
+        # humans and --from-dir, but this run's own report never re-reads
+        # them once collected here.
+        results_by_id = {}
         # SIGINT/SIGTERM anywhere in here — blocked on a parallel angle in
         # cf.as_completed, or on the serial phase's own serial_future.result()
         # — is handled by the signal.signal handlers installed above; this
@@ -2065,22 +2437,31 @@ def main(argv=None):
                 # loop included) before a real interrupt could ever be
                 # observed here — this is a cheap, correct belt-and-suspenders
                 # check, not the primary defense (that's run_angle's own
-                # checks around its Popen call).
+                # checks around its Popen call). _run_angle_isolated, not
+                # run_angle directly — see that wrapper's own docstring —
+                # gives every parallel angle its own throwaway CODEX_HOME too,
+                # not only the serial ones.
                 future_to_id = {}
                 for aid in parallel_ids:
                     future_to_id[ex.submit(
-                        run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
-                        run_dir, root, schema_path, args.timeout, codex_home, run_meta,
+                        _run_angle_isolated, aid, angles_by_id[aid], plan, base_resolved,
+                        template, run_dir, root, schema_path, args.timeout, run_meta,
                     )] = aid
                     if _CANCELLED:
                         break
                 for fut in cf.as_completed(future_to_id):
+                    aid = future_to_id[fut]
                     # spawned is irrelevant here: read-only angles never
                     # write to the checkout, so there is no residue check
                     # to gate (contrast run_write_capable_angles).
                     err, _spawned = fut.result()
                     if err is not None:
-                        spawn_failures.append((future_to_id[fut], err))
+                        spawn_failures.append((aid, err))
+                    else:
+                        # Collected now, synchronously, the moment this
+                        # angle's own future resolves — see the comment
+                        # above results_by_id's own initialization.
+                        results_by_id[aid] = collect_angle_result(angles_by_id[aid], run_dir, run_meta)
                 ex.shutdown(wait=True)
 
             # Run on a dedicated single worker thread, never inline on the
@@ -2107,10 +2488,15 @@ def main(argv=None):
             serial_future = serial_ex.submit(
                 run_write_capable_angles,
                 serial_ids, angles_by_id, plan, base_resolved, template,
-                run_dir, root, schema_path, args.timeout, codex_home, run_meta,
+                run_dir, root, schema_path, args.timeout, run_meta,
             )
-            synthetic_results, serial_spawn_failures = serial_future.result()
+            # run_write_capable_angles collects every serial angle's own
+            # result itself, immediately after that angle's residue/drift
+            # check — see its own docstring — so serial_results already
+            # covers every id in serial_ids, skipped or completed alike.
+            serial_results, serial_spawn_failures = serial_future.result()
             serial_ex.shutdown(wait=True)
+            results_by_id.update(serial_results)
             spawn_failures.extend(serial_spawn_failures)
         except KeyboardInterrupt:
             _interrupt_and_exit()
@@ -2125,12 +2511,12 @@ def main(argv=None):
                 "ran and timed out or errored, which is instead folded into a per-angle "
                 "UNPARSED result)"
             )
-
-        results_by_id = {
-            aid: synthetic_results[aid] if aid in synthetic_results
-            else collect_angle_result(angles_by_id[aid], run_dir, run_meta)
-            for aid in angle_ids
-        }
+        # No spawn failures: parallel_ids ∪ serial_ids == angle_ids exactly
+        # (partition_angles is exhaustive and non-overlapping), every
+        # parallel angle without a spawn_failures entry was just collected
+        # above, and run_write_capable_angles' own return already covers
+        # every serial id — so results_by_id is complete here without
+        # re-reading run_dir again.
 
     merged_findings = merge_findings([results_by_id[aid] for aid in angle_ids])
     merged_path = resolve_merged_json_path(run_dir, from_dir_mode=bool(args.from_dir))

@@ -139,60 +139,104 @@ shape), and `-c project_doc_max_bytes=0`: without it, `codex exec -C <root>`
 loads the branch's own `AGENTS.md`/`CLAUDE.md` (root and every parent up to
 the git root) as project instructions ahead of the angle prompt, and a branch
 under review controls that file — it could instruct every angle to report
-CLEAN regardless of what the diff does. The Codex lane never loads them. The
-Claude lane (`claude-angle-prompt.md`) has no such knob to disable that
-loading, so a Claude reviewer must treat repo instruction files as part of
-the diff under review, never as instructions to itself. Every angle also runs
-with `CODEX_HOME` pointed at a throwaway directory (holding only a copy of
-the real one's `auth.json`, deleted once the run ends), never the real
-`CODEX_HOME`: `codex exec -C <root>` on a checkout the real `CODEX_HOME`'s
-config.toml marks `trusted` (set once, in any unrelated session, by accepting
-the interactive trust prompt) loads *that checkout's own* `.codex/config.toml`
-— hooks, MCP servers, exec-policy rules, model overrides, all
-branch-controlled — ahead of every angle's prompt, the same hazard class as
-the AGENTS.md guard above, and `project_doc_max_bytes=0` does nothing against
-it. Verified empirically against codex-cli 0.145.0: a throwaway repo's
-`.codex/config.toml` setting `model_reasoning_effort = "minimal"` left `codex
-exec`'s own startup header at the ambient `CODEX_HOME`'s own setting while
-the project was untrusted, and switched to the repo-local value the instant a
-`CODEX_HOME` marked that path trusted; a `CODEX_HOME` holding only a copy of
-`auth.json` (no config.toml at all) authenticated normally while leaving the
-header at the built-in default — closing the surface without breaking login.
-Write-capable angles
-run against the shared checkout — a `git
-worktree` was rejected because reviewers need the project's real environment
-(`.venv`, caches) that a worktree lacks — so the runner schedules
-accordingly: every `read-only` angle runs together in the shared thread pool,
-then every `workspace-write` angle runs one at a time, never overlapping
-another angle. The first write-capable angle requires a clean tree
-(`git status --porcelain` empty); if the tree is already dirty, every
-write-capable angle is skipped and marked `UNPARSED(dirty-tree)` without
-running. After each write-capable angle the tree is checked again; a
-non-empty result is recorded to `<angle>.residue.txt`, that angle is marked
-`UNPARSED(residue)` (its findings still surface in `merged.json` and the
-block, just not counted as `RAN`), and every write-capable angle still to
-come is skipped as `UNPARSED(compromised)` rather than run against that
-now-modified tree — nothing is auto-reverted, so inspect and restore by
-hand. Any angle,
-read-only or workspace-write, can also come back `UNPARSED(refused)`: it
-exited nonzero with no `<angle>.out.json`, and its `.log` shows the
-provider's content filter refused the prompt rather than the angle failing
-to run cleanly — the runner prints one stderr line naming the angle when
-this happens. The run directory keeps `plan.json`, `<angle>.prompt.txt`,
+CLEAN regardless of what the diff does. The Codex lane never loads them.
+`codex exec -C <root>` separately auto-discovers a matching
+`.agents/skills/**/SKILL.md` from the checkout under review and injects its
+description (and, once triggered, its body) into the model-visible prompt —
+also branch-controlled, and neither `project_doc_max_bytes=0` nor the
+throwaway `CODEX_HOME` below stops it. `-c skills.include_instructions=false`
+closes that: verified against codex-cli 0.145.0 with `codex debug
+prompt-input`, a throwaway repo's own attack skill (description matching an
+adversarial review, body instructing a fixed reply) appeared in the
+model-visible prompt with both of those in place, and disappeared once this
+flag was added — it disables every skill, global and project alike, not just
+the repo-local one, which is fine since a reviewer angle has no legitimate
+use for any. The Claude lane (`claude-angle-prompt.md`) has no knob to
+disable either kind of loading, so a Claude reviewer must treat repo
+instruction files and repo-local skills as part of the diff under review,
+never as instructions to itself. Every angle also runs with `CODEX_HOME`
+pointed at its own fresh throwaway directory (holding only a copy of the real
+one's `auth.json`, created immediately before that one angle's `codex exec`
+and deleted the moment it finishes — never one CODEX_HOME shared across the
+whole run), never the real `CODEX_HOME`: `codex exec -C <root>` on a checkout
+the real `CODEX_HOME`'s config.toml marks `trusted` (set once, in any
+unrelated session, by accepting the interactive trust prompt) loads *that
+checkout's own* `.codex/config.toml` — hooks, MCP servers, exec-policy rules,
+model overrides, all branch-controlled — ahead of every angle's prompt, the
+same hazard class as the AGENTS.md guard above, and `project_doc_max_bytes=0`
+does nothing against it. Verified empirically against codex-cli 0.145.0: a
+throwaway repo's `.codex/config.toml` setting `model_reasoning_effort =
+"minimal"` left `codex exec`'s own startup header at the ambient
+`CODEX_HOME`'s own setting while the project was untrusted, and switched to
+the repo-local value the instant a `CODEX_HOME` marked that path trusted; a
+`CODEX_HOME` holding only a copy of `auth.json` (no config.toml at all)
+authenticated normally while leaving the header at the built-in default —
+closing the surface without breaking login. Giving each angle its own
+CODEX_HOME, rather than one shared for the whole run, closes a further gap: a
+workspace-write angle's reproduction is already free to write anywhere its
+own sandbox allows, so a shared CODEX_HOME would let it delete the next
+angle's copy of `auth.json` or plant a `config.toml` of its own.
+
+Write-capable angles run against the shared checkout — a `git worktree` was
+rejected because reviewers need the project's real environment (`.venv`,
+caches) that a worktree lacks — so the runner schedules accordingly: every
+`read-only` angle runs together in the shared thread pool, then every
+`workspace-write` angle runs one at a time, never overlapping another angle.
+The first write-capable angle requires a clean tree (`git status --porcelain`
+empty); if the tree is already dirty, every write-capable angle is skipped
+and marked `UNPARSED(dirty-tree)` without running. After each write-capable
+angle, two independent checks run: the tree again (a non-empty result), and
+HEAD itself — its commit and, unless detached, the branch it resolves
+through — against what the run recorded at the start (a `git commit`,
+`git checkout <ref>`, or `git reset --hard` inside the reproduction can each
+leave the tree looking clean again while still moving history, which the
+tree check alone would miss). Either one records to `<angle>.residue.txt`,
+marks that angle `UNPARSED(residue)` (its findings still surface in
+`merged.json` and the block, just not counted as `RAN`), and skips every
+write-capable angle still to come as `UNPARSED(compromised)` rather than
+running it against that now-modified tree or history — nothing is
+auto-reverted, so inspect and restore by hand. Every angle's `{{DIFF_COMMAND}}`
+is pinned to the exact base and HEAD commits resolved once at the start of
+the run (not the mutable ref names, and never a bare `HEAD` a later command
+could re-resolve against wherever a reproduction left it), and each one's
+result is collected into memory the instant that angle itself finishes —
+never re-read from the run directory only after every angle, parallel and
+serial alike, has already run — because the run directory lives outside the
+checkout under review and so is never covered by the tree/HEAD checks above;
+without collecting immediately, a later write-capable angle's reproduction
+could overwrite an earlier angle's already-written `<angle>.out.json` on disk
+with a schema-valid `CLEAN` before anything ever read it back. The on-disk
+files remain, for humans and `--from-dir`. Any angle, read-only or
+workspace-write, can also come back `UNPARSED(refused)`: it exited nonzero
+with no `<angle>.out.json`, and its `.log` shows the provider's content
+filter refused the prompt rather than the angle failing to run cleanly — the
+runner prints one stderr line naming the angle when this happens.
+
+The run directory keeps `plan.json`, `<angle>.prompt.txt`,
 `<angle>.out.json`, `<angle>.log`, `<angle>.status`, `<angle>.meta.json`
 (the plan hash, resolved base and its commit, angle-prompt template hash,
 and prompt hash the output belongs to — a `--from-dir` merge reports an
 angle whose metadata no longer matches `plan.json`'s own provenance record
 as `UNPARSED(stale)`), `<angle>.residue.txt`
-(write-capable angles only, when the tree came back dirty), `<angle>.skipped.txt`
-(write-capable angles the dirty-tree gate or the compromised cascade skipped
-entirely, naming the cause), and normally `merged.json` — except under
-`--from-dir` when that directory sits inside a real git checkout (a fixtures
-tree, an example under version control): then `merged.json` is written to a
-temp file instead, so the run never dirties that checkout, and the block's
-`DIR=` line is followed by a `MERGED=` line naming where it actually landed.
-Re-running an angle into a reused `--dir` (a fresh invocation, or `--only`
-narrowing a re-run) first deletes that angle's own prior
+(write-capable angles only, when the tree or HEAD came back changed),
+`<angle>.skipped.txt` (write-capable angles the dirty-tree gate or the
+compromised cascade skipped entirely, naming the cause — read defensively:
+neither a symlink nor content outside the runner's own known causes is ever
+trusted or echoed, folding into `UNPARSED(badmarker)` instead), and normally
+`merged.json` — except under `--from-dir` when that directory sits inside a
+real git checkout (a fixtures tree, an example under version control): then
+`merged.json` is written to a temp file instead, so the run never dirties
+that checkout, and the block's `DIR=` line is followed by a `MERGED=` line
+naming where it actually landed. By default the run directory itself is a
+fresh `mktemp -d`, normally under the system temp dir — except whenever the
+plan has any `workspace-write` angle, in which case a workspace-write
+angle's own reproduction is free to write there too, so both the default and
+an explicit `--dir` are required to sit outside `tempfile.gettempdir()`,
+`$TMPDIR`, `/tmp`, `/var/tmp`, and the checkout: the default instead picks a
+stable directory under `$XDG_CACHE_HOME` (or `~/.cache`) outside all of
+those, and an explicit `--dir` inside any of them is refused rather than
+used. Re-running an angle into a reused `--dir` (a fresh invocation, or
+`--only` narrowing a re-run) first deletes that angle's own prior
 `.prompt.txt`/`.out.json`/`.log`/`.status`/`.meta.json`/`.residue.txt`/`.skipped.txt`,
 so a stale file from an earlier run in the same directory is never mistaken
 for this run's result; when the incoming plan, base, or angle-prompt
