@@ -1973,9 +1973,10 @@ plan = {"promise": "Ships a thing.", "contracts": [], "invariants": []}
 
 with tempfile.TemporaryDirectory() as d:
     run_dir = Path(d)
+    run_meta = {"plan_hash": "deadbeef", "base_resolved": "main", "base_sha": "cafef00d"}
     err, spawned = ar.run_angle(
         "alpha", angle, plan, "main", "template {{ANGLE_ID}}",
-        run_dir, "/tmp", "schema.json", 5, Path("/tmp/unused-codex-home"),
+        run_dir, "/tmp", "schema.json", 5, Path("/tmp/unused-codex-home"), run_meta,
     )
     result = ar.collect_angle_result(angle, run_dir)
     ok = (
@@ -2123,6 +2124,358 @@ for aid29b in alpha beta; do
 
   rm -rf "$rundir29b"
 done
+
+# --- Case 30: a reused --dir with a changed plan + --only never leaks an -------
+# unselected angle's stale verdict into a later --from-dir merge
+# Regression: run_angle now stamps each angle's own <aid>.meta.json with the
+# plan hash + resolved base/sha that produced it (run_meta in main()), and a
+# live run whose plan or base differs from --dir's existing plan.json clears
+# every angle's artifacts (not only the ones --only selects) before writing
+# the new plan.json. Seeds a run with two read-only angles (alpha, beta),
+# reruns with a changed plan (different promise) restricted to --only alpha,
+# then --from-dir merges the whole --dir: beta's stale CLEAN from the first
+# run must never surface as this (different) plan's own verdict.
+repo30=$(make_throwaway_repo reused-dir-changed-plan)
+planA30="$repo30/planA.json"
+cat > "$planA30" <<'EOF'
+{"version": 1, "base": "main", "promise": "Plan A.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+planB30="$repo30/planB.json"
+cat > "$planB30" <<'EOF'
+{"version": 1, "base": "main", "promise": "Plan B -- a materially different review.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+rundir30="$tmpdir/reused-dir-changed-plan-run.$$.${RANDOM:-0}"
+argvdir30="$tmpdir/reused-dir-changed-plan-argv.$$.${RANDOM:-0}"
+
+out30_1=$(cd "$repo30" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir30" \
+  bash "$SH" --plan "$planA30" --base main --dir "$rundir30" 2>&1); rc30_1=$?
+echo "--- case 30: first run (plan A, both angles) ---"
+printf '%s\n' "$out30_1"
+check "first run exits 0" test "$rc30_1" -eq 0
+check "first run: alpha CLEAN" grep -qx "alpha: CLEAN" <<<"$out30_1"
+check "first run: beta CLEAN" grep -qx "beta: CLEAN" <<<"$out30_1"
+
+out30_2=$(cd "$repo30" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir30" \
+  bash "$SH" --plan "$planB30" --base main --dir "$rundir30" --only alpha 2>&1); rc30_2=$?
+echo "--- case 30: second run (plan B, --only alpha) ---"
+printf '%s\n' "$out30_2"
+check "second run exits 0" test "$rc30_2" -eq 0
+check "second run only counts alpha" \
+  grep -qx "ANGLES=1  RAN=1  BLOCKED=0  UNPARSED=0" <<<"$out30_2"
+
+out30_3=$(bash "$SH" --from-dir "$rundir30" 2>&1); rc30_3=$?
+echo "--- case 30: --from-dir merges the reused --dir after the plan changed ---"
+printf '%s\n' "$out30_3"
+check "--from-dir exits 4 (beta must never resurface as a clean plan-B result)" \
+  test "$rc30_3" -eq 4
+check "--from-dir verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out30_3"
+check "alpha (rerun under plan B) is CLEAN" grep -qx "alpha: CLEAN" <<<"$out30_3"
+check "beta is never reported CLEAN (its plan-A artifact must not leak into plan B)" \
+  bash -c '! grep -q "^beta: CLEAN" <<<"$1"' _ "$out30_3"
+
+rm -rf "$rundir30"
+
+# --- Case 30b: a meta mismatch alone yields UNPARSED(stale) ---------------------
+# Regression: an angle's <aid>.meta.json must be checked field-for-field
+# against the run dir's own plan.json "_run" record -- a single mismatched
+# field (here, base_sha) is as untrustworthy as a missing meta.json
+# entirely, however well-formed the angle's own .status/.out.json otherwise
+# look. Hand-crafted directly (no live run needed) to unit-test the
+# collect_angle_result check in isolation from main()'s own broad-clear
+# defense (case 30 exercises that one together with this backstop).
+dir30b="$tmpdir/meta-mismatch.$$.${RANDOM:-0}"
+mkdir -p "$dir30b"
+cat > "$dir30b/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}],
+ "_run": {"plan_hash": "h1", "base_resolved": "refs/heads/main", "base_sha": "aaaa000"}}
+EOF
+printf '0\n' > "$dir30b/solo.status"
+cat > "$dir30b/solo.out.json" <<'EOF'
+{"angle": "solo", "verdict": "CLEAN", "summary": "looks fine", "findings": []}
+EOF
+cat > "$dir30b/solo.meta.json" <<'EOF'
+{"plan_hash": "h1", "base_resolved": "refs/heads/main", "base_sha": "different-sha"}
+EOF
+
+out30b=$(bash "$SH" --from-dir "$dir30b" 2>&1); rc30b=$?
+echo "--- case 30b: a meta mismatch alone yields UNPARSED(stale) ---"
+printf '%s\n' "$out30b"
+
+check "exits 4" test "$rc30b" -eq 4
+check "verdict is UNPARSED" grep -qx "ADVERSARIAL_REVIEW: UNPARSED" <<<"$out30b"
+check "the angle is marked UNPARSED(stale), not the well-formed CLEAN it otherwise carries" \
+  grep -qx "solo: UNPARSED(stale)" <<<"$out30b"
+
+rm -rf "$dir30b"
+
+# --- Case 30c: an unchanged plan with --only still merges the untouched --------
+# angle's earlier result (the documented purpose of --only)
+# Companion to case 30: a --dir reused with the SAME plan and base must
+# never treat an angle --only left out of this run as stale just because it
+# wasn't part of this particular invocation -- both the broad clear (case
+# 30) and the meta check (case 30b) key off the plan/base actually
+# changing, never off --only being present at all.
+repo30c=$(make_throwaway_repo reused-dir-unchanged-plan)
+cat > "$repo30c/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [
+   {"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"},
+   {"id": "beta", "title": "Beta", "mandate": "m", "evidence": "e", "execution": "read-only"}
+ ]}
+EOF
+rundir30c="$tmpdir/reused-dir-unchanged-plan-run.$$.${RANDOM:-0}"
+argvdir30c="$tmpdir/reused-dir-unchanged-plan-argv.$$.${RANDOM:-0}"
+
+out30c_1=$(cd "$repo30c" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir30c" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir30c" 2>&1); rc30c_1=$?
+echo "--- case 30c: first run (both angles) ---"
+printf '%s\n' "$out30c_1"
+check "first run exits 0" test "$rc30c_1" -eq 0
+
+out30c_2=$(cd "$repo30c" && CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir30c" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir30c" --only alpha 2>&1); rc30c_2=$?
+echo "--- case 30c: second run (same plan, --only alpha) ---"
+printf '%s\n' "$out30c_2"
+check "second run exits 0" test "$rc30c_2" -eq 0
+check "second run only counts alpha" \
+  grep -qx "ANGLES=1  RAN=1  BLOCKED=0  UNPARSED=0" <<<"$out30c_2"
+
+out30c_3=$(bash "$SH" --from-dir "$rundir30c" 2>&1); rc30c_3=$?
+echo "--- case 30c: --from-dir merges both, beta's earlier result survives ---"
+printf '%s\n' "$out30c_3"
+check "--from-dir exits 0" test "$rc30c_3" -eq 0
+check "--from-dir verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out30c_3"
+check "--from-dir counts both angles ran" \
+  grep -qx "ANGLES=2  RAN=2  BLOCKED=0  UNPARSED=0" <<<"$out30c_3"
+check "alpha is CLEAN" grep -qx "alpha: CLEAN" <<<"$out30c_3"
+check "beta's untouched earlier result still merges as CLEAN, not stale" \
+  grep -qx "beta: CLEAN" <<<"$out30c_3"
+
+rm -rf "$rundir30c"
+
+# --- Case 31: resolve_base handles a base already in "<remote>/<branch>" form --
+# Regression: a plan's base can legitimately already be written in the
+# documented "<remote>/<branch>" form (e.g. "origin/main"). Before checking
+# that form directly, resolve_base's generic remote loop instead probed the
+# nonsensical refs/remotes/origin/origin/main (this base's own "origin/"
+# prefix, plus the loop's own) -- which never verifies -- and fell through
+# to refs/heads/origin/main, which a same-named local branch can satisfy
+# instead of the real refs/remotes/origin/main. Same repo shape as case 25d
+# (a genuine bare-remote origin/main sitting behind HEAD, plus a decoy local
+# branch literally named "origin/main" built at HEAD) but resolved with
+# --base origin/main directly, not --base main.
+repo31="$tmpdir/prefixed-base.$$.${RANDOM:-0}"
+mkdir -p "$repo31"
+git init -q -b main "$repo31"
+git -C "$repo31" config user.email "test@example.com"
+git -C "$repo31" config user.name "Test"
+echo base > "$repo31/f.txt"
+git -C "$repo31" add -A
+git -C "$repo31" commit -q -m base
+
+remote31="$tmpdir/prefixed-base-remote.$$.${RANDOM:-0}.git"
+git init -q --bare "$remote31"
+git -C "$repo31" remote add origin "$remote31"
+git -C "$repo31" push -q origin main
+git -C "$repo31" fetch -q origin
+
+echo "ahead of origin" >> "$repo31/f.txt"
+git -C "$repo31" commit -qam "HEAD moves ahead of origin/main"
+
+# The decoy: a LOCAL branch literally named "origin/main" -- the exact
+# refs/heads/origin/main path resolve_base's old fallback would have hit
+# instead of refs/remotes/origin/main.
+git -C "$repo31" branch "origin/main"
+
+origin_sha31=$(git -C "$repo31" rev-parse refs/remotes/origin/main)
+decoy_sha31=$(git -C "$repo31" rev-parse refs/heads/origin/main)
+head_sha31=$(git -C "$repo31" rev-parse HEAD)
+
+out31=$(cd "$repo31" && CODEX_BIN=true bash "$SH" --print-base --base origin/main 2>&1); rc31=$?
+echo "--- case 31: --print-base --base origin/main resolves the real remote ref ---"
+printf '%s\n' "$out31"
+
+check "setup: the remote-tracking ref is really behind HEAD" test "$origin_sha31" != "$head_sha31"
+check "setup: the decoy local branch is really identical to HEAD" test "$decoy_sha31" = "$head_sha31"
+check "exits 0" test "$rc31" -eq 0
+check "--print-base --base origin/main prints refs/remotes/origin/main, not the decoy" \
+  test "$out31" = "refs/remotes/origin/main"
+
+# --- Case 32: a TMPDIR inside the checkout never puts the throwaway CODEX_HOME -
+# inside it
+# Regression: make_throwaway_codex_home used to call tempfile.mkdtemp() with
+# no dir= override at all -- honoring TMPDIR unconditionally, with no check
+# that the resulting directory (holding a copy of the real auth.json) sits
+# outside every git checkout. A TMPDIR pointed inside the reviewed repo
+# would put that copy inside the working tree, where a careless
+# workspace-write angle (or just `git status`) could see it. Reuses
+# select_dir_outside_git_checkouts (the same helper resolve_merged_json_path
+# uses) to fall back to /tmp or /var/tmp instead.
+repo32=$(make_throwaway_repo hostile-tmpdir-codex-home)
+hostiletmp32="$repo32/.hostile-tmp"
+mkdir -p "$hostiletmp32"
+fakerealhome32="$tmpdir/fake-real-codex-home-32.$$.${RANDOM:-0}"
+mkdir -p "$fakerealhome32"
+echo '{"marker": "the-real-users-auth"}' > "$fakerealhome32/auth.json"
+cat > "$repo32/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+rundir32="$tmpdir/hostile-tmpdir-codex-home-run.$$.${RANDOM:-0}"
+argvdir32="$tmpdir/hostile-tmpdir-codex-home-argv.$$.${RANDOM:-0}"
+
+out32=$(cd "$repo32" && TMPDIR="$hostiletmp32" CODEX_HOME="$fakerealhome32" \
+  CODEX_BIN="$FIXTURES/fake-codex-argv-log.sh" ADV_TEST_ARGV_DIR="$argvdir32" \
+  bash "$SH" --plan plan.json --base main --dir "$rundir32" 2>&1); rc32=$?
+echo "--- case 32: TMPDIR inside the checkout ---"
+printf '%s\n' "$out32"
+
+check "exits 0" test "$rc32" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out32"
+
+seen_home32=""
+if [ -f "$argvdir32/env_CODEX_HOME" ]; then
+  seen_home32=$(cat "$argvdir32/env_CODEX_HOME")
+fi
+check "the angle's codex exec saw a non-empty CODEX_HOME" test -n "$seen_home32"
+# A plain bash `case "$seen_home32" in "$repo32"/*)` string-prefix match is
+# not reliable here: $tmpdir (and so $repo32) comes from `mktemp -d
+# "${TMPDIR:-/tmp}/..."`, and a `${TMPDIR:-/tmp}` that already ends in "/"
+# leaves a literal doubled slash baked into $repo32 that mkdtemp's own
+# output does not reproduce -- a real path, wrongly judged "outside" by a
+# naive string comparison. Compared instead via Python's os.path, after
+# os.path.realpath on both sides (macOS's /tmp -> /private/tmp and similar
+# symlinks would otherwise make even a genuinely-inside path compare as
+# unrelated).
+inside_repo32_check=$(REPO32="$repo32" SEEN32="$seen_home32" python3 -c '
+import os
+repo = os.path.realpath(os.environ["REPO32"])
+seen = os.path.realpath(os.environ["SEEN32"])
+print("INSIDE" if os.path.commonpath([repo, seen]) == repo else "OUTSIDE")
+')
+check "the throwaway CODEX_HOME is not inside the checkout despite TMPDIR pointing there" \
+  test "$inside_repo32_check" = "OUTSIDE"
+check "the auth.json copy was still reachable at the diverted CODEX_HOME" \
+  test -f "$argvdir32/env_CODEX_HOME_AUTH_JSON"
+
+rm -rf "$rundir32"
+
+# --- Case 33: the throwaway CODEX_HOME is always resolved to an absolute path --
+# Regression: tempfile.mkdtemp() can return a path exactly as relative as the
+# `dir=` it was given -- true of the stdlib's own mkdtemp on Python 3.9-3.11
+# for an explicit relative `dir=`, though not reproducible against whatever
+# python3 happens to be installed here (newer stdlib versions absolutize it
+# internally regardless of what this fix does). tempfile.mkdtemp and
+# tempfile.gettempdir are monkeypatched to force that exact 3.9-3.11 shape,
+# isolating make_throwaway_codex_home()'s own contract -- always hand back
+# an absolute path -- from whatever the installed Python's tempfile already
+# does on its own. This matters because codex_home is placed into
+# CODEX_HOME for a child Popen'd with cwd=root, which differs from wherever
+# this command was invoked whenever the caller runs from a subdirectory --
+# a relative CODEX_HOME would resolve against the wrong directory there,
+# missing the copy of auth.json this process actually wrote. Run from a
+# scratch directory outside every git checkout (unlike this very repo,
+# wherever it happens to be checked out) so the relative "relhome" target
+# passes select_dir_outside_git_checkouts' own dir_in_git_repo check
+# instead of being rejected as "inside a checkout" for an unrelated reason.
+scratch33="$tmpdir/absolute-codex-home-check.$$.${RANDOM:-0}"
+mkdir -p "$scratch33"
+absolute_check33=$(cd "$scratch33" && python3 - "$SCRIPT_DIR" <<'PYEOF'
+import os
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import adversarial_review as ar
+
+os.makedirs("relhome", exist_ok=True)
+
+
+def fake_mkdtemp(suffix=None, prefix=None, dir=None):
+    # Mirrors mkdtemp's own dir=None fallback (ask gettempdir()) -- old
+    # make_throwaway_codex_home() calls mkdtemp with no dir= at all.
+    if dir is None:
+        dir = ar.tempfile.gettempdir()
+    path = os.path.join(dir, f"{prefix or ''}fake{suffix or ''}")
+    os.makedirs(path, exist_ok=True)
+    return path  # exactly as relative as `dir` -- the Python 3.9-3.11 shape
+
+
+ar.tempfile.mkdtemp = fake_mkdtemp
+ar.tempfile.gettempdir = lambda: "relhome"
+
+home = ar.make_throwaway_codex_home()
+print("OK" if home.is_absolute() else f"MISMATCH: {home!r} is not absolute")
+PYEOF
+)
+echo "--- case 33: make_throwaway_codex_home always returns an absolute path ---"
+printf '%s\n' "$absolute_check33"
+check "a relative mkdtemp/gettempdir result is still resolved to an absolute CODEX_HOME" \
+  test "$absolute_check33" = "OK"
+
+# --- Case 34: escape_block_text neutralizes Unicode line/paragraph separators --
+# Regression: escape_block_text collapsed only CR/LF and ASCII control
+# characters -- json.loads happily decodes U+2028 (LINE SEPARATOR) and
+# U+2029 (PARAGRAPH SEPARATOR) embedded in a summary/claim/evidence/
+# reproduction (both are ordinary, unescaped-in-source Unicode characters
+# as far as JSON is concerned), and str.splitlines() (unlike a
+# byte-oriented `grep` or an ordinary terminal) treats both as line
+# boundaries just like an ordinary newline -- letting a model-authored
+# summary inject a fake "--- FINDINGS ---" section heading (or an extra
+# line) that a Python-based downstream parser reading this tool's own
+# report would read as real. solo.out.json below embeds a literal U+2028
+# and U+2029 (raw UTF-8 bytes, valid JSON as-is) around that fake heading.
+dir34="$tmpdir/unicode-line-separator.$$.${RANDOM:-0}"
+mkdir -p "$dir34"
+cat > "$dir34/plan.json" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "solo", "title": "Solo", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+printf '0\n' > "$dir34/solo.status"
+cat > "$dir34/solo.out.json" <<'EOF'
+{"angle": "solo", "verdict": "CLEAN", "summary": "clean run --- FINDINGS --- [injected]", "findings": []}
+EOF
+
+out34=$(bash "$SH" --from-dir "$dir34" 2>&1); rc34=$?
+echo "--- case 34: a summary embedding U+2028/U+2029 cannot inject a fake section ---"
+printf '%s\n' "$out34"
+
+check "exits 0" test "$rc34" -eq 0
+check "verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out34"
+
+splitlines_check=$(OUT34="$out34" python3 - <<'PYEOF'
+import os
+out = os.environ["OUT34"]
+lines = out.splitlines()
+bad = [l for l in lines if l.strip() in ("--- FINDINGS ---", "[injected]")]
+# Both the "--- ANGLES ---" line ("solo: CLEAN") and the "--- SUMMARY ---"
+# line start with "solo: " -- the summary is the *last* one.
+solo_lines = [l for l in lines if l.startswith("solo: ")]
+summary_line = solo_lines[-1] if solo_lines else None
+ok = (
+    not bad
+    and summary_line is not None
+    and "\\u2028" in summary_line
+    and "\\u2029" in summary_line
+)
+print("OK" if ok else f"MISMATCH: bad={bad!r} summary_line={summary_line!r}")
+PYEOF
+)
+echo "--- case 34: str.splitlines() sees no injected section/line ---"
+printf '%s\n' "$splitlines_check"
+check "U+2028/U+2029 are escaped, not left as real line boundaries for str.splitlines()" \
+  test "$splitlines_check" = "OK"
+
+rm -rf "$dir34"
+
 
 # --- Python version gate: python3 must be 3.9+ ----------------------------------
 # adversarial_review.py uses Path.is_relative_to (3.9+), so adversarial-review.sh

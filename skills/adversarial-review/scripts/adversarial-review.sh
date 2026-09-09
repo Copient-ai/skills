@@ -23,7 +23,9 @@
 #   --dir DIR                run directory (default: a fresh mktemp -d).
 #                           Holds plan.json (copy), <angle>.prompt.txt,
 #                           <angle>.out.json, <angle>.log, <angle>.status
-#                           (exit code), and merged.json.
+#                           (exit code), <angle>.meta.json (the plan
+#                           hash, base, and prompt hash the output
+#                           belongs to), and merged.json.
 #   --only ANGLE,...          restrict the run to these angle ids.
 #   --angle-prompt FILE        prompt template (default:
 #                           <this-skill-dir>/angle-prompt.md, else a minimal

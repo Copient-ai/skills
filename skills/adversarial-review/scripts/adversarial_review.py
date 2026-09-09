@@ -24,6 +24,7 @@ Exit codes (same contract as the .sh wrapper):
 import argparse
 import atexit
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
@@ -210,6 +211,19 @@ def validate_plan(data, source):
             usage_error(f"plan {source}: angle '{aid}' field 'files' must be a list of strings")
 
 
+def compute_plan_hash(plan):
+    """sha256 hex digest of `plan`'s canonical JSON — sorted keys, compact
+    separators — so the same semantic plan always hashes identically
+    regardless of key order or the source file's formatting. Computed over
+    the plan exactly as loaded, before any run-only bookkeeping (see
+    run_meta / the "_run" key stamped into run_dir/plan.json) is attached,
+    so it changes if and only if the plan's own content changes. Used to
+    detect a `--dir` reused across two live runs whose plan differs — see
+    main()'s stale-artifact handling and collect_angle_result's meta check."""
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def parse_only(only_arg, known_ids):
     """Returns the subset of known_ids named by --only, in plan order, or
     None when --only was not given at all (meaning: every angle). An
@@ -315,11 +329,28 @@ def resolve_base(base, cwd):
     it fresh, and a local branch literally named e.g. "origin/main" would
     win over the remote-tracking ref this function actually verified. Only
     the last-resort bare revision (a SHA, a tag — nothing this function can
-    qualify) is returned as given."""
+    qualify) is returned as given.
+
+    A `base` already written in the documented "<remote>/<branch>" form
+    (e.g. a plan's `"base": "origin/main"`) is checked first, against
+    exactly that remote's own refs/remotes/<remote>/<branch> — before it,
+    the generic loop below would instead probe the nonsensical
+    refs/remotes/origin/origin/main (base's own "origin/" prefix, plus the
+    loop's own), which never verifies, and control would fall through to
+    refs/heads/origin/main — a wrong answer whenever a local branch happens
+    to be named literally "origin/main", the exact decoy this function's
+    own fully-qualified-remote design otherwise exists to defeat."""
     remotes_r = git(["remote"], cwd=cwd)
     remotes = [l for l in remotes_r.stdout.splitlines() if l.strip()] if remotes_r.returncode == 0 else []
     # origin tried first when present, matching the previous candidate order.
     ordered_remotes = [r for r in remotes if r == "origin"] + [r for r in remotes if r != "origin"]
+
+    if "/" in base:
+        remote_prefix, _, rest = base.partition("/")
+        if remote_prefix in remotes and rest:
+            qualified = f"refs/remotes/{remote_prefix}/{rest}"
+            if git_verify(qualified, cwd):
+                return qualified
 
     for remote in ordered_remotes:
         qualified = f"refs/remotes/{remote}/{base}"
@@ -334,6 +365,19 @@ def resolve_base(base, cwd):
 
     tried = [f"{r}/{base}" for r in ordered_remotes] + [base]
     env_error(f"cannot resolve base ref '{base}': tried {', '.join(tried)}")
+
+
+def resolve_base_sha(base_resolved, cwd):
+    """The commit sha `base_resolved` (already verified by resolve_base)
+    currently points at. Recorded alongside plan_hash in each angle's
+    run-provenance record (see run_meta in main()) so a base whose name is
+    unchanged but has since moved — a branch advanced, a remote re-fetched —
+    is still detected as "the base changed" for stale-artifact purposes,
+    not just a changed base *name*."""
+    r = git(["rev-parse", base_resolved], cwd)
+    if r.returncode != 0:
+        env_error(f"cannot resolve commit for base ref '{base_resolved}': {r.stderr.strip()}")
+    return r.stdout.strip()
 
 
 # --- Prompt rendering ---------------------------------------------------------
@@ -493,13 +537,14 @@ def log_refused(log_path):
     return any(marker in text for marker in REFUSAL_MARKERS)
 
 
-def collect_angle_result(angle, run_dir):
+def collect_angle_result(angle, run_dir, expected_run_meta=None):
     aid = angle["id"]
     status_path = run_dir / f"{aid}.status"
     out_path = run_dir / f"{aid}.out.json"
     residue_path = run_dir / f"{aid}.residue.txt"
     log_path = run_dir / f"{aid}.log"
     skipped_path = run_dir / f"{aid}.skipped.txt"
+    meta_path = run_dir / f"{aid}.meta.json"
 
     # An angle that run_write_capable_angles decided never to run at all —
     # the dirty-tree gate, or a later angle skipped after an earlier one's
@@ -510,6 +555,36 @@ def collect_angle_result(angle, run_dir):
     if skipped_path.is_file():
         cause = skipped_path.read_text().strip() or "skipped"
         return AngleResult(aid, angle["title"], "UNPARSED", cause=cause)
+
+    # `expected_run_meta` is the run dir's own current provenance record —
+    # `run_meta` itself for a live run's own collection, or run_dir/plan.json's
+    # "_run" key for a `--from-dir` merge (None when that key is absent,
+    # e.g. a hand-authored plan.json that was never produced by a live run —
+    # nothing to compare against, so the check is skipped rather than
+    # treating every angle as stale). When present, every angle's own
+    # .meta.json (written by run_angle alongside its other artifacts — see
+    # run_meta) must match it exactly: a reused `--dir` whose plan or base
+    # changed between two live runs, combined with `--only` selecting just
+    # some angles, leaves an unselected angle's older .status/.out.json
+    # sitting next to the *new* plan.json (main()'s own broad clear on a
+    # detected change is the primary defense — see main() — this is the
+    # backstop for whatever it misses: a hand-edited run dir, a partial
+    # failure between the clear and the rewrite, ...). A missing or
+    # mismatched meta is never trusted as any verdict, however well-formed
+    # its .status/.out.json otherwise look — it is attributed to nothing,
+    # not misattributed to the plan/base sitting in run_dir right now.
+    if expected_run_meta is not None:
+        if not meta_path.is_file():
+            return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
+        if not isinstance(meta, dict) or any(
+            meta.get(k) != expected_run_meta.get(k)
+            for k in ("plan_hash", "base_resolved", "base_sha")
+        ):
+            return AngleResult(aid, angle["title"], "UNPARSED", cause="stale")
 
     # A present out.json is trusted only once its own run reports exit 0 —
     # a missing or unparsable .status file, or one that isn't 0, means the
@@ -649,6 +724,28 @@ def _escape_control_char(m):
     return f"\\x{ord(m.group(0)):02x}"
 
 
+# Every character str.splitlines() treats as a line boundary that isn't
+# \r or \n (already collapsed to a literal, visible "\n" above) or already
+# caught by _CONTROL_CHAR_RE's ASCII range (\x0b, \x0c, \x1c-\x1e — matched
+# there too, but replaced here first so they end up in this escape's
+# consistent \uXXXX form rather than that one's \xNN): the Unicode NEL,
+# Line Separator, and Paragraph Separator. None of the three is an ASCII
+# control byte, so _CONTROL_CHAR_RE's 0x00-0x7f range never sees them — and
+# a JSON string decodes any of them just fine embedded raw (json.loads has
+# no reason to reject a valid, unescaped Unicode character), so a
+# model-authored claim/summary can carry one straight through and inject a
+# line str.splitlines() would treat as a boundary — a fake section heading,
+# say — into what must render as one finding's fixed set of lines.
+_LINE_BOUNDARY_RE = re.compile("[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _escape_line_boundary(m):
+    # \xNN cannot represent \u2028/\u2029 (above 0xff) — \uXXXX covers the
+    # whole set in one consistent form instead of switching formats
+    # mid-set depending on each character's code point.
+    return f"\\u{ord(m.group(0)):04x}"
+
+
 def escape_block_text(s):
     """Collapse any literal CR/LF in `s` into a visible two-character `\\n`
     so a multiline path/claim/evidence/reproduction can never inject a bare
@@ -656,11 +753,14 @@ def escape_block_text(s):
     exactly its `- [Pn] ...` line plus the `  evidence:`/`  reproduction:`
     lines that follow it, nothing else. Uses str.replace, not re.sub, so the
     literal backslash-n is never re-interpreted as an escape sequence. Every
-    remaining control character (see _CONTROL_CHAR_RE) is then escaped too,
-    as \\xNN, so no other raw control byte can reach the block either.
-    merged.json is unaffected — JSON handles embedded control characters
-    natively, so this only applies to the plain-text block."""
+    other character str.splitlines() would treat as a line boundary is
+    escaped next (see _LINE_BOUNDARY_RE), as \\uXXXX, then every remaining
+    control character (see _CONTROL_CHAR_RE) is escaped too, as \\xNN, so no
+    other raw control byte or line-breaking Unicode character can reach the
+    block either. merged.json is unaffected — JSON handles embedded control
+    characters natively, so this only applies to the plain-text block."""
     collapsed = s.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+    collapsed = _LINE_BOUNDARY_RE.sub(_escape_line_boundary, collapsed)
     return _CONTROL_CHAR_RE.sub(_escape_control_char, collapsed)
 
 
@@ -845,26 +945,17 @@ def dir_in_git_repo(path):
     )
 
 
-def resolve_merged_json_path(run_dir, from_dir_mode):
-    """Where merged.json for this run should be written. In `--from-dir`
-    mode `run_dir` may be a directory the caller doesn't own writing into —
-    a fixtures tree, an example checked into some other repo — so if it
-    sits inside a git working tree, merged.json is diverted to a temp file
-    instead of dirtying that checkout; the report's MERGED= line (see
-    build_report) says where it actually landed. The candidate temp
-    directory itself is verified the same way, not just assumed safe:
-    `tempfile.gettempdir()` (which honors TMPDIR) can itself point inside a
-    checkout — including the very one being diverted away from — so each
-    candidate is checked with `dir_in_git_repo` before use, falling back
-    from `tempfile.gettempdir()` to `/tmp` to `/var/tmp`. If every candidate
-    is unusable (missing, or itself inside a checkout), this is an
-    environment failure, not a silent write into a checkout — it exits 1.
-    Live runs never divert: `main` already refuses a run dir inside the
-    repository under review, so the default <run_dir>/merged.json is always
-    safe there."""
-    if not (from_dir_mode and dir_in_git_repo(run_dir)):
-        return run_dir / "merged.json"
-
+def select_dir_outside_git_checkouts(purpose):
+    """Picks the first of `tempfile.gettempdir()`, `/tmp`, `/var/tmp` that
+    both exists and sits outside every git working tree (see
+    dir_in_git_repo), for a caller that needs somewhere to write that must
+    never land inside a checkout. `tempfile.gettempdir()` (which honors
+    TMPDIR) can itself point inside a checkout — including the very one a
+    caller is trying to stay out of — so each candidate is verified with
+    dir_in_git_repo rather than trusted outright. `purpose` names, in the
+    error message, what the directory was needed for. If every candidate is
+    unusable (missing, or itself inside a checkout), this is an environment
+    failure, not a silent fall-back into a checkout — it exits 1."""
     tried = []
     seen = set()
     for candidate_dir in (tempfile.gettempdir(), "/tmp", "/var/tmp"):
@@ -877,17 +968,36 @@ def resolve_merged_json_path(run_dir, from_dir_mode):
         if dir_in_git_repo(candidate_dir):
             tried.append(f"{candidate_dir} (inside a git checkout)")
             continue
-        fd, path = tempfile.mkstemp(
-            prefix="adversarial-review-merged.", suffix=".json", dir=candidate_dir,
-        )
-        os.close(fd)
-        return Path(path)
+        return candidate_dir
 
     env_error(
-        "cannot find a temp directory outside every git checkout to divert "
-        f"merged.json into — tried {', '.join(tried)} (TMPDIR may be "
-        "pointing inside a repository)"
+        f"cannot find a temp directory outside every git checkout to {purpose} — "
+        f"tried {', '.join(tried)} (TMPDIR may be pointing inside a repository)"
     )
+
+
+def resolve_merged_json_path(run_dir, from_dir_mode):
+    """Where merged.json for this run should be written. In `--from-dir`
+    mode `run_dir` may be a directory the caller doesn't own writing into —
+    a fixtures tree, an example checked into some other repo — so if it
+    sits inside a git working tree, merged.json is diverted to a temp file
+    instead of dirtying that checkout; the report's MERGED= line (see
+    build_report) says where it actually landed. The candidate directory is
+    picked by select_dir_outside_git_checkouts (also used by
+    make_throwaway_codex_home, for the same reason), which exits 1 if every
+    candidate is unusable rather than silently writing into a checkout.
+    Live runs never divert: `main` already refuses a run dir inside the
+    repository under review, so the default <run_dir>/merged.json is always
+    safe there."""
+    if not (from_dir_mode and dir_in_git_repo(run_dir)):
+        return run_dir / "merged.json"
+
+    candidate_dir = select_dir_outside_git_checkouts("divert merged.json into")
+    fd, path = tempfile.mkstemp(
+        prefix="adversarial-review-merged.", suffix=".json", dir=candidate_dir,
+    )
+    os.close(fd)
+    return Path(path)
 
 
 def write_merged_json(merged_path, angle_ids, results_by_id, merged_findings, banner, counts):
@@ -1175,7 +1285,9 @@ def _interrupt_and_exit(signum=None, frame=None):
 # plan, or --only re-running just a few ids) must never let one of these
 # survive from an earlier run — a stale .out.json or .residue.txt sitting
 # next to a failed re-run would be misread as this run's own result.
-ANGLE_ARTIFACT_SUFFIXES = (".prompt.txt", ".out.json", ".log", ".status", ".residue.txt", ".skipped.txt")
+ANGLE_ARTIFACT_SUFFIXES = (
+    ".prompt.txt", ".out.json", ".log", ".status", ".residue.txt", ".skipped.txt", ".meta.json",
+)
 
 
 def clear_stale_artifacts(aid, run_dir):
@@ -1228,9 +1340,25 @@ def make_throwaway_codex_home():
     is not fatal here — some setups authenticate purely via an environment
     variable this process's own environ (inherited by every angle's Popen
     call) already carries, so the throwaway, otherwise-empty CODEX_HOME
-    still closes off project-local config for them too."""
+    still closes off project-local config for them too.
+
+    Created outside every git working tree, via the same
+    select_dir_outside_git_checkouts used to divert merged.json — a TMPDIR
+    pointed inside a checkout would otherwise put a copy of the real
+    auth.json inside that checkout's working tree, where a careless
+    workspace-write angle (or just `git status`) could see it; failing with
+    an environment error is preferable to silently landing it in one. The
+    resulting path is also always made absolute: Python's own
+    tempfile.mkdtemp (3.9-3.11) can return a path exactly as relative as the
+    `dir=` it was given, and this path is later placed into angle_env
+    (CODEX_HOME) for a child process Popen'd with cwd=root, not this
+    process's own cwd — a relative CODEX_HOME there would resolve against
+    the wrong directory."""
     real_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    throwaway = Path(tempfile.mkdtemp(prefix="adversarial-review-codex-home."))
+    candidate_dir = select_dir_outside_git_checkouts("create the throwaway CODEX_HOME in")
+    throwaway = Path(
+        tempfile.mkdtemp(prefix="adversarial-review-codex-home.", dir=candidate_dir)
+    ).resolve()
     real_auth = real_home / "auth.json"
     if real_auth.is_file():
         dest_auth = throwaway / "auth.json"
@@ -1242,7 +1370,7 @@ def make_throwaway_codex_home():
     return throwaway
 
 
-def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home):
+def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home, run_meta):
     """Returns (error, spawned): error is None on a clean run, else a
     message; spawned is True once Popen has actually started the codex
     process, regardless of what happens afterward. A caller running
@@ -1250,7 +1378,16 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     failure (nothing to check — the tree was never touched) apart from a
     post-spawn failure (writing .status, the background-leak note) that
     still leaves a process that may have dirtied the tree — see
-    run_write_capable_angles."""
+    run_write_capable_angles.
+
+    `run_meta` is this run's provenance record — {"plan_hash", "base_resolved",
+    "base_sha"}, the same dict stamped into run_dir/plan.json's "_run" key —
+    written alongside the prompt into `<aid>.meta.json`, with the rendered
+    prompt's own sha256 added, so a later `--from-dir` (this run's own
+    immediate merge, or a separate invocation entirely) can tell this
+    angle's .status/.out.json apart from a same-named leftover produced by a
+    different plan or base sharing the same --dir (see collect_angle_result
+    and main())."""
     spawned = False
     # Stale artifacts for `aid` are cleared by main(), synchronously, before
     # either phase (parallel or serial) schedules any angle — not here, so a
@@ -1258,6 +1395,9 @@ def run_angle(aid, angle, plan, base_resolved, template, run_dir, root, schema_p
     # interrupt still has its old outputs gone.
     prompt_text = render_prompt(template, plan, angle, base_resolved)
     (run_dir / f"{aid}.prompt.txt").write_text(prompt_text)
+    meta = dict(run_meta)
+    meta["prompt_sha256"] = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    (run_dir / f"{aid}.meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     out_path = run_dir / f"{aid}.out.json"
     log_path = run_dir / f"{aid}.log"
     # Every other environment variable passes through unchanged (an
@@ -1399,7 +1539,7 @@ def _mark_skipped(aid, title, cause, run_dir, synthetic_results):
     synthetic_results[aid] = AngleResult(aid, title, "UNPARSED", cause=cause)
 
 
-def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home):
+def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, template, run_dir, root, schema_path, timeout_sec, codex_home, run_meta):
     """Runs workspace-write angles one at a time against the shared checkout
     (never concurrently with each other or with a read-only angle — see
     partition_angles: isolating them in a git worktree was rejected because
@@ -1451,7 +1591,7 @@ def run_write_capable_angles(serial_ids, angles_by_id, plan, base_resolved, temp
             continue
         err, spawned = run_angle(
             aid, angles_by_id[aid], plan, base_resolved, template,
-            run_dir, root, schema_path, timeout_sec, codex_home,
+            run_dir, root, schema_path, timeout_sec, codex_home, run_meta,
         )
         if err is not None:
             spawn_failures.append((aid, err))
@@ -1525,7 +1665,16 @@ def main(argv=None):
         angle_ids_all = [a["id"] for a in plan["angles"]]
         angles_by_id = {a["id"]: a for a in plan["angles"]}
         angle_ids = parse_only(args.only, angle_ids_all) or angle_ids_all
-        results_by_id = {aid: collect_angle_result(angles_by_id[aid], run_dir) for aid in angle_ids}
+        # None (skip the check) when this plan.json carries no "_run" record
+        # at all — a hand-authored plan.json (every static fixtures/*/plan.json
+        # in this test suite included) was never produced by a live run and
+        # has nothing to compare an angle's .meta.json against, so it is
+        # merged exactly as before this check existed.
+        expected_run_meta = plan.get("_run") if isinstance(plan.get("_run"), dict) else None
+        results_by_id = {
+            aid: collect_angle_result(angles_by_id[aid], run_dir, expected_run_meta)
+            for aid in angle_ids
+        }
     else:
         if not args.plan:
             usage_error("--plan FILE is required unless --from-dir is given")
@@ -1569,6 +1718,19 @@ def main(argv=None):
         if not base:
             usage_error("plan has no 'base' and --base was not given")
         base_resolved = resolve_base(base, root)
+        # This run's provenance record — stamped into run_dir/plan.json's
+        # "_run" key and into every angle's own <aid>.meta.json (see
+        # run_angle) — so a `--dir` reused later, whether by a second live
+        # run or a separate `--from-dir` merge, can tell whether the plan or
+        # the base has moved since an artifact sitting in run_dir was
+        # produced. base_sha (not just base_resolved's name) matters on its
+        # own: the same branch name can advance between two runs that never
+        # touched --plan or --base at all.
+        run_meta = {
+            "plan_hash": compute_plan_hash(plan),
+            "base_resolved": base_resolved,
+            "base_sha": resolve_base_sha(base_resolved, root),
+        }
 
         diff_check = git(["diff", f"{base_resolved}...HEAD", "--name-only"], root)
         if diff_check.returncode != 0:
@@ -1623,12 +1785,46 @@ def main(argv=None):
 
         if args.dir:
             run_dir.mkdir(parents=True, exist_ok=True)
+
+        # A reused --dir whose plan or resolved base differs from the run
+        # that last wrote to it must never let an *unselected* angle's
+        # artifacts from that earlier run survive: --only only clears the
+        # ids it selects (the loop below), so an angle left out of this run
+        # would otherwise keep last time's .status/.out.json sitting next to
+        # today's plan.json, and a later --from-dir would attribute that old
+        # verdict to a plan it was never actually produced against
+        # (collect_angle_result's own meta check is the backstop for
+        # whatever this misses — see there). Compared via the same "_run"
+        # record this run is about to stamp into plan.json itself, so a
+        # plan whose bytes changed, or a base that resolved to a different
+        # ref or has since moved to a different commit, both count as
+        # "changed" — an unparsable or missing existing plan.json is treated
+        # the same way, conservatively, since nothing in it can be trusted.
+        old_plan_path = run_dir / "plan.json"
+        if old_plan_path.is_file():
+            try:
+                old_doc = json.loads(old_plan_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                old_doc = None
+            old_ids = set()
+            if isinstance(old_doc, dict) and isinstance(old_doc.get("angles"), list):
+                old_ids = {
+                    a.get("id") for a in old_doc["angles"]
+                    if isinstance(a, dict) and isinstance(a.get("id"), str)
+                }
+            old_run_meta = old_doc.get("_run") if isinstance(old_doc, dict) else None
+            if old_run_meta != run_meta:
+                for stale_aid in old_ids | set(angle_ids_all):
+                    clear_stale_artifacts(stale_aid, run_dir)
+
         # A reused --dir may carry a merged.json from an earlier invocation
         # — clear it before any angle launches, so an abort further down
         # (spawn failure) can never leave that previous verdict looking
         # like this run's own result.
         clear_merged_json(run_dir)
-        (run_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+        plan_doc = dict(plan)
+        plan_doc["_run"] = run_meta
+        (run_dir / "plan.json").write_text(json.dumps(plan_doc, indent=2) + "\n")
 
         # Read-only angles don't write to the checkout, so they're safe to
         # race in the shared thread pool. workspace-write angles run against
@@ -1680,7 +1876,7 @@ def main(argv=None):
                 for aid in parallel_ids:
                     future_to_id[ex.submit(
                         run_angle, aid, angles_by_id[aid], plan, base_resolved, template,
-                        run_dir, root, schema_path, args.timeout, codex_home,
+                        run_dir, root, schema_path, args.timeout, codex_home, run_meta,
                     )] = aid
                     if _CANCELLED:
                         break
@@ -1717,7 +1913,7 @@ def main(argv=None):
             serial_future = serial_ex.submit(
                 run_write_capable_angles,
                 serial_ids, angles_by_id, plan, base_resolved, template,
-                run_dir, root, schema_path, args.timeout, codex_home,
+                run_dir, root, schema_path, args.timeout, codex_home, run_meta,
             )
             synthetic_results, serial_spawn_failures = serial_future.result()
             serial_ex.shutdown(wait=True)
@@ -1738,7 +1934,7 @@ def main(argv=None):
 
         results_by_id = {
             aid: synthetic_results[aid] if aid in synthetic_results
-            else collect_angle_result(angles_by_id[aid], run_dir)
+            else collect_angle_result(angles_by_id[aid], run_dir, run_meta)
             for aid in angle_ids
         }
 
