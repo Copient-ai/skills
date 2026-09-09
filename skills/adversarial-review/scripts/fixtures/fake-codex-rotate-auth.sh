@@ -8,11 +8,25 @@
 # rotated token in a directory about to be rmtree'd.
 #
 # Requires ADV_TEST_ROTATED_MARKER (the new auth.json content to write).
+#
+# ADV_TEST_ROTATE_TRUNCATE, if set, ignores ADV_TEST_ROTATED_MARKER and
+# instead leaves auth.json looking like a rotation killed mid-write:
+# "zero" truncates it to an empty file, anything else writes a partial
+# JSON fragment. Used to test that _propagate_rotated_auth refuses to
+# propagate a candidate that fails _is_plausible_auth_rotation.
 set -u
-: "${ADV_TEST_ROTATED_MARKER:?ADV_TEST_ROTATED_MARKER must be set}"
 
 if [ -n "${CODEX_HOME:-}" ]; then
-  printf '%s' "$ADV_TEST_ROTATED_MARKER" > "$CODEX_HOME/auth.json"
+  if [ -n "${ADV_TEST_ROTATE_TRUNCATE:-}" ]; then
+    if [ "$ADV_TEST_ROTATE_TRUNCATE" = "zero" ]; then
+      : > "$CODEX_HOME/auth.json"
+    else
+      printf '%s' '{"tok' > "$CODEX_HOME/auth.json"
+    fi
+  else
+    : "${ADV_TEST_ROTATED_MARKER:?ADV_TEST_ROTATED_MARKER must be set}"
+    printf '%s' "$ADV_TEST_ROTATED_MARKER" > "$CODEX_HOME/auth.json"
+  fi
 fi
 
 out_path=""

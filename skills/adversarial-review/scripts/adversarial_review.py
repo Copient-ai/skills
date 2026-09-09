@@ -1779,6 +1779,36 @@ def make_throwaway_codex_home():
     return throwaway
 
 
+def _is_plausible_auth_rotation(candidate_bytes, snapshot_bytes):
+    """True only if `candidate_bytes` parses as a non-empty JSON object
+    whose keys are a superset of `snapshot_bytes`'s own top-level keys —
+    checked by key set, not fixed names, since codex-cli 0.145.0's
+    auth.json (tokens/auth_mode/OPENAI_API_KEY/last_refresh) is only this
+    version's shape. Guards _propagate_rotated_auth's write-back: an angle
+    killed by its timeout, or a codex process that crashed mid-write, can
+    leave its throwaway auth.json copy truncated or half-written, and a
+    plain byte-difference check would otherwise read that as a successful
+    rotation and overwrite the user's real, working credentials with
+    garbage. `snapshot_bytes` missing or unparsable (the pre-run read
+    failed, or somehow wasn't JSON) skips the superset check rather than
+    blocking every rotation on it."""
+    try:
+        candidate = json.loads(candidate_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(candidate, dict) or not candidate:
+        return False
+    if snapshot_bytes is None:
+        return True
+    try:
+        snapshot = json.loads(snapshot_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return True
+    if not isinstance(snapshot, dict):
+        return True
+    return set(candidate.keys()) >= set(snapshot.keys())
+
+
 def _propagate_rotated_auth(codex_home, real_home, pre_auth_bytes):
     """Called once an angle's codex exec has exited, before its throwaway
     CODEX_HOME (codex_home) is deleted: if `codex_home/auth.json` no longer
@@ -1824,13 +1854,25 @@ def _propagate_rotated_auth(codex_home, real_home, pre_auth_bytes):
     module's own tests point at an actual developer's ~/.codex — every
     caller resolves it via _real_codex_home(), which honors CODEX_HOME the
     same way make_throwaway_codex_home does, so a test sets CODEX_HOME to a
-    throwaway directory precisely to keep this away from the real one."""
+    throwaway directory precisely to keep this away from the real one.
+
+    Before writing back, the candidate is validated by
+    _is_plausible_auth_rotation — see that function for why: a candidate
+    that fails validation is skipped with one stderr warning, leaving the
+    real auth.json untouched."""
     src = codex_home / "auth.json"
     try:
         new_bytes = src.read_bytes()
     except OSError:
         return
     if new_bytes == pre_auth_bytes:
+        return
+    if not _is_plausible_auth_rotation(new_bytes, pre_auth_bytes):
+        print(
+            f"{PROG}: warning: a review angle's rotated auth.json failed "
+            "validation — not propagating it to the real CODEX_HOME",
+            file=sys.stderr,
+        )
         return
     lock_fd = None
     try:

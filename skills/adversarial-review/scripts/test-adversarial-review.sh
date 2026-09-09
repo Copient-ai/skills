@@ -3771,6 +3771,47 @@ check "the real CODEX_HOME's auth.json no longer carries the pre-rotation token"
 
 rm -rf "$rundir51"
 
+# --- Case 51b: a truncated/invalid rotated auth.json is never propagated ------
+# Regression: _propagate_rotated_auth used to treat ANY byte difference from
+# the pre-run snapshot as a successful rotation and write those bytes over
+# the real auth.json. An angle killed by its timeout, or a codex process
+# that crashed mid-write, can leave its throwaway copy truncated or
+# half-written instead — that garbage would otherwise clobber the user's
+# real, working credentials. _is_plausible_auth_rotation now requires the
+# candidate to parse as a non-empty JSON object whose keys are a superset
+# of the snapshot's own keys before any write-back happens; a candidate
+# that fails validation is skipped with one stderr warning. Run twice, once
+# for a zero-byte truncation and once for a partial-JSON fragment.
+for mode51b in zero partial; do
+  repo51b=$(make_throwaway_repo "auth-rotation-invalid-$mode51b")
+  plan51b="$tmpdir/auth-rotation-invalid-plan.$mode51b.$$.${RANDOM:-0}.json"
+  cat > "$plan51b" <<'EOF'
+{"version": 1, "base": "main", "promise": "Ships a thing.", "contracts": [], "invariants": [],
+ "angles": [{"id": "alpha", "title": "Alpha", "mandate": "m", "evidence": "e", "execution": "read-only"}]}
+EOF
+  fakerealhome51b="$tmpdir/fake-real-codex-home-51b-$mode51b.$$.${RANDOM:-0}"
+  mkdir -p "$fakerealhome51b"
+  echo '{"marker": "pre-rotation-token"}' > "$fakerealhome51b/auth.json"
+  rundir51b="$safe_tmpdir/auth-rotation-invalid-run-$mode51b.$$.${RANDOM:-0}"
+
+  out51b=$(cd "$repo51b" && CODEX_HOME="$fakerealhome51b" \
+    CODEX_BIN="$FIXTURES/fake-codex-rotate-auth.sh" \
+    ADV_TEST_ROTATE_TRUNCATE="$mode51b" \
+    bash "$SH" --plan "$plan51b" --base main --dir "$rundir51b" 2>&1)
+  rc51b=$?
+  echo "--- case 51b ($mode51b): a truncated/invalid rotated auth.json is never propagated ---"
+  printf '%s\n' "$out51b"
+
+  check "($mode51b) exits 0" test "$rc51b" -eq 0
+  check "($mode51b) verdict is CLEAN" grep -qx "ADVERSARIAL_REVIEW: CLEAN" <<<"$out51b"
+  check "($mode51b) the real CODEX_HOME's auth.json is byte-identical to the pre-rotation snapshot" \
+    diff -q <(printf '{"marker": "pre-rotation-token"}\n') "$fakerealhome51b/auth.json"
+  check "($mode51b) a validation warning was printed" \
+    grep -q "rotated auth.json failed validation" <<<"$out51b"
+
+  rm -rf "$rundir51b"
+done
+
 # --- Case 52: every text read/write is locale-independent (item 4) ------------
 # Regression: every read_text()/open(...)/fdopen(...) this runner uses for a
 # plan, prompt, metadata, or artifact file now passes encoding="utf-8"
