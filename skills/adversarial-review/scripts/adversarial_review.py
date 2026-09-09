@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -469,6 +470,14 @@ def build_report(angle_ids, results_by_id, merged_findings, run_dir):
     return "\n".join(lines), rc, banner, counts
 
 
+def _inside_git_checkout(path):
+    r = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
 def merged_json_path(run_dir, from_dir_mode):
     """Where merged.json for this run belongs. A live run already refuses a
     run_dir inside the repo under review, so it always belongs at
@@ -476,19 +485,21 @@ def merged_json_path(run_dir, from_dir_mode):
     caller names, including one of this skill's own committed fixture
     directories, which isn't ours to dirty (or, for a read-only install,
     can't be written at all). Divert to a tempfile in that case."""
-    if from_dir_mode:
-        r = subprocess.run(
-            ["git", "-C", str(run_dir), "rev-parse", "--is-inside-work-tree"],
-            capture_output=True, text=True,
+    if from_dir_mode and _inside_git_checkout(run_dir):
+        # tempfile.mkstemp honors TMPDIR, which could itself be pointed
+        # inside a git checkout (e.g. TMPDIR=<something under the repo>) —
+        # verify the fallback too rather than trusting it blindly, falling
+        # back again to a hardcoded /tmp if even that's compromised.
+        candidate_dir = tempfile.gettempdir()
+        if _inside_git_checkout(candidate_dir):
+            candidate_dir = "/tmp"
+        fd, path = tempfile.mkstemp(prefix="adversarial-review-merged.", suffix=".json", dir=candidate_dir)
+        os.close(fd)
+        print(
+            f"{PROG}: {run_dir} is inside a git checkout; merged.json written to {path} instead",
+            file=sys.stderr,
         )
-        if r.returncode == 0 and r.stdout.strip() == "true":
-            fd, path = tempfile.mkstemp(prefix="adversarial-review-merged.", suffix=".json")
-            os.close(fd)
-            print(
-                f"{PROG}: {run_dir} is inside a git checkout; merged.json written to {path} instead",
-                file=sys.stderr,
-            )
-            return Path(path)
+        return Path(path)
     return run_dir / "merged.json"
 
 
@@ -535,6 +546,13 @@ def build_arg_parser():
 _LIVE_PROCS_LOCK = threading.Lock()
 _LIVE_PROCS = []
 
+# Count of spawns between Popen() returning and _track(proc) registering it
+# — a signal landing in that gap would otherwise let the handler's snapshot
+# run and exit before the new process is ever recorded. The handler waits
+# this out (bounded) before it snapshots _LIVE_PROCS.
+_PENDING_LOCK = threading.Lock()
+_PENDING_SPAWNS = 0
+
 
 def _track(proc):
     with _LIVE_PROCS_LOCK:
@@ -549,6 +567,18 @@ def _untrack(proc):
             pass
 
 
+def _kill_group(proc):
+    # start_new_session=True (see run_angle) makes each codex its own
+    # process-group leader, so killpg reaches whatever it spawned too (a
+    # test or reproduction command under --allow-writes) — proc.kill()
+    # alone only reaches codex itself, leaving children to keep running
+    # (and, under --allow-writes, keep writing) past the timeout/interrupt.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _interrupt_and_exit(signum=None, frame=None):
     """Installed for both SIGINT and SIGTERM: a plain `except KeyboardInterrupt`
     around the executor wait isn't enough on its own — a signal merely
@@ -557,11 +587,11 @@ def _interrupt_and_exit(signum=None, frame=None):
     sys.exit, so an already-running angle's worker thread (blocked in
     proc.wait()) is never joined first — ThreadPoolExecutor otherwise waits
     for it at interpreter shutdown, which could take the full --timeout."""
+    deadline = time.monotonic() + 2.0
+    while _PENDING_SPAWNS > 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
     for proc in list(_LIVE_PROCS):
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+        _kill_group(proc)
     print(f"{PROG}: interrupted — terminating in-flight reviewer processes", file=sys.stderr)
     sys.stderr.flush()
     os._exit(130)
@@ -590,18 +620,29 @@ def run_angle(aid, angle, plan, base_resolved, template, execution_mode, run_dir
         "--",  # everything after this is the positional prompt, never a flag
         prompt_text,
     ]
+    global _PENDING_SPAWNS
     try:
         with open(log_path, "wb") as logfh:
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
-                cwd=root, env=os.environ,
-            )
-            _track(proc)
+            with _PENDING_LOCK:
+                _PENDING_SPAWNS += 1
+            try:
+                # start_new_session so this angle's whole process group (not
+                # just codex's own pid) can be reaped on timeout/interrupt —
+                # a workspace-write angle's own reproduction is a child of
+                # codex, not of us.
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=logfh, stderr=subprocess.STDOUT,
+                    cwd=root, env=os.environ, start_new_session=True,
+                )
+                _track(proc)
+            finally:
+                with _PENDING_LOCK:
+                    _PENDING_SPAWNS -= 1
             try:
                 proc.wait(timeout=timeout_sec)
                 (run_dir / f"{aid}.status").write_text(f"{proc.returncode}\n", encoding="utf-8")
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _kill_group(proc)
                 proc.wait()
                 (run_dir / f"{aid}.status").write_text("124\n", encoding="utf-8")
             finally:
