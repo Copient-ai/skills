@@ -34,7 +34,7 @@
 #                      failure this script exists to prevent.
 #
 #   Env overrides:
-#     CODEX_REVIEW_MODEL    model passed to `codex review` (default: gpt-6.1-sol)
+#     CODEX_REVIEW_MODEL    model passed to `codex review` (default: unset, so Codex picks)
 #     CODEX_REVIEW_EFFORT   reasoning effort passed to `codex review` (default: medium)
 #
 # Output:
@@ -114,7 +114,8 @@ LOG=""
 RAW=false
 TIMEOUT=600
 FROM_LOG=""
-CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-gpt-6.1-sol}"
+# Unset or empty: Codex picks the model (config.toml, else its own default).
+CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-}"
 CODEX_REVIEW_EFFORT="${CODEX_REVIEW_EFFORT:-medium}"
 
 while [ $# -gt 0 ]; do
@@ -164,8 +165,12 @@ else
   fi
   [ -z "$LOG" ] && LOG=$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX")
   PROMPT_ARGS=()
+  MODEL_ARGS=(-c model_reasoning_effort="$CODEX_REVIEW_EFFORT")
+  if [ -n "$CODEX_REVIEW_MODEL" ]; then
+    MODEL_ARGS=(-c model="$CODEX_REVIEW_MODEL" "${MODEL_ARGS[@]}")
+  fi
   set +e
-  run_with_timeout "$TIMEOUT" codex review -c model="$CODEX_REVIEW_MODEL" -c model_reasoning_effort="$CODEX_REVIEW_EFFORT" "${SCOPE_ARGS[@]}" ${PROMPT_ARGS[@]+-- "${PROMPT_ARGS[@]}"} >"$LOG" 2>&1
+  run_with_timeout "$TIMEOUT" codex review "${MODEL_ARGS[@]}" "${SCOPE_ARGS[@]}" ${PROMPT_ARGS[@]+-- "${PROMPT_ARGS[@]}"} >"$LOG" 2>&1
   rc=$?
   set -e
   if [ "$rc" -eq 124 ]; then

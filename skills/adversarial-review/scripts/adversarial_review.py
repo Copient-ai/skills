@@ -33,8 +33,9 @@ from pathlib import Path
 VERSION = "1.1.0"
 PROG = "adversarial-review"
 
-CODEX_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-6.1-sol")
-CODEX_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT", "medium")
+# Unset or empty: Codex picks the model (config.toml, else its own default).
+CODEX_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "")
+CODEX_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT") or "medium"
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 
 SEVERITIES = ("P0", "P1", "P2", "P3")
@@ -597,6 +598,13 @@ def _interrupt_and_exit(signum=None, frame=None):
     os._exit(130)
 
 
+def reviewer_model_args(model=None, effort=None):
+    model = CODEX_REVIEW_MODEL if model is None else model
+    effort = CODEX_REVIEW_EFFORT if effort is None else effort
+    args = ["-c", f"model_reasoning_effort={effort}"]
+    return (["-c", f"model={model}"] + args) if model else args
+
+
 def run_angle(aid, angle, plan, base_resolved, template, execution_mode, run_dir, root, schema_path, timeout_sec):
     """Runs one ephemeral `codex exec`. Returns an error string only on a
     spawn failure (exit 3); a nonzero exit or timeout instead lands in
@@ -611,8 +619,7 @@ def run_angle(aid, angle, plan, base_resolved, template, execution_mode, run_dir
         "-C", root,
         "--output-schema", str(schema_path),
         "-o", str(out_path),
-        "-c", f"model={CODEX_REVIEW_MODEL}",
-        "-c", f"model_reasoning_effort={CODEX_REVIEW_EFFORT}",
+        *reviewer_model_args(),
         # Independence of judgment, not security (we review our own branches):
         # keeps an angle from being swayed by the branch's own AGENTS.md/skills.
         "-c", "project_doc_max_bytes=0",

@@ -1,7 +1,7 @@
 ---
 name: adversarial-review
 description: Plan and run a targeted adversarial review of the current branch before a PR — derive what the diff itself promises, turn that into a handful of falsifiable attack angles, and run each as an isolated reviewer pass (Codex, and optionally Claude). Composes with codex-review-loop and pr-review-loop, which converge a generic review; this one plans and runs a targeted one first, angle by angle. Use when the user says "adversarial review", "attack the branch", "plan the review", "local review before the PR", or wants the review built around this specific change's own contracts rather than a generic checklist.
-version: 1.1.1
+version: 1.1.2
 disable-model-invocation: false
 allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/scripts/"*), Bash(codex exec:*), Bash(git:*), Bash(gh:*), Task, Read, Edit, Write, Grep, Glob
 ---
@@ -122,7 +122,9 @@ step 1):
 [--timeout SEC] [--dir DIR] [--only ANGLE,...] [--angle-prompt FILE]
 [--from-dir DIR] [--allow-writes] [--print-base] [--version] [--help]`**
 
-Env overrides: `CODEX_REVIEW_MODEL`, `CODEX_REVIEW_EFFORT`, `CODEX_BIN`.
+Env overrides: `CODEX_REVIEW_MODEL`, `CODEX_REVIEW_EFFORT`, `CODEX_BIN`. With
+`CODEX_REVIEW_MODEL` unset, Codex picks the model (your `config.toml`, else its
+own default); effort defaults to `medium`.
 
 ### Threat model
 

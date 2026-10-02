@@ -50,7 +50,7 @@
 #   --version                    print the version and exit.
 #
 #   Env overrides:
-#     CODEX_REVIEW_MODEL    model passed to `codex exec` (default: gpt-6.1-sol)
+#     CODEX_REVIEW_MODEL    model passed to `codex exec` (default: unset, so Codex picks)
 #     CODEX_REVIEW_EFFORT   reasoning effort (default: medium)
 #     CODEX_BIN              codex executable (default: codex on PATH)
 #
