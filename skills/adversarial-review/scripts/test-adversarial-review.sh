@@ -278,6 +278,21 @@ check "--version exits 0 with no python3/codex on PATH" test "$ver_rc" -eq 0
 check "--version prints a semver" \
   grep -qE '^adversarial-review\.sh [0-9]+\.[0-9]+\.[0-9]+$' <<<"$ver_out"
 
+# --- Case 15: the model is Codex's choice unless CODEX_REVIEW_MODEL is set --
+model_args() { # model_args <CODEX_REVIEW_MODEL value, or - for unset>
+  local env_args=(-u CODEX_REVIEW_MODEL -u CODEX_REVIEW_EFFORT)
+  [ "$1" != "-" ] && env_args+=("CODEX_REVIEW_MODEL=$1")
+  env "${env_args[@]}" PYTHONDONTWRITEBYTECODE=1 python3 -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); import adversarial_review as a; print(" ".join(a.reviewer_model_args()))' \
+    "$SCRIPT_DIR"
+}
+check "unset CODEX_REVIEW_MODEL passes no model, effort medium" \
+  test "$(model_args -)" = "-c model_reasoning_effort=medium"
+check "empty CODEX_REVIEW_MODEL also passes no model" \
+  test "$(model_args '')" = "-c model_reasoning_effort=medium"
+check "a set CODEX_REVIEW_MODEL is passed through" \
+  test "$(model_args gpt-x)" = "-c model=gpt-x -c model_reasoning_effort=medium"
+
 echo
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"

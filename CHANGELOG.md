@@ -9,6 +9,14 @@ bash <skill-dir>/scripts/codex-review.sh --version
 bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
 
+## 1.1.2
+
+Neither Codex runner pins a model any more. With `CODEX_REVIEW_MODEL` unset or
+empty, `-c model=` is not passed, so Codex uses the `model` in your
+`config.toml` or, without one, its own default, which moves to new releases
+without a skills update. Reasoning effort is still pinned to `medium` unless
+`CODEX_REVIEW_EFFORT` says otherwise. Parser and runner versions are unchanged.
+
 ## 1.1.1
 
 Both Codex runners now default to `gpt-6.1-sol` at `medium` reasoning effort,
