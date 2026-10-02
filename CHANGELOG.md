@@ -9,6 +9,21 @@ bash <skill-dir>/scripts/codex-review.sh --version
 bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
 
+## 1.1.1
+
+Both Codex runners now default to `gpt-6.1-sol` at `medium` reasoning effort,
+replacing `gpt-5.6-sol` at `xhigh`. Applies to `codex-review.sh`
+(`codex-review-loop`) and `adversarial-review.sh` (`adversarial-review`).
+`CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` still override either one. Parser
+and runner versions are unchanged.
+
+On a one-shot comparison (copient-trainer #6482's first push, codex-cli
+0.159.3), `gpt-6.1-sol`/`medium` returned the same two findings as the old
+default in 94s instead of 601s.
+
+- **Requires** a codex-cli recent enough to list `gpt-6.1-sol`. 0.135.0 fails
+  at startup on the current model catalog; 0.159.3 is verified.
+
 ## 1.1.0
 
 `codex-review.sh`'s parser is unchanged — it still reports `1.0.0`, and

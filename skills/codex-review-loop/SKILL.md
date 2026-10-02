@@ -1,7 +1,7 @@
 ---
 name: codex-review-loop
 description: Self-review the current branch with OpenAI Codex's local CLI (`codex review`) in a review→fix loop, without polluting this thread's context. Runs codex review locally (no GitHub round-trip), fixes the issues here, and repeats until no blocking issues remain. The Codex peer to `pr-review-loop` — run both for independent Claude + Codex perspectives. Use when the user says "run the codex review loop", "review with codex until clean", or wants Codex's perspective on the branch.
-version: 1.0.0
+version: 1.0.1
 disable-model-invocation: false
 allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/skills/codex-review-loop/scripts/"*), Bash(codex review:*), Bash(git:*), Bash(gh:*), Read, Edit, Write, Grep, Glob
 ---
@@ -374,7 +374,7 @@ work around a prompt by skipping the step.
 
 - `codex review` runs the model locally — each iteration costs a Codex call and a
   few minutes; the iteration cap bounds it.
-- The script pins `codex review` to `gpt-5.6-sol` at `xhigh` reasoning effort;
+- The script pins `codex review` to `gpt-6.1-sol` at `medium` reasoning effort;
   override with `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` if needed.
 - The script's regression test needs no live Codex call:
   `bash <skill-dir>/scripts/test-codex-review.sh`. It must report `ALL PASS`

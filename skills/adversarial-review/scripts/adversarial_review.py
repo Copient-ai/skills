@@ -33,8 +33,8 @@ from pathlib import Path
 VERSION = "1.1.0"
 PROG = "adversarial-review"
 
-CODEX_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-5.6-sol")
-CODEX_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT", "xhigh")
+CODEX_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-6.1-sol")
+CODEX_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT", "medium")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 
 SEVERITIES = ("P0", "P1", "P2", "P3")

@@ -34,8 +34,8 @@
 #                      failure this script exists to prevent.
 #
 #   Env overrides:
-#     CODEX_REVIEW_MODEL    model passed to `codex review` (default: gpt-5.6-sol)
-#     CODEX_REVIEW_EFFORT   reasoning effort passed to `codex review` (default: xhigh)
+#     CODEX_REVIEW_MODEL    model passed to `codex review` (default: gpt-6.1-sol)
+#     CODEX_REVIEW_EFFORT   reasoning effort passed to `codex review` (default: medium)
 #
 # Output:
 #   CODEX_REVIEW: CLEAN | FINDINGS | UNPARSED
@@ -114,8 +114,8 @@ LOG=""
 RAW=false
 TIMEOUT=600
 FROM_LOG=""
-CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-gpt-5.6-sol}"
-CODEX_REVIEW_EFFORT="${CODEX_REVIEW_EFFORT:-xhigh}"
+CODEX_REVIEW_MODEL="${CODEX_REVIEW_MODEL:-gpt-6.1-sol}"
+CODEX_REVIEW_EFFORT="${CODEX_REVIEW_EFFORT:-medium}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
