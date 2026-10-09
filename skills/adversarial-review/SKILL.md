@@ -234,17 +234,17 @@ that a generic angle gets dropped rather than kept as padding — there is no
 minimum, so a focused diff earning one or two sharp angles gets exactly that.
 
 Write the plan to `${TMPDIR:-/tmp}/adversarial-review/<branch>-<timestamp>.json`
-(create the directory if needed) and print the full path to the user for
-review before the first run. Once step 2 has run once, every later invocation
+(create the directory if needed) and print the full path to the user before
+the first run. Once step 2 has run once, every later invocation
 in this round-trip (step 3's single-angle re-run, step 5's re-runs) switches
 `--plan` to `<DIR>/plan.json` — the copy the runner itself wrote into the run
 directory — and repeats `--dir <DIR>`, never this original path again.
 
-If a person is present in this session, show them the plan (promise,
-contracts, invariants, and each angle's title + mandate) and pause for edits
-before running — they can strike an angle, sharpen a mandate, or add one you
-missed. If no one is present to respond (a scripted or unattended run), say so
-explicitly and proceed without pausing.
+Show the plan (promise, contracts, invariants, and each angle's title +
+mandate), then go straight to step 2 — don't pause to ask for approval or
+edits. The derived angles are the default and run as planned. If the user
+interrupts to strike an angle, sharpen a mandate, or add one you missed,
+edit the plan file and re-run with the revised plan.
 
 ### 2. Run
 

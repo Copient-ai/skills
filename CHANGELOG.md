@@ -9,6 +9,14 @@ bash <skill-dir>/scripts/codex-review.sh --version
 bash <skill-dir>/scripts/adversarial-review.sh --version
 ```
 
+## 1.1.3
+
+`adversarial-review` no longer pauses for approval after planning. It shows the
+plan (promise, contracts, invariants, and each angle's title + mandate) and
+runs it as derived. To strike an angle, sharpen a mandate, or add one, interrupt
+the run; the plan file is edited and the review re-runs with it. Parser and
+runner versions are unchanged.
+
 ## 1.1.2
 
 Neither Codex runner pins a model any more. With `CODEX_REVIEW_MODEL` unset or
